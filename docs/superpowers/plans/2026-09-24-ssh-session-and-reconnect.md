@@ -1135,7 +1135,7 @@ void main() {
       // §13.15：catch 以 SSHError 为主，unknown 只留给**非** SSHError 的意外。
       // 删掉 `is SSHError` 那一支，SSHStateError 会掉进 unknown —— 于是
       // 「协议层出错」和「我们没预料到的东西」在报告里再也分不开。
-      // SSHStateError 是活会话的终态错误（ssh_client.dart:967），不是假形态。
+      // SSHStateError 是活会话的终态错误（ssh_client.dart:969），不是假形态。
       final f = classifyConnectionFailure(SSHStateError('SSH connection closed'));
 
       expect(f.kind, ConnectionFailureKind.protocolError);
