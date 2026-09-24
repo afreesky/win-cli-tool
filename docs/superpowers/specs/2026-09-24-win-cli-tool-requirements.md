@@ -925,3 +925,35 @@ Foo copyWith({Object? bar = _unset}) => Foo(
 另外要注意 `dartssh2/src/ssh_errors.dart` 里 `ssh_transport.dart:1408/1482` 抛的是**裸 `StateError`**，但它**不会**逃到调用方 —— 已被包装进 `SSHInternalError` 再放进 `reason`。所以分类器的 `catch` 仍应以 `SSHError` 为主，同时保留一个兜底分支处理非 `SSHError` 的意外异常。
 
 对应用例（计划 2 必须覆盖）：三个场景各自的分类结果，其中**第一行与第二行必须分类不同** —— 这是这条约束的回归测试。
+
+**13.16 测试可控性：三条实测事实（计划 2 预演中得到，含一个被否定的猜测）**
+
+计划 2 的代码在写入计划前先抽出来编译并跑过一遍，过程中撞到下面三条。它们不是风格偏好，是**会把测试写成假测试或假失败**的坑。
+
+1. **`fake_async` 推不动完整的「拆除」链 —— 用 `await` 串起来的 `cancel()` / `close()` 不会在 fake zone 下完成。**
+
+   实测形态：`ConnectionManager.dispose()` → `_teardownSession()` → `await _dispatcher?.dispose()`，在 `fakeAsync` 里停在最后一步不再往下走，`session.close()` 因此**根本没被执行**，测试断言 `closed == true` 假失败。同一段代码换成真实 async，`closed` 立即为 `true`。
+
+   关键旁证：卡住时 `async.pendingTimers.length == 0` 且 `async.microtaskCount == 0` —— **没有任何待推进的工作**，所以 `flushMicrotasks()`、`flushTimers()`、`elapse()` 都无效。这不是"少 flush 一次"的问题。
+
+   **约束：涉及拆除（cancel / close / dispose）的断言一律用真实 `async` 测。** 拆除本身不涉及计时，真实 async 更直接也更强。`fakeAsync` 只留给**需要控制时间**的用例（退避序列、超时、断线时长）。
+
+2. **广播 `StreamController` 的 `close()` future 并**不**等待订阅者取消 —— 这一条是为了否定一个看似合理的猜测。**
+
+   我一度推断"`await dispatcher.dispose()` 会挂住，是因为广播 controller 的 `close()` 要等所有订阅者取消"，并据此设计了修复（先取消自己的订阅）。**实测否定了这个推断**：`StreamController.broadcast()` 在「有活跃订阅者」「无订阅者」「订阅者已取消」「单订阅 controller」四种情形下，`close()` 的 future 都**立即完成**（`package:fake_async` 内外都一样）。
+
+   所以第 1 条的成因**尚未定位**（已排除：订阅者数量、订阅者取消、zone 一致性、嵌套 async 层数、dispatcher 单独调用）。**不要在没重新实测的情况下把它归因到 broadcast 语义上。**
+
+   但由此得到的**设计结论仍然成立**：`session.close()` 不该挂在 `dispatcher.dispose()` 的 future 后面 —— 订阅 `dispatcher.events` 的不止 `ConnectionManager`（界面也会直接订阅），让 FR-C-12 依赖一个我们控制不了的 future 是错的。`dispose()` 的**同步**部分（`_disposed = true`、清空队列）立即生效，fire-and-forget 足以保证"不再发出任何命令"。
+
+3. **`Uint8List` 的 `runtimeType` 与类型字面量 `Uint8List` 不 `==`。**
+
+   `expect(value.runtimeType, Uint8List)` 会失败，且失败信息是 `Expected: Uint8List, Actual: Uint8List` —— 极具误导性（实测：`seen == Uint8List` 为 `false`，`identical(seen, Uint8List)` 也为 `false`，而 `value.runtimeType.toString()` 打印出来就是 `Uint8List`）。
+
+   **约束：断言类型一律用 `expect(value, isA<T>())`，永不用 `expect(value.runtimeType, T)`。**
+
+4. **时间源必须用 `clock.now()`（`package:clock`），不能用 `DateTime.now()`。**
+
+   `fake_async` 推进的是 `clock`；`DateTime.now()` 走真实时间。用后者的话，测试里 `elapse(1s)` 之后算出来的时长恒为 0 秒，FR-C-09 的「断线时长」永远断言不了（实测：`fakeAsync` 里 `elapse(7s)` 后 `clock.now()` 恰好前进 7s）。
+
+   `clock` 通常已在传递依赖里，但**必须**在 `pubspec.yaml` 里显式声明为直接依赖才能 `import`。
