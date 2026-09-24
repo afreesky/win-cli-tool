@@ -153,4 +153,58 @@ void main() {
       expect(f.message, isNotEmpty);
     });
   });
+
+  group('文案必须把人指向正确的地方（§13.15 的理由整个就在文案上）', () {
+    // 这个 group 守的**不是 kind，而是文案本身**，因为 FR-C-06 的交付物
+    // 就是「在输出区给出可读的失败原因」。
+    //
+    // 实测过的两个漏洞形态，两者都让本文件全绿：
+    //   1. 把主机密钥那条消息换成「认证失败：用户名、口令或私钥不正确」——
+    //      kind 仍是 hostKey，14 条用例照绿，而用户去反复检查一个根本没问题
+    //      的口令。这正是 §13.15 存在的唯一理由。
+    //   2. 把 `is SSHInternalError` 整支删掉 —— 兜底分支返回的 kind 一样，
+    //      只有文案退化成「连接在认证完成前中断」，同样全绿。
+    // 所以下面钉的是"文案把人指向哪里"，不是逐字文本。
+
+    test('主机密钥的文案指向指纹，不指向口令', () {
+      final f = classifyConnectionFailure(
+        SSHAuthAbortError(
+          'Connection closed before authentication',
+          SSHHostkeyError('Hostkey verification failed'),
+        ),
+      );
+
+      expect(f.message, contains('指纹'));
+      expect(f.message, isNot(contains('口令')));
+      expect(f.message, isNot(contains('密码')));
+    });
+
+    test('算法协商失败的文案指向算法，同样不指向口令', () {
+      // §13.15 表格的第 2 行：老设备只提供 ssh-rsa/SHA-1 等。
+      // 它与第 1 行抛出的异常类型和 toString 完全一样。
+      final f = classifyConnectionFailure(
+        SSHAuthAbortError(
+          'Connection closed before authentication',
+          SSHInternalError(
+            StateError('Bad state: No matching key exchange algorithm'),
+          ),
+        ),
+      );
+
+      expect(f.kind, ConnectionFailureKind.protocolError);
+      expect(f.message, contains('算法'));
+      expect(f.message, isNot(contains('口令')));
+      expect(f.message, isNot(contains('密码')));
+    });
+
+    test('SSHError 兜底归 protocolError，不归 unknown', () {
+      // §13.15：catch 以 SSHError 为主，unknown 只留给**非** SSHError 的意外。
+      // 删掉 `is SSHError` 那一支，SSHStateError 会掉进 unknown —— 于是
+      // 「协议层出错」和「我们没预料到的东西」在报告里再也分不开。
+      // SSHStateError 是活会话的终态错误（ssh_client.dart:967），不是假形态。
+      final f = classifyConnectionFailure(SSHStateError('SSH connection closed'));
+
+      expect(f.kind, ConnectionFailureKind.protocolError);
+    });
+  });
 }
