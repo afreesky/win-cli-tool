@@ -272,4 +272,30 @@ void main() {
     expect(sanitizeLogFileName('   '), '未命名设备');
     expect(sanitizeLogFileName('...'), '未命名设备');
   });
+
+  test('日志的剥离规则与输出区是同一套（§5.6「与输出区所见一致」）', () async {
+    await withClock(Clock.fixed(t0), () async {
+      final w = writer();
+      await w.start('ssh admin@10.0.0.1:22');
+      // 这条输入里三种控制序列都有：CSI 擦除、OSC 标题、两字节转义。
+      await w.write('\x1b[2J\x1b]0;标题\x07\x1b[1m[CoreSW]\x1b[0m\r\n');
+      await w.end();
+      final line = (await logged(w)).split('\n')[1];
+      expect(line, '[2026-09-24 14:30:12.001] [CoreSW]');
+    });
+  });
+
+  test('日志里不留 \\r：不含 ESC 的设备输出也要与输出区一致（§5.6）', () async {
+    await withClock(Clock.fixed(t0), () async {
+      final w = writer();
+      await w.start('ssh admin@10.0.0.1:22');
+      // **不含任何控制序列** —— `stripAnsi` 会在这句上提前返回、把 `\r` 留下，
+      // 而输出区的 `parseAnsi` 一律删。切换前这条必红。
+      await w.write('[CoreSW]sys\r\n');
+      await w.end();
+      final line = (await logged(w)).split('\n')[1];
+      expect(line, '[2026-09-24 14:30:12.001] [CoreSW]sys',
+          reason: '尾部不能有 \\r —— 否则日志与输出区所见不一致');
+    });
+  });
 }

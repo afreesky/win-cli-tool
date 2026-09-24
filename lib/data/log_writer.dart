@@ -2,7 +2,7 @@ import 'dart:io';
 
 import 'package:clock/clock.dart';
 
-import '../render/ansi.dart';
+import '../render/ansi_parser.dart';
 import 'json_file.dart';
 
 /// 日志文件名的净化（FR-L-05）。**替换 → 去首尾空白与点号 → 截断到 64。**
@@ -77,10 +77,16 @@ class LogWriter {
     await _flush();
   }
 
-  /// 会话输出。文本会先剥离控制符（§5.6：日志与输出区所见一致）。
+  /// 会话输出。文本会先剥离控制符。
+  ///
+  /// 剥离规则来自 `render/ansi_parser.dart`，与输出区**同源** —— 输出区要颜色
+  /// 所以调 [parseAnsi]，这里只要文本所以调 [stripToPlainText]（就是它的拼接）。
+  /// §5.6 的「与输出区所见一致」因此是构造上成立的，不靠两边各自遵守约定。
+  /// 别换回 `render/ansi.dart` 的 `stripAnsi`（命令层在用）：它在不含 ESC 的
+  /// 输入上会提前返回、把 `\r` 留下，日志就与输出区不一致了。
   Future<void> write(String text) async {
     if (!_started || _closed) return;
-    final clean = stripAnsi(text);
+    final clean = stripToPlainText(text);
     if (clean.isEmpty) return;
     // 末尾换行会在 split 后留下一个空尾元素，那只是行尾符的产物，丢掉它；
     // 中间的空白行是真实内容，保留。

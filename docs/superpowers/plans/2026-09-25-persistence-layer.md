@@ -3558,6 +3558,27 @@ git commit -m "feat(render): SGR 解析（样式片段 / 256 色与真彩 / 与 
   });
 ```
 
+**还要再加一条**（本计划补的，不在原文里）：上面那条的输入**含 ESC**，走的是
+`stripAnsi` 的慢路径 —— 而本节最要紧的那处分歧恰恰是**不含 ESC 时 `\r` 不被删除**。
+少了这一条，Step 6 的切换在"ESC-free CRLF"这个**正是它要修**的情形上没有回归钉子。
+切换**之前**这条必红（`stripAnsi` 提前返回，`\r` 留在行尾）。
+
+```dart
+  test('日志里不留 \\r：不含 ESC 的设备输出也要与输出区一致（§5.6）', () async {
+    await withClock(Clock.fixed(t0), () async {
+      final w = writer();
+      await w.start('ssh admin@10.0.0.1:22');
+      // **不含任何控制序列** —— `stripAnsi` 会在这句上提前返回、把 `\r` 留下，
+      // 而输出区的 `parseAnsi` 一律删。切换前这条必红。
+      await w.write('[CoreSW]sys\r\n');
+      await w.end();
+      final line = (await logged(w)).split('\n')[1];
+      expect(line, '[2026-09-24 14:30:12.001] [CoreSW]sys',
+          reason: '尾部不能有 \\r —— 否则日志与输出区所见不一致');
+    });
+  });
+```
+
 改 `lib/data/log_writer.dart`：
 
 ```dart
@@ -3580,7 +3601,7 @@ flutter test test/data/log_writer_test.dart
 flutter test test/render/ansi_parser_test.dart
 ```
 
-Expected: 前一个 `All tests passed!`（18 条），后一个 `All tests passed!`（28 条）。
+Expected: 前一个 `All tests passed!`（20 条），后一个 `All tests passed!`（28 条）。
 
 ```bash
 git add lib/data/log_writer.dart test/data/log_writer_test.dart
