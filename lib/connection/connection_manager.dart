@@ -97,4 +97,3 @@ final class SessionLost extends ConnectionEvent {
   /// 界面需要自备兜底文案。
   final ConnectionFailure? failure;
 }
-
