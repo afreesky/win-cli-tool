@@ -4073,10 +4073,25 @@ shell 三段**没有任何上限**：一台"接受了 TCP 却不说话"的设备
    是有限的，泄漏几次就再也连不上了。
 
    **残留（已记录，本轮不修）：**
-   - **两次 `connect()` 重叠**（用户连点两下，两次都还没走完）仍不安全：拆除动作作用于
-     "此刻的字段"，而不是"这一次尝试造出来的对象"，于是 catch 分支那句
-     `unawaited(_teardownSession())` 会拆掉**另一次**尝试的会话。修法是给每次尝试一个
-     代际令牌。本轮只记注释，不加令牌 —— 交给复审决定要不要现在做。
+   - **两次 `connect()` 重叠**（用户连点两下；握手窗口就是整个 `connectTimeout`，最长
+     15 秒，两下很容易落在里面）**仍不安全，且本轮不修**。机制**不是**"互相拆除"（这里
+     原先写错了，复审实测订正），而是**拆不到位**：被打断的那次尝试，它的 catch 跑起来时
+     字段已经被置空了，于是那句 `unawaited(_teardownSession())` 成了空操作；接着它发出
+     `ConnectionFailed` 并调 `_scheduleRetry()` —— **在一个会话还活着的时候** arm 了一个
+     定时器，而那个定时器的回调直接调 `_attemptConnect()`、**不带拆除**，于是把
+     `_session`/`_outputSub` 悄悄覆写掉。
+     实测（真实 async、gate 型夹具、`close()` 打断握手使 `connect()` 抛错、60ms 退避）：
+     连点两下 → `created=3`、`closed=[true,false,false]`（第 2 条成了孤儿，占着一个 vty），
+     逐个 emit 后 `received=[out1,out2]` —— **两条会话同时往 `mgr.output` 灌**；此外还多出
+     一个假的 `ConnectionFailed` + `ReconnectScheduled`，以及一条用户**根本没断过**的
+     `Reconnected` 横幅。手动 connect 撞上在飞的重连尝试 → `created=4`、
+     `closed=[true,true,false,false]`，一个孤儿。
+     **修前对照（`acdc10d`，同样的探针）：`created=2`、`closed=[false,false]`、
+     `received=[out0,out1]`** —— 所以这次修复**不是**这个泄漏的来源，也**没有**把它关掉；
+     新出现的是那个假失败与假横幅。
+     修法仍是给每次尝试一个**代际令牌**，本轮**只记不修**。它必须在**任何界面把 `connect()`
+     接到用户手势上之前**落地（计划 5）；今天这个类里没有任何东西阻止重叠 —— 没有在飞守卫，
+     也没有令牌。
    - 输出订阅上的 `onError: (Object _) {}` 仍然是"吞掉且不留痕"。两个真实实现都会把输出
      流错误转成 `done` 完成，所以它目前是双保险；但真有一条错误走到这里，就是静默的 ——
      与 §13.20 同一形状。已加注释记录。
@@ -4153,7 +4168,21 @@ class _FakeSession implements Session {
     closed = true;
     // 真实会话里 socket 在握手途中被关掉，connect() 必然抛错 —— 复现它。
     if (!(_gate?.isCompleted ?? true)) _gate!.complete();
-    unawaited(_output.close());
+    // **刻意不关 `_output` —— 这一点与两个真实实现都不一样，是故意的。**
+    //
+    // `Session` 的契约（session.dart）**没有**承诺 `close()` 会结束 `output`。两个
+    // 真实实现恰好都这么做（`_onDisconnected` 里 `_output.close()`），但那是这两个
+    // 具体类的实现细节，不是契约。夹具照抄这个细节的代价是**一条恒真的断言**：
+    // broadcast controller 的 `isClosed` 在 `close()` 之后**同步**变成 true，于是
+    // `emit` 里那个门把 stale chunk 直接丢掉 ——「被替换掉的会话不得再往 `mgr.output`
+    // 里灌数据」（I5a 下半段）想看的"订阅有没有被摘掉"根本没被看见，它只可能作为
+    // `closed == true` 的重述而失败。实测：把 `_teardownSession()` 里那句
+    // `await outputSub?.cancel();` 删掉，**26/26 全绿**。
+    //
+    // 夹具不关 output 之后，manager 的订阅所有权（它自己那句 `await outputSub?.cancel();`）
+    // 才真的被钉住：cancel 在 ⇒ stale chunk 到不了界面；cancel 不在 ⇒ 到得了、断言变红。
+    // manager 本来就不该依赖"两个具体类的 `close()` 顺手关了 output"这件没写进契约的事。
+    // **不要"修回去"。**
   }
 
   /// 模拟对端断开。[error] 给出时先记进 [lastError] —— 与两个真实实现里
@@ -4164,7 +4193,11 @@ class _FakeSession implements Session {
   }
 
   void emit(String s) {
-    if (!_output.isClosed) _output.add(s);
+    // 不设 `isClosed` 门：夹具的 `_output` 从不由 `close()` 关掉（见上），门恒真，
+    // 留着只会让"有人把 `close()` 里那行 `_output.close()` 修回去"变成一次**静默的
+    // 空操作** —— 而那正是本文件当初那条断言恒真的原因。去掉门之后，同样的手笔会
+    // 让这里直接抛 `StateError`，点名用例，红得响亮。
+    _output.add(s);
   }
 }
 
@@ -4206,9 +4239,19 @@ class _FakeFactory implements SessionFactory {
   Future<bool> Function(KnownHost)? get onUnknownHostKey => null;
 }
 
-/// 夹具的默认值与生产默认值**刻意保持一致**（`'\n'`、单条 `['enable']`），
-/// 两个参数只在用例显式传值时才不同 —— 否则上面那批用例断言的就不再是默认
-/// 行为，而"夹具的值恰好等于实现里硬编码的那个值"正是本文件要消灭的洞。
+/// 夹具的两个默认值，与生产默认值的关系**一同一不同**，别一概而论：
+///
+/// - `lineEnding` 默认 `'\n'`，与 `DeviceProfile.lineEnding` 的生产默认值**一致**
+///   （lib/models/device_profile.dart）；
+/// - `postLogin` 默认单条 `['enable']`，而 `DeviceProfile.postLoginCommands` 的生产
+///   默认值是 **`const []`**（同一个文件），两者**刻意不同**：除 I2 那条显式传两条的
+///   用例之外，所有用例都要让"连上后自动下发"这条路径真的跑起来，用生产默认值
+///   （空列表）它们就全都断言不到 FR-C-08 了。
+///
+/// 两个参数都只在用例显式传值时才取别的值。而"夹具的值恰好等于实现里硬编码的那个
+/// 值"这个洞，由 I2 的『登录后命令是多条时全部依次下发』堵住：它显式传
+/// `['enable', 'configure terminal']`，实现里若把登录后命令写死成 `['enable']`，
+/// 那条立刻变红。
 DeviceProfile _profile({
   List<String> postLogin = const ['enable'],
   String lineEnding = '\n',
@@ -5078,6 +5121,11 @@ void main() {
 
     // 旧会话的订阅也必须摘掉：它还挂着的话，那条已被替换的连接会继续往
     // 界面灌数据（两个会话的回显混在一起，且谁也停不下来）。
+    //
+    // 这条断言钉的是 manager 自己那句 `await outputSub?.cancel();`：夹具的 `close()`
+    // **不关** `_output`（见 `_FakeSession.close` 的注释），所以上面那句
+    // `closed == isTrue` 通过之后，这次 emit 依然会真的送到订阅者手上 —— 把 cancel
+    // 删掉，stale chunk 就会到达界面，这条断言随之变红。
     sessions[0].emit('stale output');
     sessions[1].emit('live output');
     await Future<void>.delayed(const Duration(milliseconds: 20));
@@ -5322,10 +5370,31 @@ class ConnectionManager {
   /// 定时器醒来时手里已经没有旧会话了。
   ///
   /// **仍未解决（记录在案，本轮不改）**：两次**重叠**的 [connect]（用户连点两下，
-  /// 或手动连接与重连定时器同时落下）依然不安全。拆解作用在"当下的字段"而不是
-  /// "自己那次尝试的对象"上：第二次的拆除会把第一次刚建的会话关掉，而第一次随后
-  /// 失败时，catch 里那句 `unawaited(_teardownSession())` 拆的是**第二次**的新会话。
-  /// 根治要给每次尝试配一个代号（generation），让拆除只认自己的会话。
+  /// 或手动连接与重连定时器同时落下）依然不安全。真正的机制**不是**"两次拆除互相
+  /// 拆台"（曾经这样记过，实测**是错的**），而是**漏拆**：输掉的那次尝试走进 catch
+  /// 时，字段早已被对手清空，于是它那句 `unawaited(_teardownSession())` 是**空操作**；
+  /// 它接着发 `ConnectionFailed`、调 `_scheduleRetry()` —— 在前一条会话**还活着**的
+  /// 时候武装一个重连定时器。那个定时器的回调直接调 `_attemptConnect()`，**不经任何
+  /// 拆除**，于是把 `_session` / `_outputSub` / `_dispatcher` 静默覆写，前一条会话
+  /// 从此没人关。
+  ///
+  /// 实测（真实 async，gate 型夹具，握手中途 `close()` ⇒ `connect()` 抛错，60ms 退避）：
+  /// 连点两下的探针给出 `created=3`、`closed=[true,false,false]` —— `sessions[2]` 是
+  /// 当下那条，`sessions[1]` 成了**孤儿**（一个被占住的 vty）；再从每条会话各 emit
+  /// 一次，`received=[out1,out2]`，也就是**两条**会话同时往 `mgr.output` 里灌。
+  /// 同一次还多发了一个**假告警**（`ConnectionFailed` + `ReconnectScheduled`）和一个
+  /// `Reconnected` 横幅 —— 用户其实从没掉线。
+  /// "重连尝试在途时手动 connect()"的探针给出 `created=4`、
+  /// `closed=[true,true,false,false]`，同样一个孤儿。
+  ///
+  /// **修复前（`acdc10d`）的同两条探针：`created=2`、`closed=[false,false]`、
+  /// `received=[out0,out1]`。** 所以 I5 的修复**不是**这次泄漏的来源（重叠一次就漏
+  /// 一条，修之前也漏），也**没有**堵上这个洞；新出现的是那个假 `ConnectionFailed`
+  /// 加 `Reconnected` 横幅。
+  ///
+  /// 根治要给每次尝试配一个代号（generation），让拆除只认自己的会话。本轮**只记
+  /// 注释、不实现令牌**；但它必须在**任何界面从用户手势驱动 `connect()`** 之前落地。
+  /// 今天这个类里没有任何东西阻止重叠：没有"尝试在途"的闸门，也没有代际令牌。
   Future<void> connect() async {
     if (_disposed) return;
     _userClosed = false;
@@ -5334,8 +5403,16 @@ class ConnectionManager {
     // 的这条顶掉（`_session` 被覆写，这条就再也没人关了）。
     _retryTimer?.cancel();
     _retryTimer = null;
-    // 已经连着（或上一次拆除还没走完）时，先把旧会话拆干净再建新的，见上面的
-    // 所有权说明。这里 `await` 是安全的：按契约 `Session.close()` **不会**触发
+    // 已经连着时，先把旧会话拆干净再建新的，见上面的所有权说明。
+    // 这个保证**只在前一次拆除没有在途时才成立**：`_teardownSession()` 在任何
+    // await 之前就把字段取走并置空，所以第二次拆除对着已被清空的字段是**空操作**，
+    // `connect()` 会径直往下建新会话。实测：让上一次 `close()` 悬在半路，`connect()`
+    // 建出第 2 条会话时第 1 条的 `closed` 仍是 false（`created=2 closed=[false,false]`）。
+    // 结局是良性的 —— 第 1 次拆除终究会关掉它自己那条会话，最终 `closed=[true,false]`，
+    // 无孤儿 —— 但"已经连着（**或上一次拆除还没走完**）时都先拆干净"是**过度承诺**，
+    // 别照着它推理。
+    //
+    // 这里 `await` 是安全的：按契约 `Session.close()` **不会**触发
     // `done`（session.dart），所以旧会话不会在拆除途中反过来走一趟 `_onSessionDone`。
     await _teardownSession();
     await _attemptConnect();
@@ -5531,7 +5608,7 @@ class ConnectionManager {
 Run: `flutter test test/connection/connection_manager_test.dart`
 Expected: 26 个用例全部 PASS
 
-- [ ] **Step 5: 反证二十三个承载行为的非空性（逐个做，每个都要看到红）**
+- [ ] **Step 5: 反证二十四个承载行为的非空性（M1–M23 与 X1，逐个做，每个都要看到红）**
 
 计划 1 的教训是"全绿"不等于"被约束"。下表每一条都是把缺陷**放回去**，确认对应测试确实变红；不变红就说明那条测试是空的。每改一条立刻恢复，最后 `git diff` 确认工作区干净再提交。
 
@@ -5560,13 +5637,25 @@ Expected: 26 个用例全部 PASS
 | M21 | backoff 的**使用点**换成硬编的默认序列（刻意的：不写成 M1 那种 `backoff[0]`，好让 M1 那几行保持独立） | 注入的 backoff 生效：重连发生在配置的延迟上（I4） |
 | M22 | `connect()` 里删掉 `await _teardownSession();` | 已连接时再 connect() 必须关掉被替换的那条（I5a） |
 | M23 | `connect()` 里删掉 `_retryTimer?.cancel(); _retryTimer = null;` | 重连待命中手动 connect()：待命的重连定时器必须作废（I5c） |
+| X1 | `_teardownSession()` 里删掉 `await outputSub?.cancel();` | 已连接时再 connect()：被替换的会话必须被关掉、**订阅必须被摘掉**（I5a） |
 
-已实测：M1–M23 全部变红，**零假红**（没有任何一条红是点名文件路径的）。
+已实测：M1–M23 与 X1 全部变红，**零假红**（没有任何一条红是点名文件路径的）。
 
 **M0-PREFIX（基线，不是变异）：把 `acdc10d` 的实现配上**新**用例** —— 26 条里**恰好 2 红**
 （`已连接时再 connect()…` 与 `重连待命中手动 connect()…`），其余 24 条全绿。这是 I5 修复的
 非空性证据：修之前那两条就是红的，修之后全绿，而其余用例两条都绿 —— 说明新用例钉的正是
 那条不变量，不是别的东西。
+
+**X1 的教训：夹具会把断言变成同义反复。** 这一行原来**是绿的** —— 不是实现没问题，
+而是夹具自己把路堵死了：`_FakeSession.close()` 当时会 `_output.close()`，而 `emit` 又有
+`if (!_output.isClosed)` 的闸门，于是"被替换的会话又 emit 了一次"根本不是"往
+`mgr.output` 里灌数据"，而是一个空操作。那条用例因此**只能作为 `closed` 的复述而红**，
+永远测不到它名字里写的"订阅必须被摘掉"。修法是让夹具**不再**在 `close()` 里关掉
+`_output`（理由：`Session` 的契约**从未**承诺 `close()` 会结束 `output`，两个真实实现
+只是碰巧这么做；管理器靠 `await outputSub?.cancel()` 才独立于它们），并把 `emit` 里那道
+闸门也去掉 —— 留着它，将来有人把 `_output.close()` 加回夹具，同一处又会静默变回空操作；
+去掉之后那种手改会直接抛 `StateError` 并点名用例。**夹具故意与两个真实实现在这点上不一致，
+不要"修回去"。**
 
 **M4 的爆炸半径比原先记的大**：删掉 `await session.close();` 之后，那条 gate 型用例的
 `connect()` 再也没人放行，于是它以 `TimeoutException after 0:00:30` 变红 —— 点名用例，成色是
