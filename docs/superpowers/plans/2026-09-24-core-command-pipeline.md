@@ -153,6 +153,8 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 - Create: `lib/models/device_profile.dart`
 - Create: `lib/models/app_settings.dart`
 - Test: `test/models/device_profile_test.dart`
+- Test: `test/models/app_settings_test.dart`
+- Delete: `lib/models/.gitkeep`、`test/models/.gitkeep`（已被真实文件取代）
 
 一次定义完整字段，避免后续计划（跳板机、持久化、界面）反复修改模型。JSON 编解码也放在这里，因为它是模型契约的一部分；计划 4 只负责文件 IO 与迁移。
 
@@ -281,15 +283,109 @@ void main() {
 }
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [ ] **Step 2: 写 AppSettings 的失败测试**
 
-```bash
-flutter test test/models/device_profile_test.dart
+创建 `test/models/app_settings_test.dart`。**为什么单独测它**：`AppSettings` 的 JSON 编解码在计划 4 里要承担 `settings.json` 的读写与迁移，字段错一个就会静默丢配置。它的每个字段都带默认值回落逻辑，是这套模型里最容易写错的一块，必须有测试钉住。
+
+```dart
+import 'package:flutter_test/flutter_test.dart';
+import 'package:win_cli_tool/models/app_settings.dart';
+
+void main() {
+  group('AppSettings', () {
+    test('默认值符合 spec §8.6', () {
+      const s = AppSettings();
+
+      expect(s.defaultPromptRegex, r'[>#\]]\s*$');
+      expect(s.promptDebounceMs, 120);
+      expect(s.commandTimeoutMs, 10000);
+      expect(s.connectTimeoutMs, 15000);
+      expect(s.morePromptPatterns, [
+        '---- More ----',
+        '--More--',
+        '<--- More --->',
+      ]);
+      expect(s.logEnabled, isTrue);
+      expect(s.logDir, isNull);
+      expect(s.verifySshHostKey, isTrue);
+      expect(s.theme, AppTheme.system);
+      expect(s.editorSplitRatio, 0.4);
+      expect(s.outputBufferLines, 5000);
+    });
+
+    test('JSON 往返后所有字段保持一致', () {
+      const original = AppSettings(
+        defaultPromptRegex: r'>>>\s*$',
+        promptDebounceMs: 200,
+        commandTimeoutMs: 30000,
+        connectTimeoutMs: 5000,
+        morePromptPatterns: ['<SPACE>'],
+        logEnabled: false,
+        logDir: '/tmp/logs',
+        verifySshHostKey: false,
+        theme: AppTheme.dark,
+        editorSplitRatio: 0.6,
+        outputBufferLines: 1000,
+      );
+
+      final restored = AppSettings.fromJson(original.toJson());
+
+      expect(restored.defaultPromptRegex, r'>>>\s*$');
+      expect(restored.promptDebounceMs, 200);
+      expect(restored.commandTimeoutMs, 30000);
+      expect(restored.connectTimeoutMs, 5000);
+      expect(restored.morePromptPatterns, ['<SPACE>']);
+      expect(restored.logEnabled, isFalse);
+      expect(restored.logDir, '/tmp/logs');
+      expect(restored.verifySshHostKey, isFalse);
+      expect(restored.theme, AppTheme.dark);
+      expect(restored.editorSplitRatio, 0.6);
+      expect(restored.outputBufferLines, 1000);
+    });
+
+    test('字段缺失时回落到默认值（向前兼容旧配置文件）', () {
+      final restored = AppSettings.fromJson(const <String, Object?>{});
+
+      expect(restored.promptDebounceMs, 120);
+      expect(restored.theme, AppTheme.system);
+      expect(restored.verifySshHostKey, isTrue);
+      expect(restored.outputBufferLines, 5000);
+    });
+
+    test('整数形式的 editorSplitRatio 也能解析', () {
+      final restored =
+          AppSettings.fromJson(const <String, Object?>{'editorSplitRatio': 1});
+      expect(restored.editorSplitRatio, 1.0);
+    });
+
+    test('未知主题名回落到 system 而非抛错', () {
+      final restored =
+          AppSettings.fromJson(const <String, Object?>{'theme': 'solarized'});
+      expect(restored.theme, AppTheme.system);
+    });
+
+    test('copyWith 只改指定字段', () {
+      const s = AppSettings();
+      final t = s.copyWith(theme: AppTheme.light, commandTimeoutMs: 1000);
+
+      expect(t.theme, AppTheme.light);
+      expect(t.commandTimeoutMs, 1000);
+      expect(t.promptDebounceMs, 120);
+      expect(t.verifySshHostKey, isTrue);
+    });
+  });
+}
 ```
 
-Expected：FAIL，报 `Target of URI doesn't exist: 'package:win_cli_tool/models/device_profile.dart'`。
+- [ ] **Step 3: 运行测试确认失败**
 
-- [ ] **Step 3: 实现模型**
+```bash
+flutter test test/models/
+```
+
+Expected：FAIL，两份测试都报 `Target of URI doesn't exist` —— 实现文件还不存在。
+
+- [ ] **Step 4: 实现模型**
 
 创建 `lib/models/device_profile.dart`：
 
@@ -638,15 +734,25 @@ class AppSettings {
 }
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [ ] **Step 5: 运行测试确认通过**
 
 ```bash
-flutter test test/models/device_profile_test.dart
+flutter test test/models/
 ```
 
-Expected：PASS，`All tests passed!`。
+Expected：PASS，`All tests passed!`（两份测试文件合计 12 个用例全绿）。
 
-- [ ] **Step 5: 提交**
+- [ ] **Step 6: 顺手清掉已被真实文件取代的 .gitkeep**
+
+Task 1 用 `.gitkeep` 占位是因为当时目录是空的。现在 `lib/models/` 与 `test/models/` 都有真实文件了，占位文件已冗余：
+
+```bash
+git rm -q lib/models/.gitkeep test/models/.gitkeep
+```
+
+其余 8 个目录（`lib/connection`、`lib/render`、`lib/command`、`test/*`）暂时还是空的，**保留**它们的 `.gitkeep`，留到各自任务填入真实文件时再删。
+
+- [ ] **Step 7: 提交**
 
 ```bash
 git add lib/models test/models
@@ -654,6 +760,7 @@ git commit -m "feat: 添加设备与设置数据模型
 
 - DeviceProtocol / Snippet / JumpHost / DeviceProfile，含 JSON 编解码
 - AppSettings 含提示符正则、去抖、超时、翻页模式等全部设置项
+- 移除已被真实文件取代的 .gitkeep 占位
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
