@@ -1865,7 +1865,7 @@ enum _State { data, iac, negotiation, subnegotiation, subnegotiationIac }
 flutter test test/connection/telnet_protocol_test.dart
 ```
 
-Expected：PASS，10 个测试全绿。
+Expected：PASS，12 个测试全绿。
 
 - [ ] **Step 5: 提交**
 
