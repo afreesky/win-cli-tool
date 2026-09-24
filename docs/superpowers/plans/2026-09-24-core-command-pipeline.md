@@ -158,6 +158,14 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 一次定义完整字段，避免后续计划（跳板机、持久化、界面）反复修改模型。JSON 编解码也放在这里，因为它是模型契约的一部分；计划 4 只负责文件 IO 与迁移。
 
+**可空字段的 `copyWith` 必须用哨兵，不能用 `x ?? this.x`。** 对 `password`、`privateKeyPath`、`promptRegex`、`logDir` 这四个字段来说，**null 本身就是一个有语义的值**（不启用密码认证 / 不启用密钥认证 / 用全局默认提示符正则 / 用默认日志目录），而不是「调用方没传这个参数」。用 `?? this.x` 会把用户「清空」的操作静默地变成「保持原值」，且返回的是一个完全合法的对象，不报任何错。后果直接落在后两个计划的 FR 上：
+
+- **FR-D-05**「编辑已有设备的任意字段」：用户清掉密码改用密钥认证 → 旧密码仍在明文配置里（NFR-S-01 已确认 V1 凭据明文存储），且界面上没有任何地方还能看到它。
+- **FR-G-03**：用户取消勾选「设备级提示符正则」以回落全局默认 → 旧正则仍在生效，实际提示符判定行为与界面显示不一致，故障点离原因隔了两层。
+- **FR-G-01** `logDir`、以及 `privateKeyPath`：同样一旦设过就再也回不到默认。
+
+哨兵写法给出三种状态：不传 → 保留、显式传 `null` → 清空、传值 → 覆盖。
+
 - [ ] **Step 1: 写失败的测试**
 
 创建 `test/models/device_profile_test.dart`：
@@ -256,6 +264,74 @@ void main() {
       expect(q.host, '10.0.0.1');
       expect(q.id, 'd1');
     });
+
+    test('copyWith 不传参时保留原值（原值为 null 也保留）', () {
+      const p = DeviceProfile(
+        id: 'd1',
+        name: 'A',
+        protocol: DeviceProtocol.ssh,
+        host: '10.0.0.1',
+        port: 22,
+        username: 'admin',
+        password: 'pw',
+        promptRegex: r'[>#]\s*$',
+      );
+
+      final q = p.copyWith(name: 'B');
+
+      expect(q.password, 'pw');
+      expect(q.promptRegex, r'[>#]\s*$');
+      expect(q.privateKeyPath, isNull);
+    });
+
+    test('copyWith 能把可空字段显式清回 null', () {
+      const p = DeviceProfile(
+        id: 'd1',
+        name: 'A',
+        protocol: DeviceProtocol.ssh,
+        host: '10.0.0.1',
+        port: 22,
+        username: 'admin',
+        password: 'pw',
+        privateKeyPath: '/home/u/.ssh/id_rsa',
+        promptRegex: r'[>#]\s*$',
+      );
+
+      final q = p.copyWith(
+        password: null,
+        privateKeyPath: null,
+        promptRegex: null,
+      );
+
+      expect(q.password, isNull);
+      expect(q.privateKeyPath, isNull);
+      expect(q.promptRegex, isNull);
+      // 未指定的字段不受影响
+      expect(q.name, 'A');
+      expect(q.host, '10.0.0.1');
+      expect(q.port, 22);
+      expect(q.id, 'd1');
+    });
+
+    test('JSON 只有必填字段时，可选项回落到默认值（v1 配置迁移形状）', () {
+      final restored = DeviceProfile.fromJson(const <String, Object?>{
+        'id': 'd1',
+        'name': '核心交换机',
+        'protocol': 'telnet',
+        'host': '10.0.0.1',
+        'port': 23,
+        'username': 'admin',
+      });
+
+      expect(restored.password, isNull);
+      expect(restored.privateKeyPath, isNull);
+      expect(restored.jumpHostIds, isEmpty);
+      expect(restored.lineEnding, '\n');
+      expect(restored.promptRegex, isNull);
+      expect(restored.postLoginCommands, isEmpty);
+      expect(restored.autoConnect, isFalse);
+      expect(restored.snippets, isEmpty);
+    });
   });
 
   group('JumpHost', () {
@@ -267,6 +343,7 @@ void main() {
         port: 22,
         username: 'ops',
         password: 'pw',
+        privateKeyPath: '/home/ops/.ssh/id_ed25519',
       );
 
       final restored = JumpHost.fromJson(j.toJson());
@@ -277,7 +354,43 @@ void main() {
       expect(restored.port, 22);
       expect(restored.username, 'ops');
       expect(restored.password, 'pw');
-      expect(restored.privateKeyPath, isNull);
+      expect(restored.privateKeyPath, '/home/ops/.ssh/id_ed25519');
+    });
+
+    test('copyWith 保留与清空可空字段', () {
+      const j = JumpHost(
+        id: 'j1',
+        name: '堡垒机-A',
+        host: '10.0.0.254',
+        port: 22,
+        username: 'ops',
+        password: 'pw',
+        privateKeyPath: '/home/ops/.ssh/id_ed25519',
+      );
+
+      // 不传 → 保留
+      final kept = j.copyWith(username: 'ops2');
+      expect(kept.password, 'pw');
+      expect(kept.privateKeyPath, '/home/ops/.ssh/id_ed25519');
+      expect(kept.username, 'ops2');
+
+      // 显式传 null → 清空
+      final cleared = j.copyWith(password: null, privateKeyPath: null);
+      expect(cleared.password, isNull);
+      expect(cleared.privateKeyPath, isNull);
+      expect(cleared.username, 'ops');
+    });
+  });
+
+  group('Snippet', () {
+    test('JSON 往返后所有字段保持一致（含 id）', () {
+      const s = Snippet(id: 's1', name: '保存配置', content: 'save\nY');
+
+      final restored = Snippet.fromJson(s.toJson());
+
+      expect(restored.id, 's1');
+      expect(restored.name, '保存配置');
+      expect(restored.content, 'save\nY');
     });
   });
 }
@@ -343,13 +456,24 @@ void main() {
       expect(restored.outputBufferLines, 1000);
     });
 
-    test('字段缺失时回落到默认值（向前兼容旧配置文件）', () {
+    test('字段缺失时全部回落到默认值（向前兼容旧配置文件）', () {
+      // 逐个字段与「构造函数的默认值」比对，而不是写死字面量：这样
+      // fromJson 里的回落值与构造函数默认值一旦只改了一边，测试就会失败。
+      const defaults = AppSettings();
+
       final restored = AppSettings.fromJson(const <String, Object?>{});
 
-      expect(restored.promptDebounceMs, 120);
-      expect(restored.theme, AppTheme.system);
-      expect(restored.verifySshHostKey, isTrue);
-      expect(restored.outputBufferLines, 5000);
+      expect(restored.defaultPromptRegex, defaults.defaultPromptRegex);
+      expect(restored.promptDebounceMs, defaults.promptDebounceMs);
+      expect(restored.commandTimeoutMs, defaults.commandTimeoutMs);
+      expect(restored.connectTimeoutMs, defaults.connectTimeoutMs);
+      expect(restored.morePromptPatterns, defaults.morePromptPatterns);
+      expect(restored.logEnabled, defaults.logEnabled);
+      expect(restored.logDir, defaults.logDir);
+      expect(restored.verifySshHostKey, defaults.verifySshHostKey);
+      expect(restored.theme, defaults.theme);
+      expect(restored.editorSplitRatio, defaults.editorSplitRatio);
+      expect(restored.outputBufferLines, defaults.outputBufferLines);
     });
 
     test('整数形式的 editorSplitRatio 也能解析', () {
@@ -373,6 +497,16 @@ void main() {
       expect(t.promptDebounceMs, 120);
       expect(t.verifySshHostKey, isTrue);
     });
+
+    test('copyWith 能把 logDir 显式清回 null（回落默认日志目录）', () {
+      const s = AppSettings(logDir: '/tmp/logs');
+
+      // 不传 → 保留
+      expect(s.copyWith(theme: AppTheme.dark).logDir, '/tmp/logs');
+
+      // 显式传 null → 清空，回到「用应用数据目录下的 logs/」
+      expect(s.copyWith(logDir: null).logDir, isNull);
+    });
   });
 }
 ```
@@ -383,7 +517,7 @@ void main() {
 flutter test test/models/
 ```
 
-Expected：FAIL，两份测试都报 `Target of URI doesn't exist` —— 实现文件还不存在。
+Expected：FAIL，两份测试都报 `Error when reading 'lib/models/...': No such file or directory` —— 实现文件还不存在。
 
 - [ ] **Step 4: 实现模型**
 
@@ -404,6 +538,13 @@ enum DeviceProtocol {
   /// 该协议的默认端口。
   int get defaultPort => this == DeviceProtocol.ssh ? 22 : 23;
 }
+
+/// 「调用方没传这个参数」的哨兵，用来区分它与「调用方显式传了 null」。
+///
+/// 见 Task 2 开头对 [DeviceProfile.password]、[DeviceProfile.privateKeyPath]、
+/// [DeviceProfile.promptRegex] 的说明：这几个字段的 null 是有语义的值，不能被
+/// `?? this.x` 吞掉。
+const Object _unset = Object();
 
 /// 一条可复用的命令片段，归属于单台设备。
 class Snippet {
@@ -457,8 +598,8 @@ class JumpHost {
     String? host,
     int? port,
     String? username,
-    String? password,
-    String? privateKeyPath,
+    Object? password = _unset,
+    Object? privateKeyPath = _unset,
   }) =>
       JumpHost(
         id: id,
@@ -466,8 +607,11 @@ class JumpHost {
         host: host ?? this.host,
         port: port ?? this.port,
         username: username ?? this.username,
-        password: password ?? this.password,
-        privateKeyPath: privateKeyPath ?? this.privateKeyPath,
+        password:
+            identical(password, _unset) ? this.password : password as String?,
+        privateKeyPath: identical(privateKeyPath, _unset)
+            ? this.privateKeyPath
+            : privateKeyPath as String?,
       );
 
   factory JumpHost.fromJson(Map<String, Object?> json) => JumpHost(
@@ -540,11 +684,11 @@ class DeviceProfile {
     String? host,
     int? port,
     String? username,
-    String? password,
-    String? privateKeyPath,
+    Object? password = _unset,
+    Object? privateKeyPath = _unset,
     List<String>? jumpHostIds,
     String? lineEnding,
-    String? promptRegex,
+    Object? promptRegex = _unset,
     List<String>? postLoginCommands,
     bool? autoConnect,
     List<Snippet>? snippets,
@@ -556,11 +700,16 @@ class DeviceProfile {
         host: host ?? this.host,
         port: port ?? this.port,
         username: username ?? this.username,
-        password: password ?? this.password,
-        privateKeyPath: privateKeyPath ?? this.privateKeyPath,
+        password:
+            identical(password, _unset) ? this.password : password as String?,
+        privateKeyPath: identical(privateKeyPath, _unset)
+            ? this.privateKeyPath
+            : privateKeyPath as String?,
         jumpHostIds: jumpHostIds ?? this.jumpHostIds,
         lineEnding: lineEnding ?? this.lineEnding,
-        promptRegex: promptRegex ?? this.promptRegex,
+        promptRegex: identical(promptRegex, _unset)
+            ? this.promptRegex
+            : promptRegex as String?,
         postLoginCommands: postLoginCommands ?? this.postLoginCommands,
         autoConnect: autoConnect ?? this.autoConnect,
         snippets: snippets ?? this.snippets,
@@ -622,6 +771,12 @@ enum AppTheme {
       );
 }
 
+/// 「调用方没传这个参数」的哨兵，用来区分它与「调用方显式传了 null」。
+///
+/// [AppSettings.logDir] 的 null 表示「用默认日志目录」，是有语义的值，
+/// 不能被 `?? this.x` 吞掉 —— 否则用户清空日志目录后旧目录仍然生效（FR-G-01）。
+const Object _unset = Object();
+
 /// 全局设置。字段与 spec §8.6 的 settings.json 一一对应。
 class AppSettings {
   const AppSettings({
@@ -678,7 +833,7 @@ class AppSettings {
     int? connectTimeoutMs,
     List<String>? morePromptPatterns,
     bool? logEnabled,
-    String? logDir,
+    Object? logDir = _unset,
     bool? verifySshHostKey,
     AppTheme? theme,
     double? editorSplitRatio,
@@ -691,7 +846,7 @@ class AppSettings {
         connectTimeoutMs: connectTimeoutMs ?? this.connectTimeoutMs,
         morePromptPatterns: morePromptPatterns ?? this.morePromptPatterns,
         logEnabled: logEnabled ?? this.logEnabled,
-        logDir: logDir ?? this.logDir,
+        logDir: identical(logDir, _unset) ? this.logDir : logDir as String?,
         verifySshHostKey: verifySshHostKey ?? this.verifySshHostKey,
         theme: theme ?? this.theme,
         editorSplitRatio: editorSplitRatio ?? this.editorSplitRatio,
@@ -740,7 +895,7 @@ class AppSettings {
 flutter test test/models/
 ```
 
-Expected：PASS，`All tests passed!`（两份测试文件合计 12 个用例全绿）。
+Expected：PASS，`All tests passed!`（两份测试文件合计 18 个用例全绿：`device_profile_test.dart` 11 个 + `app_settings_test.dart` 7 个）。
 
 - [ ] **Step 6: 顺手清掉已被真实文件取代的 .gitkeep**
 
@@ -871,7 +1026,7 @@ void main() {
 flutter test test/connection/connector_test.dart
 ```
 
-Expected：FAIL，`Target of URI doesn't exist: 'package:win_cli_tool/connection/connector.dart'`。
+Expected：FAIL，`Error when reading 'package:win_cli_tool/connection/connector.dart': No such file or directory`。
 
 - [ ] **Step 3: 实现 Connector**
 
@@ -1143,7 +1298,7 @@ Future<void> _waitUntil(
 flutter test test/fixtures/fake_device_server_test.dart
 ```
 
-Expected：FAIL，`Target of URI doesn't exist: 'fake_device_server.dart'`。
+Expected：FAIL，`Error when reading 'fake_device_server.dart': No such file or directory`。
 
 - [ ] **Step 3: 实现假设备服务器**
 
@@ -1538,7 +1693,7 @@ void main() {
 flutter test test/connection/telnet_protocol_test.dart
 ```
 
-Expected：FAIL，`Target of URI doesn't exist: 'package:win_cli_tool/connection/telnet_protocol.dart'`。
+Expected：FAIL，`Error when reading 'package:win_cli_tool/connection/telnet_protocol.dart': No such file or directory`。
 
 - [ ] **Step 3: 实现状态机**
 
@@ -1843,7 +1998,7 @@ Future<void> _waitUntil(
 flutter test test/connection/telnet_session_test.dart
 ```
 
-Expected：FAIL，`Target of URI doesn't exist: 'package:win_cli_tool/connection/session.dart'`。
+Expected：FAIL，`Error when reading 'package:win_cli_tool/connection/session.dart': No such file or directory`。
 
 - [ ] **Step 3: 定义 Session 接口**
 
@@ -2704,7 +2859,7 @@ void main() {
 flutter test test/command/command_dispatcher_test.dart
 ```
 
-Expected：FAIL，`Target of URI doesn't exist: 'package:win_cli_tool/command/command_dispatcher.dart'`。
+Expected：FAIL，`Error when reading 'package:win_cli_tool/command/command_dispatcher.dart': No such file or directory`。
 
 - [ ] **Step 3: 实现 CommandDispatcher**
 
