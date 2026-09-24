@@ -4060,6 +4060,27 @@ shell 三段**没有任何上限**：一台"接受了 TCP 却不说话"的设备
 3. **不要给 `dispatcher.events` 挂转发订阅。** 曾经有过一个：收到 `QueueDropped` 就 `_events.add(SessionLost(null))`。它**永不触发** —— `CommandDispatcher._events` 是异步广播 controller，`QueueDropped` 要等一个 microtask，而 `_teardownSession()` 在同一个同步块里就把它取消了（实测：原样放回去测试仍然全绿）。而且它想达成的效果本来就重复：丢弃数由 `QueueDropped` 承载，界面直接订阅 `dispatcher.events` 取用（spec §13.16 第 2 条的设计结论）。所以本类**不订阅** dispatcher 的任何事件，`_dispatcher` 只用来调 `onOutput` / `onDisconnected` / `dispose`。
 4. **`_teardownSession()` 不 `await dispatcher.dispose()`。** 它是广播 `StreamController`，`close()` 的 future 要等订阅者全部摘干净才完成，而订阅者不止我们（界面会直接订阅 `dispatcher.events`）。把 `session.close()` 挂在它后面，就等于让 FR-C-12 依赖一个我们控制不了的 future。`dispose()` 的同步部分（`_disposed = true`、清空队列）立即生效，所以 fire-and-forget 不会再发出任何命令。同理，建连失败分支里也是 `unawaited(_teardownSession())` —— 拆除是清理，不能挡住重连排程。
 
+5. **`connect()` 必须接管它替换掉的那条会话。** 这是代码评审查出来的第二个真缺陷
+   （I5），修在 `connect()` 里，不在 `_attemptConnect()` 里：**先作废待命的重连定时器，
+   再把已有会话拆干净，最后才建新的。** 两条各自都能在线验证：
+   - **I5a**：已经连着时再 `connect()`，旧会话既不被关闭、它的订阅也被覆写 —— 那条死连接
+     的**回显会继续流到界面**（实测旧实现 `received=[stale, live]`）。
+   - **I5c**：重连待命中手动 `connect()` 且**这次连上了**，那个待命定时器并不知道又有人
+     连上了，到点照跑，**再建一条把刚连上的顶掉**（实测 `factory.created == 3`，三条会话
+     两条没人关）。注意反过来的那条路径**不需要**修：手动重试**失败**时会走
+     `_scheduleRetry()`，它自己会 `cancel()` 旧定时器。
+   泄漏的不是内存，是**一条活着的 SSH 连接 / 一个被占住的 vty** —— 网络设备上的 vty 数量
+   是有限的，泄漏几次就再也连不上了。
+
+   **残留（已记录，本轮不修）：**
+   - **两次 `connect()` 重叠**（用户连点两下，两次都还没走完）仍不安全：拆除动作作用于
+     "此刻的字段"，而不是"这一次尝试造出来的对象"，于是 catch 分支那句
+     `unawaited(_teardownSession())` 会拆掉**另一次**尝试的会话。修法是给每次尝试一个
+     代际令牌。本轮只记注释，不加令牌 —— 交给复审决定要不要现在做。
+   - 输出订阅上的 `onError: (Object _) {}` 仍然是"吞掉且不留痕"。两个真实实现都会把输出
+     流错误转成 `done` 完成，所以它目前是双保险；但真有一条错误走到这里，就是静默的 ——
+     与 §13.20 同一形状。已加注释记录。
+
 - [ ] **Step 1: 写失败测试**
 
 ```dart
@@ -4068,6 +4089,8 @@ import 'dart:async';
 import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:win_cli_tool/command/command_dispatcher.dart';
+import 'package:win_cli_tool/command/more_pager.dart';
+import 'package:win_cli_tool/command/prompt_detector.dart';
 import 'package:win_cli_tool/connection/connection_failure.dart';
 import 'package:win_cli_tool/connection/connection_manager.dart';
 import 'package:win_cli_tool/connection/known_host.dart';
@@ -4183,14 +4206,21 @@ class _FakeFactory implements SessionFactory {
   Future<bool> Function(KnownHost)? get onUnknownHostKey => null;
 }
 
-DeviceProfile _profile() => const DeviceProfile(
+/// 夹具的默认值与生产默认值**刻意保持一致**（`'\n'`、单条 `['enable']`），
+/// 两个参数只在用例显式传值时才不同 —— 否则上面那批用例断言的就不再是默认
+/// 行为，而"夹具的值恰好等于实现里硬编码的那个值"正是本文件要消灭的洞。
+DeviceProfile _profile({
+  List<String> postLogin = const ['enable'],
+  String lineEnding = '\n',
+}) => DeviceProfile(
   id: 'd1',
   name: '核心交换机',
   protocol: DeviceProtocol.ssh,
   host: '10.0.0.1',
   port: 22,
   username: 'admin',
-  postLoginCommands: ['enable'],
+  postLoginCommands: postLogin,
+  lineEnding: lineEnding,
 );
 
 void main() {
@@ -4362,9 +4392,6 @@ void main() {
       mgr.connect();
       async.flushMicrotasks();
 
-      final events = <ConnectionEvent>[];
-      mgr.events.listen(events.add);
-
       // 队列里已有登录后命令 'enable'，它已经写出去了、正在等提示符
       // （即"在途"）。再排三条用户命令，它们排在 'enable' 后面等着。
       final dispatcher = mgr.dispatcher!;
@@ -4378,11 +4405,10 @@ void main() {
       sessions[0].drop();
       async.flushMicrotasks();
 
-      expect(
-        events.whereType<SessionLost>().isNotEmpty,
-        isTrue,
-        reason: '断线必须通知界面',
-      );
+      // 这里不再断言 `SessionLost.isNotEmpty`：本用例要钉的是**丢弃数**，
+      // 而"事件发了"既不能证明条数、也不能证明它带上了什么（§13.20 那条
+      // 缺陷正是一个 `isNotEmpty` 放过去的）。条数由下面这行钉，
+      // "一次断线一个事件"由专门的用例钉。
 
       // FR-C-10 要求"输出区给出告警"，所以丢弃数必须报上来。
       // 3 条排队的 + 1 条在途的 = 4：在途那条的输出永远收不到了，
@@ -4489,7 +4515,11 @@ void main() {
       // 断线到重连成功恰好 1s（退避序列第一档）。
       // 这里能断言，靠的是 ConnectionManager 用 clock.now() 而不是
       // DateTime.now() —— 后者不受 fake_async 影响，会恒为 0。
-      expect(reconnected.downtime.inSeconds, 1);
+      //
+      // 断言的是**精确值**，不是 `inSeconds == 1`：后者会把 [1s, 2s) 全放过去，
+      // 1.9s 的断线时长照样算"1 秒"。`_disconnectedAt` 与重连定时器是在同一个
+      // 假时刻落下的（都是 drop 之后那个 microtask），所以差值是精确的 1s。
+      expect(reconnected.downtime, const Duration(seconds: 1));
       expect(reconnected.attempt, 1);
 
       mgr.dispose();
@@ -4623,6 +4653,477 @@ void main() {
     sessions.single.drop();
     await Future<void>.delayed(const Duration(milliseconds: 20));
     expect(sessions.length, 1, reason: 'dispose 之后不得再重连');
+  });
+
+  // ---- 入口管线（C1）：`output` 是界面唯一被允许订阅的输出通道 ----
+
+  test('会话输出经 mgr.output 转发，且跨重连连续（C1）', () {
+    fakeAsync((async) {
+      final sessions = <_FakeSession>[];
+      final mgr = ConnectionManager(
+        profile: _profile(),
+        factory: _FakeFactory(sessions),
+      );
+
+      // 界面只订阅这一个流，且在第一次连接**之前**就订阅了 —— 重连不会
+      // 让它重新订阅，所以它必须在新会话上继续有效。
+      final received = <String>[];
+      mgr.output.listen(received.add);
+
+      mgr.connect();
+      async.flushMicrotasks();
+
+      sessions[0].emit('Switch>');
+      async.flushMicrotasks();
+      expect(received, ['Switch>'], reason: '设备输出必须转发到 mgr.output');
+
+      // 断线重连：Session 对象被整个替换。
+      sessions[0].drop();
+      async.flushMicrotasks();
+      async.elapse(const Duration(seconds: 1));
+      async.flushMicrotasks();
+      expect(sessions.length, 2, reason: '应已重连');
+
+      sessions[1].emit('reconnected output');
+      async.flushMicrotasks();
+      expect(
+        received,
+        ['Switch>', 'reconnected output'],
+        reason: '同一个订阅必须继续收到**新**会话的输出 —— 否则重连后输出区永久静止',
+      );
+
+      mgr.dispose();
+      async.flushMicrotasks();
+    });
+  });
+
+  test('提示符回送时命令完成、队列继续下发（C1 / FR-C-04）', () {
+    fakeAsync((async) {
+      final sessions = <_FakeSession>[];
+      final mgr = ConnectionManager(
+        profile: _profile(),
+        factory: _FakeFactory(sessions),
+      );
+
+      final completed = <CommandCompleted>[];
+      final finished = <QueueFinished>[];
+
+      mgr.connect();
+      async.flushMicrotasks();
+
+      final dispatcher = mgr.dispatcher!;
+      dispatcher.events.listen((e) {
+        if (e is CommandCompleted) completed.add(e);
+        if (e is QueueFinished) finished.add(e);
+      });
+
+      // 'enable'（登录后命令）已写出、在途；这两条排在它后面等着。
+      dispatcher.enqueue(['show version', 'show run']);
+      expect(sessions[0].written, ['enable\n']);
+
+      // `_dispatcher?.onOutput` 是把设备输出送进判定器的**唯一**入口：
+      // 少了它，任何命令都不会在提示符上完成，只会一条条跑到 10s 超时。
+      sessions[0].emit('Switch# ');
+      async.elapse(const Duration(milliseconds: 200));
+      async.flushMicrotasks();
+
+      expect(
+        completed.map((e) => e.command),
+        ['enable'],
+        reason: '提示符必须让在途命令完成，而不是等超时',
+      );
+      expect(completed.single.timedOut, isFalse, reason: '这是提示符判定，不是超时');
+      expect(
+        sessions[0].written,
+        ['enable\n', 'show version\n'],
+        reason: '一条完成后必须写下一条',
+      );
+
+      // 队列继续走完。
+      for (var i = 0; i < 2; i++) {
+        sessions[0].emit('Switch# ');
+        async.elapse(const Duration(milliseconds: 200));
+        async.flushMicrotasks();
+      }
+
+      expect(completed.map((e) => e.command), ['enable', 'show version', 'show run']);
+      expect(finished, hasLength(1), reason: '三条都完成后队列结束');
+
+      mgr.dispose();
+      async.flushMicrotasks();
+    });
+  });
+
+  // ---- 界面消费的事件（I1）----
+
+  test('状态迁移经 ConnectionStateChanged 送达界面，含主动断开（§5.4 / I1）', () {
+    fakeAsync((async) {
+      final sessions = <_FakeSession>[];
+      final mgr = ConnectionManager(
+        profile: _profile(),
+        factory: _FakeFactory(sessions),
+      );
+
+      final states = <DeviceConnectionState>[];
+      mgr.events.listen((e) {
+        if (e is ConnectionStateChanged) states.add(e.state);
+      });
+
+      mgr.connect();
+      async.flushMicrotasks();
+
+      // 断线：黄（重连中）→ 绿（重连成功）
+      sessions[0].drop();
+      async.flushMicrotasks();
+      async.elapse(const Duration(seconds: 1));
+      async.flushMicrotasks();
+
+      // 用户主动断开：灰
+      mgr.disconnect();
+      async.flushMicrotasks();
+
+      // §5.4 的按钮颜色全部映射在这条事件流上：只断言 `mgr.state`（内部字段）
+      // 看不见"值有没有送到界面"，缺一环按钮颜色就是错的。
+      expect(
+        states,
+        [
+          DeviceConnectionState.connecting,
+          DeviceConnectionState.connected,
+          DeviceConnectionState.reconnecting,
+          DeviceConnectionState.connected,
+          DeviceConnectionState.disconnected,
+        ],
+        reason: '每次状态迁移都必须发事件（含主动断开那一次）',
+      );
+      expect(states.last, mgr.state);
+
+      mgr.dispose();
+      async.flushMicrotasks();
+    });
+  });
+
+  test('重连后 SessionReady 再发一次，且带的是新的 dispatcher（I1）', () {
+    fakeAsync((async) {
+      final sessions = <_FakeSession>[];
+      final mgr = ConnectionManager(
+        profile: _profile(),
+        factory: _FakeFactory(sessions),
+      );
+
+      final ready = <SessionReady>[];
+      mgr.events.listen((e) {
+        if (e is SessionReady) ready.add(e);
+      });
+
+      mgr.connect();
+      async.flushMicrotasks();
+      expect(ready, hasLength(1), reason: '首次连上要报一次');
+      final first = ready.single.dispatcher;
+
+      sessions[0].drop();
+      async.flushMicrotasks();
+      async.elapse(const Duration(seconds: 1));
+      async.flushMicrotasks();
+
+      // 界面靠这条事件重新订阅 `dispatcher.events`。少了它，重连之后
+      // 命令输出与 QueueDropped 都不会再到达界面，而按钮是绿的。
+      expect(ready, hasLength(2), reason: '每次连上都要报一次');
+      expect(
+        ready.last.dispatcher,
+        isNot(same(first)),
+        reason: '每次重连都新建 CommandDispatcher，界面必须重订阅',
+      );
+      expect(ready.last.dispatcher, same(mgr.dispatcher));
+
+      mgr.dispose();
+      async.flushMicrotasks();
+    });
+  });
+
+  test('ReconnectScheduled 带上第几次与等多久（FR-C-07 的可见形式）（I1）', () {
+    fakeAsync((async) {
+      final sessions = <_FakeSession>[];
+      final factory = _FakeFactory(sessions, failConnect: true);
+      final mgr = ConnectionManager(profile: _profile(), factory: factory);
+
+      final scheduled = <ReconnectScheduled>[];
+      mgr.events.listen((e) {
+        if (e is ReconnectScheduled) scheduled.add(e);
+      });
+
+      mgr.connect();
+      async.flushMicrotasks();
+      async.elapse(const Duration(seconds: 1));
+      async.flushMicrotasks();
+      async.elapse(const Duration(seconds: 2));
+      async.flushMicrotasks();
+
+      // FR-C-07 要求界面能显示"X 秒后重连"，这条事件是它唯一的数据源。
+      expect(scheduled.map((e) => e.attempt), [1, 2, 3]);
+      expect(scheduled.map((e) => e.delay), [
+        const Duration(seconds: 1),
+        const Duration(seconds: 2),
+        const Duration(seconds: 4),
+      ]);
+
+      mgr.dispose();
+      async.flushMicrotasks();
+    });
+  });
+
+  // ---- 夹具值与实现里的硬编码重合（I2）----
+
+  test('登录后命令是多条时全部依次下发（FR-C-08 / I2）', () {
+    fakeAsync((async) {
+      final sessions = <_FakeSession>[];
+      final mgr = ConnectionManager(
+        profile: _profile(postLogin: ['enable', 'configure terminal']),
+        factory: _FakeFactory(sessions),
+      );
+
+      mgr.connect();
+      async.flushMicrotasks();
+      expect(sessions[0].written, ['enable\n'], reason: '先发第一条');
+
+      sessions[0].emit('Switch# ');
+      async.elapse(const Duration(milliseconds: 200));
+      async.flushMicrotasks();
+
+      // 只发第一条的话，第二台以上的设备永远进不了配置模式 —— 且没有任何
+      // 报错（FR-C-08 要求"依次下发"）。
+      expect(
+        sessions[0].written,
+        ['enable\n', 'configure terminal\n'],
+        reason: '整个列表都要下发，不能只发第一条',
+      );
+
+      mgr.dispose();
+      async.flushMicrotasks();
+    });
+  });
+
+  test('会话拿到的是这台设备的 profile（host/id/username 不得串台）（I2）', () async {
+    final profile = _profile(postLogin: ['enable', 'show clock']);
+    final sessions = <_FakeSession>[];
+    final mgr = ConnectionManager(
+      profile: profile,
+      factory: _FakeFactory(sessions),
+    );
+
+    await mgr.connect();
+
+    expect(
+      sessions.single.profile,
+      same(profile),
+      reason: '交给工厂的必须是 manager 自己的那个 profile',
+    );
+    expect(sessions.single.profile.id, 'd1');
+    expect(sessions.single.profile.host, '10.0.0.1');
+    expect(sessions.single.profile.username, 'admin');
+
+    await mgr.dispose();
+  });
+
+  // ---- 行尾符与两个注入的判定器（I3）----
+
+  test('DeviceProfile.lineEnding 真的到了线上（老设备要 \\r\\n）（I3）', () async {
+    final sessions = <_FakeSession>[];
+    final mgr = ConnectionManager(
+      profile: _profile(lineEnding: '\r\n'),
+      factory: _FakeFactory(sessions),
+    );
+
+    await mgr.connect();
+
+    // 行尾符配错时设备什么都不执行，而界面看不出任何异常。
+    expect(
+      sessions.single.written,
+      ['enable\r\n'],
+      reason: '行尾符配成 \\r\\n 就必须发 \\r\\n',
+    );
+
+    await mgr.dispose();
+  });
+
+  test('注入的 promptDetector 生效：默认提示符不再算完成（I3）', () {
+    fakeAsync((async) {
+      final sessions = <_FakeSession>[];
+      final mgr = ConnectionManager(
+        profile: _profile(),
+        factory: _FakeFactory(sessions),
+        // 只认 `>` 结尾。`#` 结尾的（默认正则认）不该再算提示符。
+        promptDetector: PromptDetector(pattern: RegExp(r'>\s*$')),
+      );
+
+      final completed = <CommandCompleted>[];
+      mgr.connect();
+      async.flushMicrotasks();
+      mgr.dispatcher!.events.listen((e) {
+        if (e is CommandCompleted) completed.add(e);
+      });
+
+      // 默认正则认 `Switch#`，注入的这个不认 —— 命令不得完成。
+      sessions[0].emit('Switch# ');
+      async.elapse(const Duration(milliseconds: 500));
+      async.flushMicrotasks();
+      expect(
+        completed,
+        isEmpty,
+        reason: '忽略注入的话默认正则认得 `#`，这条就会被判成完成',
+      );
+
+      // 注入的这个认 `Switch>` —— 这次必须完成。
+      sessions[0].emit('Switch> ');
+      async.elapse(const Duration(milliseconds: 500));
+      async.flushMicrotasks();
+      expect(completed, hasLength(1), reason: '自定义正则认得就必须完成');
+      expect(completed.single.command, 'enable');
+
+      mgr.dispose();
+      async.flushMicrotasks();
+    });
+  });
+
+  test('注入的 morePager 生效：自定义翻页提示也回送继续键（I3）', () {
+    fakeAsync((async) {
+      final sessions = <_FakeSession>[];
+      final mgr = ConnectionManager(
+        profile: _profile(),
+        factory: _FakeFactory(sessions),
+        // 设备用的是自定义的翻页提示，不在默认那三种里。
+        morePager: MorePager(patterns: const ['(q)uit']),
+      );
+
+      mgr.connect();
+      async.flushMicrotasks();
+      expect(sessions[0].written, ['enable\n']);
+
+      sessions[0].emit('...\n(q)uit');
+      async.flushMicrotasks();
+
+      // 不回送继续键，设备就停在翻页提示上：这一条命令要等到 10s 超时才
+      // 算结束，后面的命令全部被它堵住。
+      expect(
+        sessions[0].written,
+        ['enable\n', MorePager.continueKey],
+        reason: '自定义翻页提示必须触发继续键',
+      );
+
+      mgr.dispose();
+      async.flushMicrotasks();
+    });
+  });
+
+  // ---- 退避序列这个注入口本身（I4）----
+
+  test('注入的 backoff 生效：重连发生在配置的延迟上（I4）', () {
+    fakeAsync((async) {
+      final sessions = <_FakeSession>[];
+      final factory = _FakeFactory(sessions, failConnect: true);
+      final mgr = ConnectionManager(
+        profile: _profile(),
+        factory: factory,
+        backoff: const [Duration(milliseconds: 50), Duration(milliseconds: 80)],
+      );
+
+      mgr.connect();
+      async.flushMicrotasks();
+      expect(factory.created, 1);
+
+      // 默认序列的第一档是 1s。注入 50ms 之后 999ms 那套断言就不再适用。
+      async.elapse(const Duration(milliseconds: 49));
+      async.flushMicrotasks();
+      expect(factory.created, 1, reason: '不足注入的 50ms 不得重连');
+
+      async.elapse(const Duration(milliseconds: 1));
+      async.flushMicrotasks();
+      expect(factory.created, 2, reason: '应按注入的 50ms 重连');
+
+      // 第二档也是注入的 80ms —— 整个序列都换了，不只是第一项。
+      async.elapse(const Duration(milliseconds: 80));
+      async.flushMicrotasks();
+      expect(factory.created, 3, reason: '第二档应按注入的 80ms');
+
+      mgr.dispose();
+      async.flushMicrotasks();
+    });
+  });
+
+  // ---- connect() 必须拥有它替换掉的那条会话（I5）----
+
+  test('已连接时再 connect()：被替换的会话必须被关掉、订阅必须被摘掉（I5a）', () async {
+    final sessions = <_FakeSession>[];
+    final mgr = ConnectionManager(
+      profile: _profile(),
+      factory: _FakeFactory(sessions),
+    );
+
+    final received = <String>[];
+    mgr.output.listen(received.add);
+
+    await mgr.connect();
+    await mgr.connect();
+
+    expect(sessions.length, 2, reason: '第二次手动连接会建一条新会话');
+    // 泄漏的不是内存，是**一条仍插在设备上的 SSH 连接**：设备侧的 vty
+    // 一直占着，而应用这边再也拿不到它去关。
+    expect(
+      sessions[0].closed,
+      isTrue,
+      reason: '被替换掉的会话必须被 close()，否则它永远没人关',
+    );
+    expect(sessions[1].closed, isFalse, reason: '当前会话仍然活着');
+    expect(mgr.state, DeviceConnectionState.connected);
+    expect(sessions[1].written, ['enable\n'], reason: '新会话照样要下发登录后命令');
+
+    // 旧会话的订阅也必须摘掉：它还挂着的话，那条已被替换的连接会继续往
+    // 界面灌数据（两个会话的回显混在一起，且谁也停不下来）。
+    sessions[0].emit('stale output');
+    sessions[1].emit('live output');
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+
+    expect(
+      received,
+      ['live output'],
+      reason: '被替换掉的会话不得再往 mgr.output 里灌数据',
+    );
+
+    await mgr.dispose();
+  });
+
+  test('重连待命中手动 connect()：待命的重连定时器必须作废（I5c）', () {
+    fakeAsync((async) {
+      final sessions = <_FakeSession>[];
+      final factory = _FakeFactory(sessions);
+      final mgr = ConnectionManager(profile: _profile(), factory: factory);
+
+      mgr.connect();
+      async.flushMicrotasks();
+      expect(factory.created, 1);
+
+      // 断线 → 排程 1s 后的重连（`_retryTimer` 待命）。
+      sessions[0].drop();
+      async.flushMicrotasks();
+
+      // 用户此刻手动点"连接"，并且在那个定时器到点前就连上了。
+      mgr.connect();
+      async.flushMicrotasks();
+      expect(factory.created, 2, reason: '手动连接应立刻建一条新会话');
+
+      // 原本待命的重连定时器到点。它若不作废，就会再造一条会话，把刚连上的
+      // 这条顶掉（`_session` 被覆写 → 这条再也没人关）。
+      async.elapse(const Duration(seconds: 5));
+      async.flushMicrotasks();
+      expect(
+        factory.created,
+        2,
+        reason: '待命的重连定时器不得在手动连接之后再触发一次',
+      );
+      expect(sessions[1].closed, isFalse, reason: '手动连上的会话不得被覆写掉');
+
+      mgr.dispose();
+      async.flushMicrotasks();
+    });
   });
 }
 ```
@@ -4812,9 +5313,31 @@ class ConnectionManager {
   }
 
   /// 发起连接。用户点击设备按钮时调用（FR-C-03）。
+  ///
+  /// **本方法拥有它替换掉的那条会话。** 会话是在这里被换掉的，所以拆掉旧的
+  /// 也是这里的责任：直接建新会话再覆写 `_session` / `_outputSub` / `_dispatcher`，
+  /// 旧的既没人 `close()`、订阅也再没人取消 —— 泄漏的不是内存，而是**一条仍插在
+  /// 设备上的 SSH 连接**（设备侧那个 vty 一直占着，直到它自己超时）。重连那条路
+  /// 不需要这段：`_onSessionDone` 与失败分支都会在排程之前先把字段**同步**清空，
+  /// 定时器醒来时手里已经没有旧会话了。
+  ///
+  /// **仍未解决（记录在案，本轮不改）**：两次**重叠**的 [connect]（用户连点两下，
+  /// 或手动连接与重连定时器同时落下）依然不安全。拆解作用在"当下的字段"而不是
+  /// "自己那次尝试的对象"上：第二次的拆除会把第一次刚建的会话关掉，而第一次随后
+  /// 失败时，catch 里那句 `unawaited(_teardownSession())` 拆的是**第二次**的新会话。
+  /// 根治要给每次尝试配一个代号（generation），让拆除只认自己的会话。
   Future<void> connect() async {
     if (_disposed) return;
     _userClosed = false;
+    // 动手之前先摘掉待命的重连定时器：手动连接一旦成功，`_attempt` 会归零，
+    // 而那个定时器并不知道又有人连上了 —— 它到点照跑，会再造一条会话把刚连上
+    // 的这条顶掉（`_session` 被覆写，这条就再也没人关了）。
+    _retryTimer?.cancel();
+    _retryTimer = null;
+    // 已经连着（或上一次拆除还没走完）时，先把旧会话拆干净再建新的，见上面的
+    // 所有权说明。这里 `await` 是安全的：按契约 `Session.close()` **不会**触发
+    // `done`（session.dart），所以旧会话不会在拆除途中反过来走一趟 `_onSessionDone`。
+    await _teardownSession();
     await _attemptConnect();
   }
 
@@ -4854,6 +5377,10 @@ class ConnectionManager {
       return;
     }
 
+    // `onError` 是保险，不是通道：两个真实实现都把 output 上的错误转成了 `done`
+    // 的**完成**（`_onError` → `_onDisconnected`），output 本身不会以错误结束。
+    // 真要有错误漏到这里，它是**静默**吞掉的 —— 没有事件、没有日志、没有状态
+    // 变化，所以别指望它能报信。
     _outputSub = session.output.listen((chunk) {
       if (!_output.isClosed) _output.add(chunk);
       _dispatcher?.onOutput(chunk);
@@ -5002,26 +5529,49 @@ class ConnectionManager {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `flutter test test/connection/connection_manager_test.dart`
-Expected: 13 个用例全部 PASS
+Expected: 26 个用例全部 PASS
 
-- [ ] **Step 5: 反证十个承载行为的非空性（逐个做，每个都要看到红）**
+- [ ] **Step 5: 反证二十三个承载行为的非空性（逐个做，每个都要看到红）**
 
 计划 1 的教训是"全绿"不等于"被约束"。下表每一条都是把缺陷**放回去**，确认对应测试确实变红；不变红就说明那条测试是空的。每改一条立刻恢复，最后 `git diff` 确认工作区干净再提交。
 
 | # | 把缺陷放回去 | 必须变红的测试 |
 |---|---|---|
-| M1 | `_scheduleRetry` 里 `final delay = backoff[...]` 改成 `backoff[0]`（退避不再升级） | 连续建连失败按 1s -> 2s -> 4s 退避 |
+| M1 | `_scheduleRetry` 里 `final delay = backoff[...]` 改成 `backoff[0]`（退避不再升级） | 连续建连失败按 1s -> 2s -> 4s 退避；退避在 30s 封顶；连上一次之后退避归零；ReconnectScheduled 带上第几次与等多久（I1） |
 | M2 | `_attemptConnect` 成功分支里删掉 `_attempt = 0;`（连上后不归零） | 连上一次之后退避归零 |
-| M3 | `disconnect()` 里把 `_setState(disconnected)` 挪到 `await _teardownSession()` **之后** | 用户主动断开不触发重连 |
-| M4 | `_teardownSession` 里删掉 `await session.close();` | dispose() 关闭会话（FR-C-12） |
-| M5 | `_onSessionDone` 里删掉 `_dispatcher?.onDisconnected();` | 断线时未发出的命令被丢弃（FR-C-10） |
-| M6 | `onDisconnected` 里 `_queue.length + (_current != null ? 1 : 0)` 改成只算 `_queue.length` | 同上（丢弃数漏算在途的那条） |
-| M7 | `_attemptConnect` 的 catch 里去掉 `if (_disposed \|\| _userClosed) return;`，并把 `_scheduleRetry` 的 `_userClosed` 早退合并回「置 failed」 | 建连途中用户主动断开：不得报失败，也不得转红 |
-| M8 | `_onSessionDone` 里再补一句 `_events.add(SessionLost(null));` | 一次断线只发一个 SessionLost |
+| M3 | `disconnect()` 里把 `_setState(disconnected)` 挪到 `await _teardownSession()` **之后** | 用户主动断开不触发重连；状态迁移经 ConnectionStateChanged 送达界面（I1） |
+| M4 | `_teardownSession` 里删掉 `await session.close();` | 建连途中用户主动断开；dispose() 关闭会话（FR-C-12）；已连接时再 connect() 必须关掉被替换的那条（I5a） |
+| M5 | `_onSessionDone` 里删掉 `_dispatcher?.onDisconnected();` | 断线时未发出的命令被丢弃且不重放；一次断线只发一个 SessionLost |
+| M6 | `command_dispatcher.dart` 里 `_queue.length + (_current != null ? 1 : 0)` 改成只算 `_queue.length` | 同上两条（丢弃数漏算在途的那条） |
+| M7 | `_attemptConnect` 的 catch 里去掉 `if (_disposed \| _userClosed) return;`，并把 `_scheduleRetry` 的 `_userClosed` 早退合并回「置 failed」 | 建连途中用户主动断开：不得报失败，也不得转红 |
+| M8 | `_onSessionDone` 里再补一句 `_events.add(const SessionLost(null));` | SessionLost 必须带上断开原因（§13.20）；一次断线只发一个 SessionLost |
 | M9 | `_scheduleRetry` 里删掉 `if (!autoReconnect) { _setState(failed); return; }` | 关闭自动重连时，建连失败置为 failed（红） |
-| M10 | `_onSessionDone` 里把 `session.lastError` 换成恒 `null`（原因到不了界面） | SessionLost 必须带上断开原因（§13.20） |
+| M10 | 注册处 `session.done.then((_) => _onSessionDone(session.lastError))` 改成传 `null` | SessionLost 必须带上断开原因（§13.20） |
+| M11 | 输出订阅里删掉 `if (!_output.isClosed) _output.add(chunk);` | 会话输出经 `mgr.output` 转发，且跨重连连续（C1）；已连接时再 connect() 不得让旧会话的输出继续流到界面（I5a） |
+| M12 | 输出订阅里删掉 `_dispatcher?.onOutput(chunk);` | 提示符回送时命令完成、队列继续下发（C1 / FR-C-04）；登录后命令是多条时全部依次下发（I2）；注入的 promptDetector 生效（I3）；注入的 morePager 生效（I3） |
+| M13 | 删掉 `ConnectionStateChanged` 的 emit | 状态迁移经 ConnectionStateChanged 送达界面，含主动断开（§5.4 / I1） |
+| M14 | 删掉 `SessionReady` 的 emit | 重连后 SessionReady 再发一次，且带的是新 dispatcher（I1） |
+| M15 | 删掉 `ReconnectScheduled` 的 emit | ReconnectScheduled 带上第几次与等多久（I1） |
+| M16 | `enqueue(profile.postLoginCommands)` 改成 `enqueue(const ['enable'])` | 登录后命令是多条时全部依次下发（FR-C-08 / I2） |
+| M17 | `factory.create(profile)` 改成传一个 host 不同的 profile | 会话拿到的是这台设备的 profile（host/id/username 不得串台）（I2） |
+| M18 | `lineEnding: profile.lineEnding` 改成 `'\n'` | DeviceProfile.lineEnding 真的到了线上（老设备要 `\r\n`）（I3） |
+| M19 | `promptDetector ?? PromptDetector()` 改成 `PromptDetector()` | 注入的 promptDetector 生效：默认提示符不再算完成（I3） |
+| M20 | `morePager ?? MorePager()` 改成 `MorePager()` | 注入的 morePager 生效：自定义翻页提示也回送继续键（I3） |
+| M21 | backoff 的**使用点**换成硬编的默认序列（刻意的：不写成 M1 那种 `backoff[0]`，好让 M1 那几行保持独立） | 注入的 backoff 生效：重连发生在配置的延迟上（I4） |
+| M22 | `connect()` 里删掉 `await _teardownSession();` | 已连接时再 connect() 必须关掉被替换的那条（I5a） |
+| M23 | `connect()` 里删掉 `_retryTimer?.cancel(); _retryTimer = null;` | 重连待命中手动 connect()：待命的重连定时器必须作废（I5c） |
 
-已实测：M1–M10 全部变红。
+已实测：M1–M23 全部变红，**零假红**（没有任何一条红是点名文件路径的）。
+
+**M0-PREFIX（基线，不是变异）：把 `acdc10d` 的实现配上**新**用例** —— 26 条里**恰好 2 红**
+（`已连接时再 connect()…` 与 `重连待命中手动 connect()…`），其余 24 条全绿。这是 I5 修复的
+非空性证据：修之前那两条就是红的，修之后全绿，而其余用例两条都绿 —— 说明新用例钉的正是
+那条不变量，不是别的东西。
+
+**M4 的爆炸半径比原先记的大**：删掉 `await session.close();` 之后，那条 gate 型用例的
+`connect()` 再也没人放行，于是它以 `TimeoutException after 0:00:30` 变红 —— 点名用例，成色是
+超时（与 §13.23-2 同一条）。它同时把「已连接时再 connect()」也带红。原先那一行只记了
+FR-C-12 一条用例，**少记了两条**。
 
 **M7（代码评审查出来的真缺陷）**：catch 分支原来只认 `_disposed`，成功分支却认 `_disposed || _userClosed` —— 这个不对称就是漏洞。用户在 `session.connect()` 还没返回时点"断开"，`disconnect()` 会关掉 socket 让在途的 connect 抛错，于是走进 catch：既发了一个**假告警**（这次失败是我们自己造成的），又经 `_scheduleRetry()` 把状态刷成 `failed` —— 按钮从灰变红。spec §5.4 写得很清楚：用户主动断开，**按钮变灰**。修法是 catch 与 `_scheduleRetry` 都认 `_userClosed`，并且把 `!autoReconnect`（真正该变红的唯一情形）与 `_userClosed` 分开处理。
 
