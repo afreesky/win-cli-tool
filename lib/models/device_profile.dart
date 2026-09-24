@@ -13,6 +13,13 @@ enum DeviceProtocol {
   int get defaultPort => this == DeviceProtocol.ssh ? 22 : 23;
 }
 
+/// 「调用方没传这个参数」的哨兵，用来区分它与「调用方显式传了 null」。
+///
+/// 见 Task 2 开头对 [DeviceProfile.password]、[DeviceProfile.privateKeyPath]、
+/// [DeviceProfile.promptRegex] 的说明：这几个字段的 null 是有语义的值，不能被
+/// `?? this.x` 吞掉。
+const Object _unset = Object();
+
 /// 一条可复用的命令片段，归属于单台设备。
 class Snippet {
   const Snippet({required this.id, required this.name, required this.content});
@@ -65,8 +72,8 @@ class JumpHost {
     String? host,
     int? port,
     String? username,
-    String? password,
-    String? privateKeyPath,
+    Object? password = _unset,
+    Object? privateKeyPath = _unset,
   }) =>
       JumpHost(
         id: id,
@@ -74,8 +81,11 @@ class JumpHost {
         host: host ?? this.host,
         port: port ?? this.port,
         username: username ?? this.username,
-        password: password ?? this.password,
-        privateKeyPath: privateKeyPath ?? this.privateKeyPath,
+        password:
+            identical(password, _unset) ? this.password : password as String?,
+        privateKeyPath: identical(privateKeyPath, _unset)
+            ? this.privateKeyPath
+            : privateKeyPath as String?,
       );
 
   factory JumpHost.fromJson(Map<String, Object?> json) => JumpHost(
@@ -148,11 +158,11 @@ class DeviceProfile {
     String? host,
     int? port,
     String? username,
-    String? password,
-    String? privateKeyPath,
+    Object? password = _unset,
+    Object? privateKeyPath = _unset,
     List<String>? jumpHostIds,
     String? lineEnding,
-    String? promptRegex,
+    Object? promptRegex = _unset,
     List<String>? postLoginCommands,
     bool? autoConnect,
     List<Snippet>? snippets,
@@ -164,11 +174,16 @@ class DeviceProfile {
         host: host ?? this.host,
         port: port ?? this.port,
         username: username ?? this.username,
-        password: password ?? this.password,
-        privateKeyPath: privateKeyPath ?? this.privateKeyPath,
+        password:
+            identical(password, _unset) ? this.password : password as String?,
+        privateKeyPath: identical(privateKeyPath, _unset)
+            ? this.privateKeyPath
+            : privateKeyPath as String?,
         jumpHostIds: jumpHostIds ?? this.jumpHostIds,
         lineEnding: lineEnding ?? this.lineEnding,
-        promptRegex: promptRegex ?? this.promptRegex,
+        promptRegex: identical(promptRegex, _unset)
+            ? this.promptRegex
+            : promptRegex as String?,
         postLoginCommands: postLoginCommands ?? this.postLoginCommands,
         autoConnect: autoConnect ?? this.autoConnect,
         snippets: snippets ?? this.snippets,

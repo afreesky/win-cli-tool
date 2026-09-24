@@ -53,13 +53,24 @@ void main() {
       expect(restored.outputBufferLines, 1000);
     });
 
-    test('字段缺失时回落到默认值（向前兼容旧配置文件）', () {
+    test('字段缺失时全部回落到默认值（向前兼容旧配置文件）', () {
+      // 逐个字段与「构造函数的默认值」比对，而不是写死字面量：这样
+      // fromJson 里的回落值与构造函数默认值一旦只改了一边，测试就会失败。
+      const defaults = AppSettings();
+
       final restored = AppSettings.fromJson(const <String, Object?>{});
 
-      expect(restored.promptDebounceMs, 120);
-      expect(restored.theme, AppTheme.system);
-      expect(restored.verifySshHostKey, isTrue);
-      expect(restored.outputBufferLines, 5000);
+      expect(restored.defaultPromptRegex, defaults.defaultPromptRegex);
+      expect(restored.promptDebounceMs, defaults.promptDebounceMs);
+      expect(restored.commandTimeoutMs, defaults.commandTimeoutMs);
+      expect(restored.connectTimeoutMs, defaults.connectTimeoutMs);
+      expect(restored.morePromptPatterns, defaults.morePromptPatterns);
+      expect(restored.logEnabled, defaults.logEnabled);
+      expect(restored.logDir, defaults.logDir);
+      expect(restored.verifySshHostKey, defaults.verifySshHostKey);
+      expect(restored.theme, defaults.theme);
+      expect(restored.editorSplitRatio, defaults.editorSplitRatio);
+      expect(restored.outputBufferLines, defaults.outputBufferLines);
     });
 
     test('整数形式的 editorSplitRatio 也能解析', () {
@@ -82,6 +93,16 @@ void main() {
       expect(t.commandTimeoutMs, 1000);
       expect(t.promptDebounceMs, 120);
       expect(t.verifySshHostKey, isTrue);
+    });
+
+    test('copyWith 能把 logDir 显式清回 null（回落默认日志目录）', () {
+      const s = AppSettings(logDir: '/tmp/logs');
+
+      // 不传 → 保留
+      expect(s.copyWith(theme: AppTheme.dark).logDir, '/tmp/logs');
+
+      // 显式传 null → 清空，回到「用应用数据目录下的 logs/」
+      expect(s.copyWith(logDir: null).logDir, isNull);
     });
   });
 }

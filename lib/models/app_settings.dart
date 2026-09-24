@@ -10,6 +10,12 @@ enum AppTheme {
       );
 }
 
+/// 「调用方没传这个参数」的哨兵，用来区分它与「调用方显式传了 null」。
+///
+/// [AppSettings.logDir] 的 null 表示「用默认日志目录」，是有语义的值，
+/// 不能被 `?? this.x` 吞掉 —— 否则用户清空日志目录后旧目录仍然生效（FR-G-01）。
+const Object _unset = Object();
+
 /// 全局设置。字段与 spec §8.6 的 settings.json 一一对应。
 class AppSettings {
   const AppSettings({
@@ -66,7 +72,7 @@ class AppSettings {
     int? connectTimeoutMs,
     List<String>? morePromptPatterns,
     bool? logEnabled,
-    String? logDir,
+    Object? logDir = _unset,
     bool? verifySshHostKey,
     AppTheme? theme,
     double? editorSplitRatio,
@@ -79,7 +85,7 @@ class AppSettings {
         connectTimeoutMs: connectTimeoutMs ?? this.connectTimeoutMs,
         morePromptPatterns: morePromptPatterns ?? this.morePromptPatterns,
         logEnabled: logEnabled ?? this.logEnabled,
-        logDir: logDir ?? this.logDir,
+        logDir: identical(logDir, _unset) ? this.logDir : logDir as String?,
         verifySshHostKey: verifySshHostKey ?? this.verifySshHostKey,
         theme: theme ?? this.theme,
         editorSplitRatio: editorSplitRatio ?? this.editorSplitRatio,
