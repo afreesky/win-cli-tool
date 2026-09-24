@@ -4143,7 +4143,15 @@ FR-C-06 要求「连接失败时，设备按钮变红」，但本计划的 `Conn
 
 ## 本计划**不**包含（属于计划 3）
 
-- `JumpHostPool`、`SshTunnelConnector`、`connection_socket.dart` 之外的多跳组合
+> **2026-09-24 范围收缩：** 计划 3 的跳板机功能**只做单跳**。下面第一行的
+> `JumpHostPool`（FR-J-07 的前缀复用 + 引用计数）与「多跳组合」中的 **N 跳链**
+> （FR-J-03）**已推迟到 V1.1**，计划 3 不实现。第二、三行（`forwardLocal` /
+> `direct-tcpip` 通道、跳板机断线导致的批量断线通知）**仍在计划 3 内** ——
+> 单跳也要走 `direct-tcpip`，单跳跳板机断线同样要让经由它的设备断线。
+> 见 spec §10.2。
+
+- ~~`JumpHostPool`~~、`SshTunnelConnector`、`connection_socket.dart` 之外的多跳组合
+  （**V1.1**：`JumpHostPool` 与 N 跳链）
 - `forwardLocal` / `direct-tcpip` 通道与 `SSHForwardChannel.destroy()`
 - 跳板机断线导致的批量断线通知（FR-J-05 的跨设备部分）
 
