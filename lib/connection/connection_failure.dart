@@ -86,7 +86,10 @@ ConnectionFailure _classify(Object error) {
     );
   }
 
-  // SSHAuthAbortError 必须在 SSHAuthError 之前判 —— 它是子类。
+  // 注意：这里**没有** `is SSHAuthError` 分支，所以眼下不存在顺序问题。
+  // 将来若加，必须排在本分支之后 —— SSHAuthAbortError 与 SSHAuthFailError
+  // 都 implements SSHAuthError（ssh_errors.dart:40/49），`is SSHAuthError`
+  // 会把两者一起吞掉。
   if (error is SSHAuthAbortError) {
     final reason = error.reason;
 
@@ -100,12 +103,16 @@ ConnectionFailure _classify(Object error) {
       );
     }
     if (reason is SSHInternalError) {
+      // 文案不能断言成因。dartssh2 对这个类的自述是"不该发生的错误，多半是
+      // 库自身的缺陷"（ssh_errors.dart:14-16），算法协商失败只是它承载的
+      // **其中**一种情况。若一口咬定"与该设备协商加密参数失败"，一个库缺陷
+      // 就会被说成设备的算法问题 —— 用户跑去翻设备的 SSH 配置，而那正是
+      // §13.15 要避免的"把人指向错误的方向"。所以两种成因并列，并始终附原文。
       return ConnectionFailure(
         ConnectionFailureKind.protocolError,
-        '协议错误：与该设备协商加密参数失败。'
-        '常见原因是设备只提供已被淘汰的 SSH 算法'
-        '（ssh-rsa/SHA-1、aes-cbc、hmac-md5 等），V1 暂不支持。'
-        '原始信息：${reason.error}',
+        '协议错误：SSH 协议层报错。两种常见原因：设备只提供已被淘汰的 SSH '
+        '算法（ssh-rsa/SHA-1、aes-cbc、hmac-md5 等，V1 暂不支持），'
+        '或本程序/对端实现自身的缺陷。原始信息：${reason.error}',
         cause: error,
       );
     }

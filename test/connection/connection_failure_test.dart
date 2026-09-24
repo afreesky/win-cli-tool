@@ -86,11 +86,43 @@ void main() {
     });
 
     test('认不出的 reason 优雅降级为 protocolError 并附上原文', () {
+      // **输入必须是真正认不出的 reason。** 这里原先是
+      // `SSHInternalError(StateError('something new'))` —— 那是一个**认得出**的
+      // reason，走的是上面那条 SSHInternalError 分支，根本碰不到兜底。于是
+      // 把兜底改成 `throw` 之后这条测试照样绿（实测过），而兜底恰恰是本 Task
+      // 点名要求的那条「优雅降级」。用一个非 hostkey、非 internal 的 SSHError
+      // 才能真正走到兜底。
       final f = classifyConnectionFailure(
-        SSHAuthAbortError('boom', SSHInternalError(StateError('something new'))),
+        SSHAuthAbortError('boom', SSHAuthFailError('weird')),
       );
       expect(f.kind, ConnectionFailureKind.protocolError);
-      expect(f.message, contains('something new'));
+      expect(f.message, contains('weird'));
+    });
+
+    test('reason 为 null 时同样降级，并附上 abort 自己的消息', () {
+      final f = classifyConnectionFailure(SSHAuthAbortError('boom'));
+
+      expect(f.kind, ConnectionFailureKind.protocolError);
+      expect(f.message, contains('boom'));
+    });
+  });
+
+  group('SSHSocketError 必须拆开按内层分类', () {
+    test('拒绝连接 → unreachable，超时 → timeout（不拆开就分不出这两者）', () {
+      // 守的是 `_classify` 里 `if (error is SSHSocketError) return
+      // _classify(error.error);` 那一支。它此前零覆盖 —— 把它改成 `throw`，
+      // 12 条用例照样全绿（实测过）。而这正是那句注释所声称的作用。
+      expect(
+        classifyConnectionFailure(
+          SSHSocketError(const SocketException('Connection refused')),
+        ).kind,
+        ConnectionFailureKind.unreachable,
+      );
+      expect(
+        classifyConnectionFailure(SSHSocketError(TimeoutException('timed out')))
+            .kind,
+        ConnectionFailureKind.timeout,
+      );
     });
   });
 
