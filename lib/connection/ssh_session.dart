@@ -65,6 +65,7 @@ class SshSession implements Session {
   var _closed = false;
 
   /// 最近一次断开的原始错误。正常断开为 null。
+  @override
   Object? get lastError => _lastError;
 
   @override
@@ -203,18 +204,41 @@ class SshSession implements Session {
     final client = _createClient(socket, identities);
     _client = client;
 
-    await client.authenticated;
-
-    // 认证期间也可能被 close()。
-    if (_closed) {
+    // **拨号之后的阶段同样要有上限**（spec §13.21-1）。原先 `connectTimeout`
+    // 只交给了拨号（`connector.open(timeout: …)`），而握手 / 认证 / shell 这
+    // 三段**没有任何超时**：一台"接受了 TCP 却不说话"的设备（老设备卡在 KEX、
+    // 或中间有个只做 TCP 代理的黑洞）会让 `await client.authenticated`
+    // **永远**挂着 —— 按钮一直黄，既没有 `ConnectionFailed`、也不重连。
+    // FR-C-13 承诺的是「连接超时默认 15 秒」，用户得到的却是无限等待。
+    // **这不是「慢」，是没有任何出口。**
+    //
+    // 刻意**不**给 dartssh2 设 `handshakeTimeout` / `authTimeout`：那样超时会
+    // 变成 `SSHHandshakeError('Handshake timed out')`，落进分类器
+    // `is SSHHandshakeError` 那一支 → 报成 `protocolError`，文案说"对端可能
+    // 不是 SSH 服务" —— 正是 §13.15 要防的"把超时说成协议问题"。包在这一层
+    // 抛的则是 `TimeoutException`，而分类器里 `TimeoutException` → `timeout`
+    // 那一支早就写好、也测过了（`connection_failure.dart` 的 `_timeoutMessage`），
+    // 这一改让那一支有了第一个真实调用方。
+    //
+    // 包的是**整段**（认证之后接着开 shell），不是一个阶段一个定时器：
+    // 用户点一次"连接"，等的就是"连上"这一个结果。
+    final SSHSession? session;
+    try {
+      session =
+          await _authenticatedShell(client, socket).timeout(connectTimeout);
+    } on TimeoutException {
+      // 超时也必须收干净：`client` 与 `socket` 都是这一次 connect() 建起来的，
+      // 不能指着"调用方总会 close()"把它们留给对方。与下面两处 `if (_closed)`
+      // 守卫同一套收尾（`client.close()` + `socket.dispose()`）。
+      // 这里 `await` 不会挂：`client.close()` 最终关的是手上这条连接，
+      // 而超时场景是对端**不说话**，不是拒绝关闭。
       await client.close();
       socket.dispose();
-      return;
+      rethrow;
     }
+    // null 表示认证期间被 close()；收尾已在 _authenticatedShell 里做完。
+    if (session == null) return;
 
-    final session = await client.shell(
-      pty: SSHPtyConfig(type: ptyType, width: ptyWidth, height: ptyHeight),
-    );
     if (_closed) {
       session.close();
       await client.close();
@@ -241,6 +265,32 @@ class SshSession implements Session {
     session.done.then(
       (_) => _onDisconnected(null),
       onError: (Object e, StackTrace _) => _onDisconnected(e),
+    );
+  }
+
+  /// 拨号之后的阶段：等握手与认证走完，再开一个 shell。
+  ///
+  /// 单独成方法，是为了让 [connect] 能给这**整段**包一个
+  /// `.timeout(connectTimeout)`（spec §13.21-1）。内联在 `connect()` 里的话，
+  /// 两处 `await` 得各包一次，"连接超时"就变成两个互不知情的定时器。
+  ///
+  /// 返回 null 表示认证期间被 close() 了 —— 此时收尾（client + socket）已经在
+  /// 这里做完，调用方直接返回即可。
+  Future<SSHSession?> _authenticatedShell(
+    SSHClient client,
+    ConnectionSocket socket,
+  ) async {
+    await client.authenticated;
+
+    // 认证期间也可能被 close()。
+    if (_closed) {
+      await client.close();
+      socket.dispose();
+      return null;
+    }
+
+    return client.shell(
+      pty: SSHPtyConfig(type: ptyType, width: ptyWidth, height: ptyHeight),
     );
   }
 

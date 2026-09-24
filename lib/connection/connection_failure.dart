@@ -143,17 +143,28 @@ ConnectionFailure _classify(Object error) {
   if (error is ConnectionFailure) return error;
 
   if (error is TimeoutException) {
-    // 这一支是**防御性**的，而且比原先写的更"死"。原先这里说 dartssh2 在
-    // 握手/认证超时时抛 `SSHHandshakeError('Handshake timed out')` 与
-    // `SSHAuthAbortError('Authentication timed out')` —— 但那两条只在 dartssh2
-    // **自己设了超时定时器**时才成立，而 `handshakeTimeout` 与 `authTimeout`
-    // 的默认值都是 null（ssh_client.dart:299-302），而 V1 的 `lib/` 里**没有
-    // 任何一处**给 `SSHClient` 设过它们 —— 这两个名字在 `lib/` 下的命中
-    // **无一在代码里**，全部落在这段注释自身（`grep -rn "handshakeTimeout\|authTimeout"`
-    // `lib/`）。所以那两条路径今天都到不了。
+    // **这一支今天有了真实调用方，不再是"防御性"的**（spec §13.21-1）。
     //
-    // 真正撑起 FR-C-13 的只有下面 `SocketException` 那一支的 errno 判定 ——
-    // 别把这一支的绿色读成"超时路径已验证"。
+    // 调用方是 `SshSession.connect()`：它给**拨号之后**的整段（握手认证 → 开
+    // shell）包了一个 `.timeout(connectTimeout)`，到点抛出的就是这里接的
+    // `TimeoutException`。原先 `connectTimeout` 只交给了拨号，一台"接受了
+    // TCP 却不说话"的设备会让 `await client.authenticated` **永远**挂着 ——
+    // 既没有 `ConnectionFailed`、也不重连。之所以包在会话那一层，而不是给
+    // `SSHClient` 设 `handshakeTimeout`，正是为了让超时落进**这一支**，
+    // 而不是落进下面 `is SSHHandshakeError`（见本段末尾）。
+    //
+    // 另一半事实仍然成立，而且依旧要紧：dartssh2 **自己**的超时定时器两个都
+    // 没设。`handshakeTimeout` 与 `authTimeout` 的默认值都是 null
+    // （ssh_client.dart:299-302），V1 的 `lib/` 里**没有任何一处**给 `SSHClient`
+    // 设过它们 —— 这两个名字在 `lib/` 下的命中**无一在代码里**，全部落在这段
+    // 注释自身（`grep -rn "handshakeTimeout\|authTimeout" lib/`）。
+    // 所以 `SSHHandshakeError('Handshake timed out')` 与
+    // `SSHAuthAbortError('Authentication timed out')` 那两条路径今天仍然到不了。
+    //
+    // FR-C-13 的**拨号**那一段仍然只由下面 `SocketException` 那一支的 errno 判定
+    // 撑着（`Socket.connect(timeout:)` 到点抛的是 `SocketException`，不是
+    // `TimeoutException`）—— 这一支管的是拨号**之后**，两段各管一半，
+    // 别把这一支的绿色读成"FR-C-13 全覆盖"。
     //
     // **给将来动手的人：** 谁要是给 `SSHClient` 设了 `handshakeTimeout`，超时就会
     // 变成 `SSHHandshakeError('Handshake timed out')`，落进下面

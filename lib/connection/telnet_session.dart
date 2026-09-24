@@ -26,6 +26,9 @@ class TelnetSession implements Session {
   final _dataBytes = StreamController<List<int>>();
   final _done = Completer<void>();
 
+  /// 意外断开的原始错误（FR-C-06 / spec §13.12）。null 表示正常断开。
+  Object? _lastError;
+
   Connection? _conn;
   StreamSubscription<List<int>>? _inputSub;
   StreamSubscription<String>? _decodeSub;
@@ -36,6 +39,9 @@ class TelnetSession implements Session {
 
   @override
   Future<void> get done => _done.future;
+
+  @override
+  Object? get lastError => _lastError;
 
   @override
   Future<void> connect() async {
@@ -74,8 +80,19 @@ class TelnetSession implements Session {
     }
   }
 
-  void _onDisconnected([Object? _]) {
+  /// 对端报错或 EOF —— `conn.input` 的 `onError` / `onDone` 都落在这里，
+  /// 两者都意味着**断开**。
+  ///
+  /// 形参**不能丢**：这里曾经写成 `[Object? _]`，错误被静态地扔掉了，于是
+  /// §13.12 要求保留的断开原因在 Telnet 一侧根本没有出口（spec §13.20）。
+  /// [done] 刻意不以错误完成（原因写在 [Session.done] 上），因此 [lastError]
+  /// 是它唯一的出口。
+  ///
+  /// 存必须在 `complete()` **之前**：完成 [done] 会唤醒 `await done` 的调用方，
+  /// 它紧接着就读 [lastError]。
+  void _onDisconnected([Object? error]) {
     if (_closed) return;
+    if (error != null) _lastError = error;
     if (!_done.isCompleted) _done.complete();
   }
 

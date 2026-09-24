@@ -1901,6 +1901,7 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:win_cli_tool/connection/connector.dart';
+import 'package:win_cli_tool/connection/session.dart';
 import 'package:win_cli_tool/connection/telnet_session.dart';
 import 'package:win_cli_tool/models/device_profile.dart';
 
@@ -1937,6 +1938,13 @@ class _FakeConnection implements Connection {
   void feed(List<int> bytes) {
     if (closed) return;
     _input.add(bytes);
+  }
+
+  /// 喂入一个来自对端的**错误**（设备侧被重置时传输层报的就是这个形状）。
+  /// 已关闭的连接直接忽略。
+  void feedError(Object error) {
+    if (closed) return;
+    _input.addError(error);
   }
 
   @override
@@ -2077,6 +2085,29 @@ void main() {
       expect(done, isTrue);
     });
 
+    test('对端报错时 done 正常完成，且错误对象留在 lastError 上', () async {
+      // §13.12 要求把断开原因保留下来；§13.20 记录了原实现为什么没做到 ——
+      // `_onDisconnected([Object? _])` 把形参静态地丢掉了，于是原因在
+      // Telnet 这一侧根本没有出口，调用方看到永远是一个 null。
+      final (conn, session, _) = await _manualSession();
+      addTearDown(session.close);
+
+      final failure = const SocketException('连接被重置', osError: OSError('', 104));
+      conn.feedError(failure);
+
+      // 必须**正常完成**，不是以错误完成：断开原因是给用户看的诊断信息，
+      // 不是控制流信号，以错误完成会强迫每个 `await done` 的人都处理它，
+      // 而无人监听的 `completeError` 还会变成未捕获的异步错误
+      // （§13.12 给的就是这两个选项，选了 lastError）。
+      await session.done;
+
+      // 静态类型刻意写成 Session：这条断言顺带钉住"lastError 在**接口**上"
+      // —— `ConnectionManager` 只认 Session 这个类型，成员若只在实现类上，
+      // 它照样够不着（§13.20 的缺陷正是这个形状）。
+      final Session viaInterface = session;
+      expect(viaInterface.lastError, same(failure));
+    });
+
     test('端口无人监听时 connect 抛异常', () async {
       final device = await FakeDeviceServer.start();
       final port = device.port;
@@ -2213,7 +2244,21 @@ abstract class Session {
   Stream<String> get output;
 
   /// 会话意外断开时完成。主动调用 [close] 不会触发它。
+  ///
+  /// **刻意不`completeError`**：断开原因是给用户看的诊断信息，不是控制流
+  /// 信号 —— 以错误完成会强迫每个 `await done` 的人都处理它，而无人监听的
+  /// `completeError` 还会变成未捕获的异步错误。原因改由 [lastError] 携带
+  /// （spec §13.12 给的正是这两个选项，选了后者）。
   Future<void> get done;
+
+  /// 最近一次意外断开的原始错误（FR-C-06 / spec §13.12）。正常断开为 null。
+  ///
+  /// 与 [done] 配合使用：`done` 完成之后读它。**刻意是抽象成员，不给
+  /// `=> null` 默认实现** —— 默认值会让一个新的实现静默地返回 null，而
+  /// 「失败了，但不知道为什么」正是这个字段要消灭的那个缺陷（spec §13.20）。
+  /// 调用方（`ConnectionManager`）只认 [Session] 这个类型，所以它必须在这里，
+  /// 而不是只在某个实现类上。
+  Object? get lastError;
 
   /// 建立连接。
   Future<void> connect();
@@ -2225,6 +2270,12 @@ abstract class Session {
   Future<void> close();
 }
 ```
+
+> **注（2026-09-25，计划 2 的「Task 6 前置」）：** 上面这份 `Session` 后来加了
+> 抽象成员 `Object? get lastError;`（spec §13.20），`TelnetSession` 也相应补了
+> 字段 / getter 并让 `_onDisconnected` **先存再 `complete()`** —— 三条 fence 已按
+> 实现重排。理由与实测证据在 `2026-09-24-ssh-session-and-reconnect.md` 的
+> 「## Task 6 前置：`Session.lastError` 与拨号后超时」。
 
 - [ ] **Step 4: 实现 TelnetSession**
 
@@ -2259,6 +2310,9 @@ class TelnetSession implements Session {
   final _dataBytes = StreamController<List<int>>();
   final _done = Completer<void>();
 
+  /// 意外断开的原始错误（FR-C-06 / spec §13.12）。null 表示正常断开。
+  Object? _lastError;
+
   Connection? _conn;
   StreamSubscription<List<int>>? _inputSub;
   StreamSubscription<String>? _decodeSub;
@@ -2269,6 +2323,9 @@ class TelnetSession implements Session {
 
   @override
   Future<void> get done => _done.future;
+
+  @override
+  Object? get lastError => _lastError;
 
   @override
   Future<void> connect() async {
@@ -2307,8 +2364,19 @@ class TelnetSession implements Session {
     }
   }
 
-  void _onDisconnected([Object? _]) {
+  /// 对端报错或 EOF —— `conn.input` 的 `onError` / `onDone` 都落在这里，
+  /// 两者都意味着**断开**。
+  ///
+  /// 形参**不能丢**：这里曾经写成 `[Object? _]`，错误被静态地扔掉了，于是
+  /// §13.12 要求保留的断开原因在 Telnet 一侧根本没有出口（spec §13.20）。
+  /// [done] 刻意不以错误完成（原因写在 [Session.done] 上），因此 [lastError]
+  /// 是它唯一的出口。
+  ///
+  /// 存必须在 `complete()` **之前**：完成 [done] 会唤醒 `await done` 的调用方，
+  /// 它紧接着就读 [lastError]。
+  void _onDisconnected([Object? error]) {
     if (_closed) return;
+    if (error != null) _lastError = error;
     if (!_done.isCompleted) _done.complete();
   }
 
@@ -2341,7 +2409,7 @@ class TelnetSession implements Session {
 flutter test test/connection/telnet_session_test.dart
 ```
 
-Expected：PASS，11 个测试全绿。
+Expected：PASS，12 个测试全绿。
 
 - [ ] **Step 6: 提交**
 

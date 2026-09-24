@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:win_cli_tool/connection/connector.dart';
+import 'package:win_cli_tool/connection/session.dart';
 import 'package:win_cli_tool/connection/telnet_session.dart';
 import 'package:win_cli_tool/models/device_profile.dart';
 
@@ -40,6 +41,13 @@ class _FakeConnection implements Connection {
   void feed(List<int> bytes) {
     if (closed) return;
     _input.add(bytes);
+  }
+
+  /// 喂入一个来自对端的**错误**（设备侧被重置时传输层报的就是这个形状）。
+  /// 已关闭的连接直接忽略。
+  void feedError(Object error) {
+    if (closed) return;
+    _input.addError(error);
   }
 
   @override
@@ -178,6 +186,29 @@ void main() {
       await _waitUntil(() => done);
 
       expect(done, isTrue);
+    });
+
+    test('对端报错时 done 正常完成，且错误对象留在 lastError 上', () async {
+      // §13.12 要求把断开原因保留下来；§13.20 记录了原实现为什么没做到 ——
+      // `_onDisconnected([Object? _])` 把形参静态地丢掉了，于是原因在
+      // Telnet 这一侧根本没有出口，调用方看到永远是一个 null。
+      final (conn, session, _) = await _manualSession();
+      addTearDown(session.close);
+
+      final failure = const SocketException('连接被重置', osError: OSError('', 104));
+      conn.feedError(failure);
+
+      // 必须**正常完成**，不是以错误完成：断开原因是给用户看的诊断信息，
+      // 不是控制流信号，以错误完成会强迫每个 `await done` 的人都处理它，
+      // 而无人监听的 `completeError` 还会变成未捕获的异步错误
+      // （§13.12 给的就是这两个选项，选了 lastError）。
+      await session.done;
+
+      // 静态类型刻意写成 Session：这条断言顺带钉住"lastError 在**接口**上"
+      // —— `ConnectionManager` 只认 Session 这个类型，成员若只在实现类上，
+      // 它照样够不着（§13.20 的缺陷正是这个形状）。
+      final Session viaInterface = session;
+      expect(viaInterface.lastError, same(failure));
     });
 
     test('端口无人监听时 connect 抛异常', () async {

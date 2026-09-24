@@ -321,6 +321,66 @@ void main() {
     );
   });
 
+  test('拨号之后的阶段也有超时：对端接了 TCP 却不说话时不能永远挂着', () async {
+    // spec §13.21-1：`connectTimeout` 原先只交给拨号，`await client.authenticated`
+    // 与 `await client.shell(...)` **没有任何上限**。一台"接受了 TCP 却不说话"
+    // 的设备（老设备卡在 KEX、或中间有个只做 TCP 代理的黑洞）会让 `connect()`
+    // **永远**挂着 —— 按钮一直黄，既没有 `ConnectionFailed`、也不重连。
+    // FR-C-13 承诺的是"连接超时默认 15 秒"，用户得到的却是无限等待。
+    //
+    // 夹具用 `_StubConnection`：对端永远不说话，握手发不出也走不完，于是
+    // `connect()` 正卡在 `await client.authenticated` 这一行 —— 就是这一条要
+    // 钉住的那一段。拨号那一段由 `_StubConnector` 立刻交回连接，所以下面的
+    // 超时**只可能**来自拨号之后的包超时。
+    final connector = _StubConnector(_StubConnection());
+    final session = SshSession(
+      profile: _profile(),
+      connector: connector,
+      hostKeyStore: InMemoryHostKeyStore(),
+      connectTimeout: const Duration(milliseconds: 200),
+    );
+    addTearDown(session.close);
+
+    // 哨兵：只有 `connect()` 永远不返回时才会拿到它。**不用测试框架自己的
+    // 超时** —— 那条要跑满 30 秒才红，而且拿到的是同型的 `TimeoutException`，
+    // 分不清是实现的超时还是框架的超时（那会让这条用例在变异下假绿）。
+    const sentinel = 'connect() 一直没有返回';
+    final hang = Completer<Object?>();
+    final hangTimer = Timer(const Duration(seconds: 5), () => hang.complete(sentinel));
+
+    final stopwatch = Stopwatch()..start();
+    final result = await Future.any<Object?>([
+      session.connect().then<Object?>((_) => null, onError: (Object e) => e),
+      hang.future,
+    ]);
+    stopwatch.stop();
+    hangTimer.cancel();
+
+    expect(result, isNot(sentinel), reason: '对端不说话时 connect() 必须失败，不能永远挂着');
+    expect(result, isA<TimeoutException>(), reason: '实际拿到：$result');
+    expect(
+      stopwatch.elapsed,
+      greaterThanOrEqualTo(const Duration(milliseconds: 150)),
+      reason: '必须真的等到 connectTimeout 才失败，而不是立刻以别的理由失败',
+    );
+    expect(
+      stopwatch.elapsed,
+      lessThan(const Duration(seconds: 3)),
+      reason: '超时要发生在 connectTimeout(200ms) 附近，不是靠上面那个 5s 兜底',
+    );
+
+    // 超时必须落进分类器 `TimeoutException` → `timeout` 那一支 —— 拨号之后
+    // 用 `.timeout()` 而不给 `SSHClient` 设 `handshakeTimeout`，理由正在于此：
+    // 后者会变成 `SSHHandshakeError('Handshake timed out')` → `protocolError`，
+    // 把方向指到"对端可能不是 SSH 服务"上去（§13.15）。
+    expect(
+      classifyConnectionFailure(result!).kind,
+      ConnectionFailureKind.timeout,
+    );
+    // 拨号确实发生过（否则上面的"超时"可能只是 open 从来没被调用）。
+    expect(connector.openCount, 1);
+  });
+
   // ---------------------------------------------------------------------
   // 以下五条直接调用**交给 SSHClient 的那个回调**，守它的函数体：
   // find → 比对 → 询问用户 → save / 拒绝。这些用例既不需要假服务端，

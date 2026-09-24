@@ -1531,17 +1531,28 @@ ConnectionFailure _classify(Object error) {
   if (error is ConnectionFailure) return error;
 
   if (error is TimeoutException) {
-    // 这一支是**防御性**的，而且比原先写的更"死"。原先这里说 dartssh2 在
-    // 握手/认证超时时抛 `SSHHandshakeError('Handshake timed out')` 与
-    // `SSHAuthAbortError('Authentication timed out')` —— 但那两条只在 dartssh2
-    // **自己设了超时定时器**时才成立，而 `handshakeTimeout` 与 `authTimeout`
-    // 的默认值都是 null（ssh_client.dart:299-302），而 V1 的 `lib/` 里**没有
-    // 任何一处**给 `SSHClient` 设过它们 —— 这两个名字在 `lib/` 下的命中
-    // **无一在代码里**，全部落在这段注释自身（`grep -rn "handshakeTimeout\|authTimeout"`
-    // `lib/`）。所以那两条路径今天都到不了。
+    // **这一支今天有了真实调用方，不再是"防御性"的**（spec §13.21-1）。
     //
-    // 真正撑起 FR-C-13 的只有下面 `SocketException` 那一支的 errno 判定 ——
-    // 别把这一支的绿色读成"超时路径已验证"。
+    // 调用方是 `SshSession.connect()`：它给**拨号之后**的整段（握手认证 → 开
+    // shell）包了一个 `.timeout(connectTimeout)`，到点抛出的就是这里接的
+    // `TimeoutException`。原先 `connectTimeout` 只交给了拨号，一台"接受了
+    // TCP 却不说话"的设备会让 `await client.authenticated` **永远**挂着 ——
+    // 既没有 `ConnectionFailed`、也不重连。之所以包在会话那一层，而不是给
+    // `SSHClient` 设 `handshakeTimeout`，正是为了让超时落进**这一支**，
+    // 而不是落进下面 `is SSHHandshakeError`（见本段末尾）。
+    //
+    // 另一半事实仍然成立，而且依旧要紧：dartssh2 **自己**的超时定时器两个都
+    // 没设。`handshakeTimeout` 与 `authTimeout` 的默认值都是 null
+    // （ssh_client.dart:299-302），V1 的 `lib/` 里**没有任何一处**给 `SSHClient`
+    // 设过它们 —— 这两个名字在 `lib/` 下的命中**无一在代码里**，全部落在这段
+    // 注释自身（`grep -rn "handshakeTimeout\|authTimeout" lib/`）。
+    // 所以 `SSHHandshakeError('Handshake timed out')` 与
+    // `SSHAuthAbortError('Authentication timed out')` 那两条路径今天仍然到不了。
+    //
+    // FR-C-13 的**拨号**那一段仍然只由下面 `SocketException` 那一支的 errno 判定
+    // 撑着（`Socket.connect(timeout:)` 到点抛的是 `SocketException`，不是
+    // `TimeoutException`）—— 这一支管的是拨号**之后**，两段各管一半，
+    // 别把这一支的绿色读成"FR-C-13 全覆盖"。
     //
     // **给将来动手的人：** 谁要是给 `SSHClient` 设了 `handshakeTimeout`，超时就会
     // 变成 `SSHHandshakeError('Handshake timed out')`，落进下面
@@ -1700,12 +1711,12 @@ Expected: 26 个用例全部 PASS
 
 | # | 变异 | 必须变红的用例 |
 |---|---|---|
-| 1 | 删掉 `if (reason is SSHHostkeyError)` 整支 | 「主机密钥被用户拒绝 → hostKey」与「两者必须分类不同」 |
+| 1 | 删掉 `if (reason is SSHHostkeyError)` 整支 | 「主机密钥被用户拒绝 → hostKey」「两者必须分类不同」「每个 kind 的 message 都非空、且不含字面 null」「主机密钥的文案指向指纹，不指向口令」（实测 **4 红**） |
 | 2 | 删掉 `if (reason is SSHInternalError)` **整支**（不是只删 if 行） | 「算法协商失败的文案指向算法，同样不指向口令」 |
 | 3 | 删掉 `if (error is SSHError)` 整支 | 「SSHError 兜底归 protocolError，不归 unknown」 |
 | 4 | 把主机密钥那条消息整段换成 `'认证失败：用户名、口令或私钥不正确'` | 「主机密钥的文案指向指纹，不指向口令」 |
 | 5 | 把算法那条消息整段换成上面同一句 | 「算法协商失败的文案指向算法，同样不指向口令」 |
-| 6 | 删掉 `SocketException` 分支里的 errno 判定整块 | 「Socket.connect 到点（errno 110）→ timeout，不是 unreachable」与「Windows 的 WSAETIMEDOUT（10060）同样归 timeout」 |
+| 6 | 删掉 `SocketException` 分支里的 errno 判定整块 | 「Socket.connect 到点（errno 110）→ timeout，不是 unreachable」「Windows 的 WSAETIMEDOUT（10060）同样归 timeout」「每个 kind 的 message 都非空、且不含字面 null」（实测 **3 红**） |
 | 7 | 把 errno 判定改成只认 `_etimedoutLinux` | 「Windows 的 WSAETIMEDOUT（10060）同样归 timeout」 |
 | 8 | 把 `if (error is SSHKeyDecryptError)` 那一支**挪到** `if (error is SSHKeyDecodeError)` **之后**（子类排到父类后面） | 「带口令的私钥 → 指向"去掉口令"，不要说成协议错误」 |
 | 9 | 把 `error.osError?.message ?? error.message` 改成 `error.message` | 「不可达的文案保留操作系统给的原文」 |
@@ -1725,6 +1736,18 @@ Expected: 26 个用例全部 PASS
 | 23 | 把主机密钥那条消息末尾的可操作指引换成一句没有指引的话 | 「主机密钥的文案指向指纹，不指向口令」 |
 | 24 | 把 `_timeoutMessage` 的值改成**不含「超时」**的一句 | 「Socket.connect 到点（errno 110）→ timeout，不是 unreachable」 |
 
+**第 1、6 条的红比原先记的多 —— 本轮整表重跑量出来的，别照抄旧数。** 第 1 条实测
+**4 红**（原先记 2）：除了「主机密钥被用户拒绝 → hostKey」与「两者必须分类不同」，
+删掉那一支还让「每个 kind 的 message 都非空、且不含字面 null」红（`hostKey` 那个样本
+掉进"认不出的 reason"兜底，成了 `protocolError`，于是集合里少了一个 kind —— 断言
+`Expected: Set:[…timeout, authFailed, unreachable, protocolError, jumpHostFailed,
+unknown]` 里 `hostKey` 不见了）与「主机密钥的文案指向指纹，不指向口令」红（文案退化成
+`协议错误：连接在认证完成前中断。原始信息：SSHHostkeyError(Hostkey verification
+failed)`，`contains('指纹')` 落空）。第 6 条实测 **3 红**（原先记 2）：多出来的是同一条
+「每个 kind 的 message 都非空、且不含字面 null」—— errno 判定整块删掉后，`timeout`
+那个样本被归成 `unreachable`，`ConnectionFailureKind.timeout` 从集合里消失。
+**这两条多出来的红不是新缺陷**：那张"每个 kind 都非空"的清点表按 kind 逐个分类样本，
+任何一条分支消失都会让它少一个 kind —— 它同时也是一张**分支存在性**的清单。
 第 2、8 条要删**整支**：只删 `if (...) {` 一行会留下语法破损的残块，编译不过 ——
 那不是有效的变异，会让人误以为"变红了"。第 8 条尤其要注意：把 `is SSHKeyDecodeError`
 改成 `is Never` 之类的"半删"会让分支体里的 `error.message` 编译不过，那时的红是
@@ -2166,6 +2189,66 @@ void main() {
       reason: 'connect() 建出来的 client 上，onVerifyHostKey 为 null 时 dartssh2 '
           '接受任意主机密钥（§13.14-1，FR-C-11 整体旁路）',
     );
+  });
+
+  test('拨号之后的阶段也有超时：对端接了 TCP 却不说话时不能永远挂着', () async {
+    // spec §13.21-1：`connectTimeout` 原先只交给拨号，`await client.authenticated`
+    // 与 `await client.shell(...)` **没有任何上限**。一台"接受了 TCP 却不说话"
+    // 的设备（老设备卡在 KEX、或中间有个只做 TCP 代理的黑洞）会让 `connect()`
+    // **永远**挂着 —— 按钮一直黄，既没有 `ConnectionFailed`、也不重连。
+    // FR-C-13 承诺的是"连接超时默认 15 秒"，用户得到的却是无限等待。
+    //
+    // 夹具用 `_StubConnection`：对端永远不说话，握手发不出也走不完，于是
+    // `connect()` 正卡在 `await client.authenticated` 这一行 —— 就是这一条要
+    // 钉住的那一段。拨号那一段由 `_StubConnector` 立刻交回连接，所以下面的
+    // 超时**只可能**来自拨号之后的包超时。
+    final connector = _StubConnector(_StubConnection());
+    final session = SshSession(
+      profile: _profile(),
+      connector: connector,
+      hostKeyStore: InMemoryHostKeyStore(),
+      connectTimeout: const Duration(milliseconds: 200),
+    );
+    addTearDown(session.close);
+
+    // 哨兵：只有 `connect()` 永远不返回时才会拿到它。**不用测试框架自己的
+    // 超时** —— 那条要跑满 30 秒才红，而且拿到的是同型的 `TimeoutException`，
+    // 分不清是实现的超时还是框架的超时（那会让这条用例在变异下假绿）。
+    const sentinel = 'connect() 一直没有返回';
+    final hang = Completer<Object?>();
+    final hangTimer = Timer(const Duration(seconds: 5), () => hang.complete(sentinel));
+
+    final stopwatch = Stopwatch()..start();
+    final result = await Future.any<Object?>([
+      session.connect().then<Object?>((_) => null, onError: (Object e) => e),
+      hang.future,
+    ]);
+    stopwatch.stop();
+    hangTimer.cancel();
+
+    expect(result, isNot(sentinel), reason: '对端不说话时 connect() 必须失败，不能永远挂着');
+    expect(result, isA<TimeoutException>(), reason: '实际拿到：$result');
+    expect(
+      stopwatch.elapsed,
+      greaterThanOrEqualTo(const Duration(milliseconds: 150)),
+      reason: '必须真的等到 connectTimeout 才失败，而不是立刻以别的理由失败',
+    );
+    expect(
+      stopwatch.elapsed,
+      lessThan(const Duration(seconds: 3)),
+      reason: '超时要发生在 connectTimeout(200ms) 附近，不是靠上面那个 5s 兜底',
+    );
+
+    // 超时必须落进分类器 `TimeoutException` → `timeout` 那一支 —— 拨号之后
+    // 用 `.timeout()` 而不给 `SSHClient` 设 `handshakeTimeout`，理由正在于此：
+    // 后者会变成 `SSHHandshakeError('Handshake timed out')` → `protocolError`，
+    // 把方向指到"对端可能不是 SSH 服务"上去（§13.15）。
+    expect(
+      classifyConnectionFailure(result!).kind,
+      ConnectionFailureKind.timeout,
+    );
+    // 拨号确实发生过（否则上面的"超时"可能只是 open 从来没被调用）。
+    expect(connector.openCount, 1);
   });
 
   // ---------------------------------------------------------------------
@@ -2753,6 +2836,7 @@ class SshSession implements Session {
   var _closed = false;
 
   /// 最近一次断开的原始错误。正常断开为 null。
+  @override
   Object? get lastError => _lastError;
 
   @override
@@ -2891,18 +2975,41 @@ class SshSession implements Session {
     final client = _createClient(socket, identities);
     _client = client;
 
-    await client.authenticated;
-
-    // 认证期间也可能被 close()。
-    if (_closed) {
+    // **拨号之后的阶段同样要有上限**（spec §13.21-1）。原先 `connectTimeout`
+    // 只交给了拨号（`connector.open(timeout: …)`），而握手 / 认证 / shell 这
+    // 三段**没有任何超时**：一台"接受了 TCP 却不说话"的设备（老设备卡在 KEX、
+    // 或中间有个只做 TCP 代理的黑洞）会让 `await client.authenticated`
+    // **永远**挂着 —— 按钮一直黄，既没有 `ConnectionFailed`、也不重连。
+    // FR-C-13 承诺的是「连接超时默认 15 秒」，用户得到的却是无限等待。
+    // **这不是「慢」，是没有任何出口。**
+    //
+    // 刻意**不**给 dartssh2 设 `handshakeTimeout` / `authTimeout`：那样超时会
+    // 变成 `SSHHandshakeError('Handshake timed out')`，落进分类器
+    // `is SSHHandshakeError` 那一支 → 报成 `protocolError`，文案说"对端可能
+    // 不是 SSH 服务" —— 正是 §13.15 要防的"把超时说成协议问题"。包在这一层
+    // 抛的则是 `TimeoutException`，而分类器里 `TimeoutException` → `timeout`
+    // 那一支早就写好、也测过了（`connection_failure.dart` 的 `_timeoutMessage`），
+    // 这一改让那一支有了第一个真实调用方。
+    //
+    // 包的是**整段**（认证之后接着开 shell），不是一个阶段一个定时器：
+    // 用户点一次"连接"，等的就是"连上"这一个结果。
+    final SSHSession? session;
+    try {
+      session =
+          await _authenticatedShell(client, socket).timeout(connectTimeout);
+    } on TimeoutException {
+      // 超时也必须收干净：`client` 与 `socket` 都是这一次 connect() 建起来的，
+      // 不能指着"调用方总会 close()"把它们留给对方。与下面两处 `if (_closed)`
+      // 守卫同一套收尾（`client.close()` + `socket.dispose()`）。
+      // 这里 `await` 不会挂：`client.close()` 最终关的是手上这条连接，
+      // 而超时场景是对端**不说话**，不是拒绝关闭。
       await client.close();
       socket.dispose();
-      return;
+      rethrow;
     }
+    // null 表示认证期间被 close()；收尾已在 _authenticatedShell 里做完。
+    if (session == null) return;
 
-    final session = await client.shell(
-      pty: SSHPtyConfig(type: ptyType, width: ptyWidth, height: ptyHeight),
-    );
     if (_closed) {
       session.close();
       await client.close();
@@ -2929,6 +3036,32 @@ class SshSession implements Session {
     session.done.then(
       (_) => _onDisconnected(null),
       onError: (Object e, StackTrace _) => _onDisconnected(e),
+    );
+  }
+
+  /// 拨号之后的阶段：等握手与认证走完，再开一个 shell。
+  ///
+  /// 单独成方法，是为了让 [connect] 能给这**整段**包一个
+  /// `.timeout(connectTimeout)`（spec §13.21-1）。内联在 `connect()` 里的话，
+  /// 两处 `await` 得各包一次，"连接超时"就变成两个互不知情的定时器。
+  ///
+  /// 返回 null 表示认证期间被 close() 了 —— 此时收尾（client + socket）已经在
+  /// 这里做完，调用方直接返回即可。
+  Future<SSHSession?> _authenticatedShell(
+    SSHClient client,
+    ConnectionSocket socket,
+  ) async {
+    await client.authenticated;
+
+    // 认证期间也可能被 close()。
+    if (_closed) {
+      await client.close();
+      socket.dispose();
+      return null;
+    }
+
+    return client.shell(
+      pty: SSHPtyConfig(type: ptyType, width: ptyWidth, height: ptyHeight),
     );
   }
 
@@ -3194,13 +3327,13 @@ class SshSession implements Session {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `flutter test test/connection/ssh_session_test.dart`
-Expected: 24 个用例全部 PASS。其中「私钥文件没有读权限」一条在 Windows 或以 root
+Expected: 25 个用例全部 PASS。其中「私钥文件没有读权限」一条在 Windows 或以 root
 运行时会显示为 **skipped**（chmod 000 在那两种机器上造不出"读不了"的夹具）；
 用例自带这个跳过守卫 —— 它宁愿报"没测"，也不愿假绿。
 
 - [ ] **Step 5: 反证测试的非空性**
 
-本 Task 的 **24** 条单测逐条变异验证，**每次改完逐字还原**。
+本 Task 的 **25** 条单测逐条变异验证，**每次改完逐字还原**。
 
 下表在**同一份最终实现**上整表重跑过（2026-09-25，Dart 3.12.2 / dartssh2 4.1.0，
 Linux，非 root）：**实现一改，整张表就静默过期**，所以改了实现之后只重跑新行是不够的，
@@ -3210,13 +3343,22 @@ Linux，非 root）：**实现一改，整张表就静默过期**，所以改了
 **这一轮的教训**：加了 `on SSHKeyDecodeError` 那一支（见第 25—27 条）之后，第 6 条
 的**机制变了**（红一样是 1 条，红的断言换了）—— 整表重跑不是形式主义，是它把这件事
 量出来的。
+**本轮又整表重跑了一遍**（2026-09-25，Task 6 前置的两处改动之后，27 条逐条）：
+**只有第 1 条的红数变了（6 → 7，见下），其余 26 条逐条一致**；第 2 条那个编译失败、
+第 23 条那个 0 红对照、第 23b 条退化成的 30s 超时，也都与原先记的一致。这是"实现一改、
+整张表就静默过期"的第二次实证 —— 别以为只有被改到的那些行需要重跑。
 
 1. `close()` 里三处 `?.` 改成 `!`（`_decodeSub?.cancel()`、`_session?.close()`、
-   `_client?.close()`）：必须让 `close()` 相关用例变红。实测 **6 红** ——
+   `_client?.close()`）：必须让 `close()` 相关用例变红。实测 **7 红** ——
    `从未连上的会话，close() 必须能返回` / `connect() 抛异常后，close() 仍必须能返回` /
-   `close() 可重复调用` / `close() 的清理必须走完` / `close() 之后再 connect() 必须
-   直接返回` / `主动 close() 之后，流上的收尾事件不许把 done 报成一次断开`。
+   `close() 可重复调用` / `close() 的清理必须走完` / `close()` 之后再 connect() 必须
+   直接返回` / `主动 close() 之后，流上的收尾事件不许把 done 报成一次断开` /
+   `拨号之后的阶段也有超时：对端接了 TCP 却不说话时不能永远挂着`。
    它们守的就是 `close()` 的空路径：任何一处写成非空断言，退出应用就退不掉。
+   **本轮 6 → 7 红**：新加的超时用例也走 `close()` 的空路径 —— 它建起了 `SSHClient`
+   但从未走完认证，于是 `addTearDown(session.close)` 里那句 `_decodeSub!.cancel()`
+   在 `_decodeSub == null` 上抛 `Null check operator used on a null value`
+   （`ssh_session.dart:519`），与另外六条是**同一类**空路径，不是新的机制。
 2. 让 `_buildHostKeyCallback()` 在 `verifyHostKey == false` 时返回 null：
    **这条变异今天已经写不出来了** —— 返回类型是 `SSHHostkeyVerifyHandler`（非空），
    返回 null 是**编译错误**。实测：1 个红，且是
@@ -3312,7 +3454,7 @@ Linux，非 root）：**实现一改，整张表就静默过期**，所以改了
     退回单订阅 `StreamController<List<int>>()`：单订阅 controller 在**无人监听**时
     `close()` 永不完成，于是第 17 条那个变异不再以断言变红，而是退化成
     `TimeoutException after 0:00:30: Test timed out after 30 seconds`（整整跑满 30 秒）。
-    **对照**：只改夹具、不删守卫时，实测 **0 红**（24 条全绿）—— 说明这个改动本身
+    **对照**：只改夹具、不删守卫时，实测 **0 红**（25 条全绿）—— 说明这个改动本身
     不证明任何行为，它唯一的作用就是让第 17 条的证据重新落在断言上。
     **这一行的教训**：一条红的"成色"是夹具的属性，不只是实现的属性；把红降级成
     超时不算发现，但也不该被当成"红了就行"。
@@ -3357,13 +3499,21 @@ Run: `flutter test test/connection/ssh_session_test.dart`
 
 **本 Task 覆盖不到的部分 —— 这是量的结论，不要当作通过：**
 
-- `connect()` 里另外两处 `if (_closed)` 守卫（建连返回后、认证完成后）。删掉它们，
-  预期**全部照绿**：没有一条用例能让 `connect()` 走过 `await client.authenticated`
-  （真握手要 Task 7 的 sshd），所以这两处压根不会被走到。
-  （**措辞已订正**：本轮之后**确实**有用例建起了 `SSHClient` —— 让 `connect()` 自己
-  造 client 的那条用例就是；但它停在 `authenticated` 那一行，这两处守卫仍然够不着。）
+- `connect()` 里另外两处 `if (_closed)` 守卫（认证**成功**返回后、shell **成功**
+  拿到后）。**已实测：各删一处，25 条全绿**（本轮两处改动之后重跑）。原先的理由是
+  "没有一条用例能让 `connect()` 走过 `await client.authenticated`"，**这个理由已经
+  不成立** —— 新增的超时用例正是在 `await client.authenticated` 上等到超时的（它是
+  **失败**着走出来的）。这两处仍然够不着，是因为它们分别在认证**成功**返回之后与
+  shell **成功**拿到之后，而假连接永远走不到那两步。
   （`_onDisconnected` 那一处同类守卫**已经**有反证了 —— 见第 22 条，
   它是从 `debugReportOutputError()` 这个缝进去的。）
+- **`connect()` 超时分支的收尾没有用例钉**（本轮新增的空路径）。删掉
+  `on TimeoutException` 里的 `await client.close(); socket.dispose();`（只留
+  `rethrow`），实测 **0 红（25 条全绿）**：那条超时用例只看 `connect()` 抛什么、
+  `connector.openCount` 是多少，看不见 socket / client 有没有被收掉。要钉住它，
+  需要一条能观察到"超时后底层连接确实关了"的用例 —— 今天没有。
+  （它与上面 `close()` 的空路径是**两回事**：第 1 条变异守的是 `SshSession.close()`，
+  这一条守的是 `connect()` 超时那一刻的收尾，没有别的东西覆盖。）
 - **并发**两次 `connect()`。入口守卫只挡"已关闭"这一种；同时进来两次时，第二次会
   覆盖 `_socket` / `_client` / `_session` / `_decodeSub`（第一次的连接泄漏），而被
   丢下的 `session.done` 那处注册仍可能完成 `_done`。V1 的调用方是串行的，所以这一版
@@ -3380,13 +3530,14 @@ Run: `flutter test test/connection/ssh_session_test.dart`
 - `debugReportOutputError()` 这个测试缝本身：它从**解码后的输出流报错**那条真路径上
   截出入口，真入口要能连上的会话。它测的是 `_onError` 的收尾行为，**不**测"流会在
   什么时候出错"。
-- **`onError:` 这个接线本身没有用例钉。** 这是本轮补记的一条（N1）：把
-  `onError: _onError` 从 `connect()` 里那个 `.listen(…)` 上去掉，实测**整套 24 条
-  照绿** —— 包括「输出流报错时必须完成 done」。也就是说那条用例钉的是 `_onError` 的
-  **函数体**（经 `debugReportOutputError()` 这个缝），而"订阅真的把这个函数挂上去了"
-  没有任何东西在守。要真的钉住它，得让一个 stub 的 `stdout` 流报错 —— 那要求
-  `client.shell()` 先成功，也就是**真握手**，所以这条同样归 Task 7。
-  **别把这条读成"`_onError` 被测过了"**：被测的只有它的收尾行为，接线是敞着的。
+- **`onError:` 这个接线本身没有用例钉。** 这是补记的一条（N1）：把
+  `onError: _onError` 从 `connect()` 里那个 `.listen(…)` 上去掉，实测**整套 25 条
+  照绿**（本轮加了超时用例之后重跑过）—— 包括「输出流报错时必须完成 done」。也就是说
+  那条用例钉的是 `_onError` 的**函数体**（经 `debugReportOutputError()` 这个缝），
+  而"订阅真的把这个函数挂上去了"没有任何东西在守。要真的钉住它，得让一个 stub 的
+  `stdout` 流报错 —— 那要求 `client.shell()` 先成功，也就是**真握手**，所以这条同样
+  归 Task 7。**别把这条读成"`_onError` 被测过了"**：被测的只有它的收尾行为，
+  接线是敞着的。
 - `_decodeSub` 上的 `cancelOnError: true`：它与 TelnetSession 同一处写法，但
   **没有用例**（那条错误路径走不到，见上一条）。
 
@@ -3757,6 +3908,80 @@ git commit -m "feat: SessionFactory —— 按协议构造会话，唯一的协�
 
 ---
 
+## Task 6 前置：`Session.lastError` 与拨号后超时
+
+Task 3 / Task 4 完成之后、Task 6 动工**之前**，在实现里落了两处改动。两处都直接压在
+Task 6 身上，所以记在这里。Task 3、Task 4 的 fence 已按改动**整份重排**（不是只改新行），
+两张变异表已**整表重跑**（结论见各 Task 的 Step 5）。
+
+### 一、`Session` 加 `Object? get lastError;`（spec §13.20）
+
+`session.dart` 加抽象成员；`TelnetSession` 补字段、getter，并在 `_onDisconnected` 里
+**先存再 `complete()`**（形参原先写作 `[Object? _]`，错误被静态地扔掉 —— 那就是缺陷
+本体）；`SshSession` 早已存在的 getter 标上 `@override`。**刻意不给 `=> null` 默认
+实现**：默认值会让一个新的实现静默地返回 null，而"失败了，但不知道为什么"正是这个
+字段要消灭的东西。`Session.done` 保持**不以错误完成**（理由见下面「未决项」一节）。
+
+**Task 6 跟着改了三处，已直接落在它的 fence 里：**
+
+1. `session.done.then((_) => _onSessionDone(session.lastError));`，那条死的
+   `onError` 分支**已删除** —— 留着比没有更糟：它读起来像"原因就是从这儿传下去的"。
+2. 测试围栏里的 `_FakeSession implements Session` 补一个 `lastError`（`Session` 是
+   抽象类，少一个成员就编译不过），并且它是**可置值**的，不是恒返回 null 的桩；
+   `drop()` 也接一个可选 `error`，与真实实现"先存再 `complete()`"同序。
+3. `_onSessionDone` 的形参由 `[Object? error]`（可选）收紧为 `Object? error`（必填）：
+   这个名字现在只有一个来源，可选形参反而会让人以为还有别的调用点。
+   `SessionLost(error == null ? null : classifyConnectionFailure(error))` 不用改。
+
+**Task 6 还欠一条用例，本前置没有替它写。** 上面三处只保证原因**能**传下去；Task 6
+现有的 12 条用例测的是 `SessionLost` **发出来了**，没有一条断言它**带了什么**。实现
+Task 6 时请补：让 `_FakeSession` 置一个失败对象（`drop(error)`）再等一等，断言
+`SessionLost.failure` 的 `kind` 就是那个对象分类出来的值。**没补之前，"原因到达界面"
+这条链上仍然有一段没有任何用例。**
+
+### 二、拨号之后也有超时（spec §13.21-1）
+
+`SshSession.connect()` 把**拨号之后**的整段（等握手与认证 → 开 shell）抽成
+`_authenticatedShell(client, socket)` 并包上 `.timeout(connectTimeout)`；超时分支
+收尾（`await client.close(); socket.dispose();`）后 `rethrow`。
+`connection_failure.dart` 里 `is TimeoutException` 那一支**只改注释、行为不变**：
+不再自称"防御性 / 比原先更死"，并指出自己现在有了真实调用方。
+
+原先 `connectTimeout` 只交给了拨号（`connector.open(timeout: …)`），而握手 / 认证 /
+shell 三段**没有任何上限**：一台"接受了 TCP 却不说话"的设备（老设备卡在 KEX，或中间
+一个只做 TCP 代理的黑洞）会让 `await client.authenticated` **永远**挂着 —— 按钮一直
+黄，既没有 `ConnectionFailed`、也不重连。FR-C-13 承诺"连接超时默认 15 秒"，用户得到
+的却是无限等待；**这不是"慢"，是没有任何出口。**
+
+**刻意不**给 dartssh2 设 `handshakeTimeout` / `authTimeout`：那样超时变成
+`SSHHandshakeError('Handshake timed out')`，落进分类器 `is SSHHandshakeError` 那一支
+→ 报成 `protocolError`，文案说"对端可能不是 SSH 服务" —— 正是 §13.15 要防的"把超时
+说成协议问题"。包在这一层抛的是 `TimeoutException`，分类器里那一支早就写好、也测过
+（`_timeoutMessage`），这一改让那一支第一次有了真实调用方。
+（两个定时器仍然没设，`connection_failure.dart` 里那条 `grep` 结论依旧成立，**别删**。）
+
+### 三、本轮实跑的变异证据，以及三处"预期全绿"
+
+- **Change 1**：删掉 `TelnetSession._onDisconnected` 里的
+  `if (error != null) _lastError = error;` → **1 红**，点名用例
+  「对端报错时 done 正常完成，且错误对象留在 lastError 上」，失败信息
+  `Expected: same instance as SocketException:<…连接被重置 (OS Error: errno = 104)> /
+  Actual: <null>`。
+- **Change 2**：把 `.timeout(connectTimeout)` 摘掉（回到裸的
+  `await _authenticatedShell(client, socket)`）→ **1 红**，点名用例
+  「拨号之后的阶段也有超时：对端接了 TCP 却不说话时不能永远挂着」，失败信息
+  `Expected: not 'connect() 一直没有返回' / Actual: 'connect() 一直没有返回'`。
+- **三条"预期全绿"的实测**（新代码里未被覆盖的部分，如实记下，**不要读成"已经覆盖"**）：
+  删掉超时分支里的收尾 `await client.close(); socket.dispose();`（只留 `rethrow`）
+  → **0 红（25 条全绿）**；删掉 `_authenticatedShell` 里认证后的 `if (_closed)`
+  → **0 红**；删掉 shell 之后那个 `if (_closed)` → **0 红**。
+  后两条与 Task 4「覆盖不到的部分」原有结论一致，**但理由要订正**：现在**有**用例走到
+  `await client.authenticated`（就是新增的超时用例，它是**失败**着走出来的），够不着
+  那两处守卫是因为它们分别在认证**成功**返回后与 shell **成功**拿到后，而假连接永远
+  走不到那两步。第一处（超时分支的收尾）是**新引入**的空路径，本轮新量出来的。
+
+---
+
 ## Task 6: `ConnectionManager` —— 生命周期、重连与队列
 
 **Files:**
@@ -3830,6 +4055,11 @@ class _FakeSession implements Session {
   @override
   Future<void> get done => _done.future;
 
+  /// 断开原因。默认 null；[drop] 可以先把它置上。**刻意是可置值的字段，不是恒
+  /// 返回 null 的桩** —— "失败了但不知道为什么"正是 §13.20 那个缺陷的形状。
+  @override
+  Object? lastError;
+
   @override
   Future<void> connect() async {
     connectCalls++;
@@ -3852,8 +4082,10 @@ class _FakeSession implements Session {
     unawaited(_output.close());
   }
 
-  /// 模拟对端断开。
-  void drop() {
+  /// 模拟对端断开。[error] 给出时先记进 [lastError] —— 与两个真实实现里
+  /// `_onDisconnected` 的"先存再 `complete()`"保持同一顺序（§13.20）。
+  void drop([Object? error]) {
+    if (error != null) lastError = error;
     if (!_done.isCompleted) _done.complete();
   }
 
@@ -4539,12 +4771,12 @@ class ConnectionManager {
       morePager: morePager ?? MorePager(),
       lineEnding: profile.lineEnding,
     );
-    session.done.then(
-      (_) => _onSessionDone(),
-      onError: (Object e, StackTrace _) {
-        _onSessionDone(e);
-      },
-    );
+    // `done` **不会**以错误完成（两个实现都只 `complete()`，不带参数），所以这里
+    // **不接** `onError:` —— 那条分支永远不会执行，而它读起来像"断开原因就是从
+    // 这儿传下去的"，比没有更糟。原因走 [Session.lastError]：`done` 完成之后再读，
+    // 此时它一定已经写好（两个实现的 `_onDisconnected` 都是先存再 `complete()`，
+    // spec §13.12 / §13.20）。
+    session.done.then((_) => _onSessionDone(session.lastError));
 
     final wasReconnect = _attempt > 0;
     if (wasReconnect) {
@@ -4568,7 +4800,10 @@ class ConnectionManager {
     }
   }
 
-  void _onSessionDone([Object? error]) {
+  /// [error] 只有一个来源：`session.done` 完成之后读到的 `session.lastError`。
+  /// 形参**不再是可选的** —— 可选会让人以为还有别的调用点（原先那条 `onError:`
+  /// 已经删掉，见上面注册处）。
+  void _onSessionDone(Object? error) {
     if (_disposed || _userClosed) return;
     _disconnectedAt = clock.now();
 
@@ -5195,7 +5430,16 @@ flutter test && dart analyze
 
 ---
 
-## 未决项：`Session.done` 不带错误，断开原因在 Task 6 里被丢掉（**需要决策，阻塞 Task 6**）
+## 已落地：`Session.done` 不带错误，断开原因在 Task 6 里被丢掉（**本节是缺陷记录，修法见「Task 6 前置」**）
+
+> **状态（2026-09-25）：已解决。** 下面「建议的修法」四条已全部落地，改动记在**上面的
+> 「## Task 6 前置：`Session.lastError` 与拨号后超时」** —— `session.dart` 加抽象成员、
+> `TelnetSession` 先存再 `complete()`、`SshSession` 标 `@override`、Task 6 的 fence
+> 改成读 `session.lastError` 并删掉那条死的 `onError` 分支。本节保留，因为它是这个
+> 缺陷讲得最全的一份记录（为什么不能让 `done` 直接以错误完成，见下面那一节）。
+>
+> **还欠一条**：Task 6 未写断言 `SessionLost.failure` 的用例 —— 见「Task 6 前置」
+> 第一节末尾那一条。
 
 Task 6 的 fence 是这样取失败原因的：
 
