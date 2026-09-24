@@ -5833,6 +5833,7 @@ LogLevel ERROR
 ```dart
 import 'dart:async';
 
+import 'package:dartssh2/dartssh2.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:win_cli_tool/connection/known_host.dart';
 import 'package:win_cli_tool/connection/ssh_session.dart';
@@ -5884,7 +5885,9 @@ void main() {
     await session.connect();
 
     expect(asked, isNotNull);
-    expect(asked!.fingerprint, startsWith('SHA256:'));
+    // 与**真主机密钥**的指纹比，而不是只比一个 'SHA256:' 前缀：
+    // 前缀断言放得过任何自洽但错误的指纹（截断、或串了另一把密钥）。
+    expect(asked!.fingerprint, sshd.hostFingerprint());
     expect(store.all.single.fingerprint, asked!.fingerprint);
 
     await session.close();
@@ -5914,9 +5917,22 @@ void main() {
 
   test('用户拒绝指纹则连不上', () async {
     final store = InMemoryHostKeyStore();
-    final session = sessionWith(store, onUnknown: (h) async => false);
+    var asked = false;
+    final session = sessionWith(store, onUnknown: (h) async {
+      asked = true;
+      return false;
+    });
 
-    await expectLater(session.connect(), throwsA(anything));
+    // 具体类型，而不是 throwsA(anything)：后者被**任何**异常满足，分不出
+    // "因用户拒绝被拒"与"因别的缘故提前失败"。实测（Task 7 复检探针）：
+    // 两条拒绝路径抛的都是 SSHAuthAbortError，其 .reason 是 SSHHostkeyError
+    // —— 不是裸的 SSHHostkeyError。
+    await expectLater(
+      session.connect(),
+      throwsA(isA<SSHAuthAbortError>()
+          .having((e) => e.reason, 'reason', isA<SSHHostkeyError>())),
+    );
+    expect(asked, isTrue, reason: '拒绝分支真的被走到过 —— 否则这条用例是空转');
     expect(store.all, isEmpty);
 
     await session.close();
@@ -5938,7 +5954,13 @@ void main() {
       return true;
     });
 
-    await expectLater(session.connect(), throwsA(anything));
+    // 具体类型，与上一条同一判据：抛的必须是"因主机密钥被拒"这一类，
+    // 而不是随便什么提前失败（如注入的 ConnectionFailure）。
+    await expectLater(
+      session.connect(),
+      throwsA(isA<SSHAuthAbortError>()
+          .having((e) => e.reason, 'reason', isA<SSHHostkeyError>())),
+    );
     expect(asked, isFalse, reason: '有记录时不应回退到询问用户');
 
     await session.close();
@@ -5970,8 +5992,10 @@ void main() {
     final out = StringBuffer();
     final sub = session.output.listen(out.write);
 
-    // 用 printf 输出多字节字符，验证流式解码器跨分片正确
-    session.write('printf "中文测试OK\\n"\n');
+    // 期望串在**输入里不连续**：PTY 会把命令行原样回显，若直接写
+    // "中文测试OK"，回显就能满足断言，命令根本没执行也照样绿。
+    // 实测回显行为：`printf '中%s\n' 文测试OK` 原样回显，其中不含连续期望串。
+    session.write("printf '中%s\\n' 文测试OK\n");
 
     final deadline = DateTime.now().add(const Duration(seconds: 10));
     while (!out.toString().contains('中文测试OK') &&
@@ -6011,6 +6035,53 @@ done 报成一次断开」当时就变红）。**同一条守卫，不同的入�
 **若删掉守卫后仍然全绿，说明这条测试没约束到行为。**
 
 改完恢复。
+
+- [ ] **Step 4b: 反证另外四条断言的非空性（一轮复审查出它们原本是空转的）**
+
+首轮交付（`1ce36d4`）的 6 条用例里，有 4 条的断言满足不了自己名字里的承诺。这**不是**
+实现写错了 —— 计划当初就是这么写的，实现是逐字节照抄的。但空转的断言比没有断言更坏：
+它让"全绿"看着像证据。四条全部收紧并逐条反证，改动见 `2240712`（**第二个提交**，
+Step 5 那条 message 只对应 `1ce36d4`）。
+
+复检手法值得单独记下来 —— 它是**注入一个无关的失败**，而不是读断言：在 `_identities()`
+顶部（socket 都还没开、主机密钥那一层根本走不到）注入一个 `ConnectionFailure`，旧套件
+报 `+2 -4`，**第 3、4 条仍然绿**。也就是说，"用户拒绝指纹则连不上"这条，可以在拒绝分支
+**完全没被走到**的情况下通过。
+
+| # | 原来的空转断言 | 改成 | 把缺陷放回去 | 实测红 |
+|---|---|---|---|---|
+| T7-1 | `expect(asked!.fingerprint, startsWith('SHA256:'))` —— 前缀断言放得过**任何**自洽但错误的指纹 | `expect(asked!.fingerprint, sshd.hostFingerprint())`（顺带让计划里一直是死代码的 `hostFingerprint()` 活起来） | 把交给校验回调的指纹截断（`.substring(0, 10)`） | `首次连接会询问指纹，接受后写入 store`：`Expected 'SHA256:<64 位>' / Actual 'SHA256:<前 10 位>'` —— 截断值**满足**旧断言，直接证明旧的会绿 |
+| T7-2 | `throwsA(anything)`，且没有任何东西断言拒绝分支被走到过 | 具体类型（见下）+ `expect(asked, isTrue)` | 去掉回调里的 `asked = true;` | `用户拒绝指纹则连不上`：`Expected: true / Actual: <false>`。把断言换回旧写法再跑**同一个**变异 → `All tests passed!` |
+| T7-3 | 同上；且 `asked == false` 分不出"因不匹配被拒"与"因别的缘故提前失败" | 同一具体类型 | 让不匹配分支因**无关**原因失败（抛 `ConnectionFailure`） | `指纹与已记录的不一致时拒绝连接`：`threw SSHAuthAbortError:<SSHAuthAbortError(Connection closed before authentication)>`。旧的 `throwsA(anything)` 对这个变异是绿的 |
+| T7-4 | 期望串与输入**连续相同**，PTY 回显命令行即可满足 | 输入改成 `printf '中%s\n' 文测试OK`，使期望串 `中文测试OK` 在输入里**不连续** | 去掉结尾的 `\n`，命令根本不执行 | `真实会话的 stdout 解码正常`：`Actual: 'Last login: …\r\r\n'`，不含期望串 |
+
+四条红**都点名用例**，没有一条是点名文件路径的假红；每条爆炸半径都恰好是瞄准的那一条。
+
+**具体类型：复审的假设是错的，以实测为准。** 复审建议 `throwsA(isA<SSHHostkeyError>())`
+—— **不成立**。实测两条拒绝路径抛的都是 **`SSHAuthAbortError`**，其 `.reason` 才是
+`SSHHostkeyError`。原因是 `SshSession.connect()` 直接 await `_authenticatedShell()`，
+**不做**分类；分类在 `ConnectionManager` 那层（`connection_failure.dart:196-197` 正是
+`if (error is SSHAuthAbortError)` 套 `if (reason is SSHHostkeyError)`）。所以断言写成：
+
+```dart
+throwsA(isA<SSHAuthAbortError>()
+    .having((e) => e.reason, 'reason', isA<SSHHostkeyError>()))
+```
+
+**`.having(...)` 是承重的，不是装饰**：T7-3 那个变异抛出的对象**仍然是**
+`SSHAuthAbortError`（`reason == null`），所以裸的 `isA<SSHAuthAbortError>()` 会**绿着放过
+它**。只有 `.reason` 这一层能区分"因主机密钥被拒"与"因别的缘故中断"。这条判据与生产
+分类器同源，不会各走各的。
+
+**这一步同时修正了 Step 2 里那句注释的说法**：原注释写"用 printf 输出多字节字符，验证
+流式解码器跨分片正确"。实测那次匹配**来自 PTY 对命令行的回显**，命令自身的输出当时还没到；
+而 PTY 是在提交 `\n` 时把回显与命令一起刷出来的，所以"只有回显"的时间窗**测不到**。修法是
+不连续化（让回显无法满足断言），不是去掐时间。
+
+**本轮没有修的（记为计划级遗留，不属于本 Task 的实现缺陷）**：`SshdHarness.isAvailable`
+是死代码（`hostFingerprint()` 经 T7-1 已活）；`start()` 抛异常时 `late SshdHarness sshd`
+未赋值，`tearDownAll` 会以 `LateInitializationError` 盖掉真正的错误；探测端口那段
+（`bind(0)` → 关掉 → 让 sshd 去绑）原理上有 TOCTOU 竞争，实测未触发。
 
 - [ ] **Step 5: 提交**
 
