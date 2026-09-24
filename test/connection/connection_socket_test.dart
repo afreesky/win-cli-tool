@@ -106,8 +106,8 @@ void main() {
     //
     // 实测（真 sshd + 真 SSHClient，见 spec §13.18）：client.close() 在同一个
     // 同步块里先往 sink 写 CHANNEL_EOF / CHANNEL_CLOSE 再关闭传输层，异步
-    // controller 下这两个报文全部丢失 —— 设备侧看到的是连接被粗暴掐断，
-    // 而不是优雅断开（网络设备上这会把 vty 占住到超时）。
+    // controller 下这两个报文全部丢失 —— TCP 连接照常关闭（socket FIN 会发），
+    // 丢的是 SSH 协议层的优雅关闭。
     final conn = _FakeConnection();
     final socket = ConnectionSocket(conn);
 
@@ -122,6 +122,31 @@ void main() {
       reason: 'close 之后才落到的写入会被真实连接静默丢弃',
     );
     expect(conn.written, [65]);
+  });
+
+  test('close() 关闭底层 Connection，并让 done 完成', () async {
+    // SSHTransport.close() 走的正是这条 await socket.close() 路径，所以它必须
+    // 真的把连接关掉 —— 否则 §5.4 的"断开"只停在界面上。
+    final conn = _FakeConnection();
+    final socket = ConnectionSocket(conn);
+
+    await socket.close();
+
+    expect(conn.closed, isTrue, reason: 'close() 必须真的关掉底层连接');
+    await expectLater(socket.done, completes);
+  });
+
+  test('sink.close() 关闭底层 Connection（onDone 这条兜底路径）', () async {
+    // dartssh2 目前从不调用 sink.close()，但 close() 是 StreamSink 契约里的
+    // 合法操作。这条兜底若无声腐烂，第一个这么用的调用方会拿到一个关不掉的
+    // 连接 —— 而它自己不会知道。
+    final conn = _FakeConnection();
+    final socket = ConnectionSocket(conn);
+
+    await socket.sink.close();
+    await Future<void>.delayed(Duration.zero);
+
+    expect(conn.closed, isTrue);
   });
 
   test('destroy() 关闭底层 Connection', () async {

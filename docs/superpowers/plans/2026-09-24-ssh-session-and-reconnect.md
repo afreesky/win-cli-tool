@@ -335,8 +335,8 @@ void main() {
     //
     // 实测（真 sshd + 真 SSHClient，见 spec §13.18）：client.close() 在同一个
     // 同步块里先往 sink 写 CHANNEL_EOF / CHANNEL_CLOSE 再关闭传输层，异步
-    // controller 下这两个报文全部丢失 —— 设备侧看到的是连接被粗暴掐断，
-    // 而不是优雅断开（网络设备上这会把 vty 占住到超时）。
+    // controller 下这两个报文全部丢失 —— TCP 连接照常关闭（socket FIN 会发），
+    // 丢的是 SSH 协议层的优雅关闭。
     final conn = _FakeConnection();
     final socket = ConnectionSocket(conn);
 
@@ -351,6 +351,31 @@ void main() {
       reason: 'close 之后才落到的写入会被真实连接静默丢弃',
     );
     expect(conn.written, [65]);
+  });
+
+  test('close() 关闭底层 Connection，并让 done 完成', () async {
+    // SSHTransport.close() 走的正是这条 await socket.close() 路径，所以它必须
+    // 真的把连接关掉 —— 否则 §5.4 的"断开"只停在界面上。
+    final conn = _FakeConnection();
+    final socket = ConnectionSocket(conn);
+
+    await socket.close();
+
+    expect(conn.closed, isTrue, reason: 'close() 必须真的关掉底层连接');
+    await expectLater(socket.done, completes);
+  });
+
+  test('sink.close() 关闭底层 Connection（onDone 这条兜底路径）', () async {
+    // dartssh2 目前从不调用 sink.close()，但 close() 是 StreamSink 契约里的
+    // 合法操作。这条兜底若无声腐烂，第一个这么用的调用方会拿到一个关不掉的
+    // 连接 —— 而它自己不会知道。
+    final conn = _FakeConnection();
+    final socket = ConnectionSocket(conn);
+
+    await socket.sink.close();
+    await Future<void>.delayed(Duration.zero);
+
+    expect(conn.closed, isTrue);
   });
 
   test('destroy() 关闭底层 Connection', () async {
@@ -506,10 +531,15 @@ class ConnectionSocket implements SSHSocket {
   /// 而非优雅断开。裸 socket 不会这样，所以这层适配器把一个原本正确的
   /// 行为改坏了。
   ///
-  /// 代价：[_conn.write] 若同步抛错，现在会直接从 `sink.add` 里抛出来，
-  /// 而不是变成异步未捕获错误。这是刻意的 —— 快速失败好过静默。前提是
-  /// 监听回调不会回头再往 `_sink` 里写（那会让 sync controller 抛
-  /// StateError）；[_conn.write] 不碰 `_sink`，前提成立。
+  /// 代价（实测，勿凭直觉改写，见 spec §13.18-1）：[_conn.write] 若同步抛错，
+  /// **不会**从 `sink.add` 里抛出来 —— 实测 `try { sink.add(...) } catch` 什么
+  /// 都捕不到，错误经 `_BufferingStreamSubscription._sendData` →
+  /// `_RootZone.runUnaryGuarded` 仍然变成未捕获的 zone 错误，**落点与异步
+  /// controller 完全相同**，只是上报时机从下一个 microtask 提前到同步。
+  ///
+  /// 另：`dispose()` 之后再 `sink.add` 会抛 `Bad state: Cannot add event after
+  /// closing`，但这条不是 `sync: true` 带来的 —— 异步 controller 抛的是一模
+  /// 一样的错误。
   final _sink = StreamController<List<int>>(sync: true);
   final _done = Completer<void>();
   late final StreamSubscription<List<int>> _sub;
@@ -553,7 +583,7 @@ class ConnectionSocket implements SSHSocket {
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `flutter test test/connection/connection_socket_test.dart`
-Expected: 10 个用例全部 PASS
+Expected: 12 个用例全部 PASS
 
 - [ ] **Step 6: 分析 + 提交**
 

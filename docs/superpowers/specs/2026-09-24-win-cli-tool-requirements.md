@@ -1021,17 +1021,33 @@ Foo copyWith({Object? bar = _unset}) => Foo(
    `CHANNEL_CLOSE` 因此从未上线**，而裸 socket 路径下它们是发出去的 —— 也就是说这层
    适配器把一个原本正确的行为改坏了。
 
-   代价不是抽象的：设备侧看到的是连接被粗暴掐断而非优雅断开。网络设备上这会占住
-   vty 直到超时（Cisco/Huawei 都要 `clear line vty` 去清），对一个网络工程师工具是
-   真实的操作负担。
+   **代价要说准，别说过头**：**TCP 连接仍然会正常关闭** —— `close()` → `_conn.close()`
+   → socket 发出 FIN，设备侧的会话不会因此挂住。丢掉的是 **SSH 协议层的优雅关闭**
+   （`CHANNEL_EOF` / `CHANNEL_CLOSE` / 可能的 `DISCONNECT`），影响的是协议卫生：对端
+   日志里的 teardown 与 channel 状态机会看到一次不完整关闭。
+
+   **不要写成"vty 会被一直占住、要 `clear line vty`"** —— 那是 TCP 连接从未关闭
+   （客户端崩溃、链路中断）才有的现象，本情形不是。这一条曾按直觉写进 spec，属于
+   "推断冒充实测"，经评审指出后改掉；本节的规矩是**先测**。
 
    **修法**：`StreamController<List<int>>(sync: true)`。加 `sync: true` 后重测：
    `[write(36B), write(36B), close]`，两个报文都发出去了。
 
-   **副带影响**：`Connection.write` 若同步抛错，现在会从 `sink.add` 里同步抛出，而不是
-   变成异步未捕获错误。刻意如此（快速失败好过静默）。前提是监听回调不会回头再往
-   同一个 sink 里写 —— 那会让 sync controller 抛 `StateError`。`Connection.write`
-   不碰 sink，前提成立。
+   **副带影响（三条"看起来像、实测不是"的直觉，一并记下，免得下次有人照着改）**：
+
+   - `Connection.write` 若同步抛错，**并不会**从 `sink.add` 里抛出来。实测
+     `try { sink.add(...) } catch (e) { … }` 什么都捕不到（`escaped == null`）：
+     错误经 `_BufferingStreamSubscription._sendData` → `_RootZone.runUnaryGuarded`
+     仍然变成未捕获的 zone 错误，**落点与异步 controller 完全相同**，只是上报时机
+     从下一个 microtask 提前到同步。所以别指望 `try/catch` 包住 `sink.add` 能接住
+     写入失败。
+   - 同步 controller 的监听回调里**重入 `add` 不会抛 `StateError`**。Dart 3.12 的
+     `stream_controller.dart` 里根本没有 `_isFiring` / `Cannot fire new event` 这类
+     守卫，实测重入 add 正常通过。别拿这个当"不能重入"的理由。
+   - `dispose()`（即 `_sink.close()`）之后再 `sink.add` 会同步抛
+     `Bad state: Cannot add event after closing`。这条**不是** `sync: true` 带来的：
+     异步 controller 抛的是一模一样的错误，因为 `_StreamController.add` 在两条派发
+     路径之前就查了 `_mayAddEvent`。
 
    **`_sink` 上那条 `onError` 是不可达的**：`Connection.write` 是同步 `void`，没有错误
    通道；而 `onData` 里抛出的异常**不会**路由到同一个订阅的 `onError`（实测：它会变成

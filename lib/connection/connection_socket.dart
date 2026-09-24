@@ -58,10 +58,15 @@ class ConnectionSocket implements SSHSocket {
   /// 而非优雅断开。裸 socket 不会这样，所以这层适配器把一个原本正确的
   /// 行为改坏了。
   ///
-  /// 代价：[_conn.write] 若同步抛错，现在会直接从 `sink.add` 里抛出来，
-  /// 而不是变成异步未捕获错误。这是刻意的 —— 快速失败好过静默。前提是
-  /// 监听回调不会回头再往 `_sink` 里写（那会让 sync controller 抛
-  /// StateError）；[_conn.write] 不碰 `_sink`，前提成立。
+  /// 代价（实测，勿凭直觉改写，见 spec §13.18-1）：[_conn.write] 若同步抛错，
+  /// **不会**从 `sink.add` 里抛出来 —— 实测 `try { sink.add(...) } catch` 什么
+  /// 都捕不到，错误经 `_BufferingStreamSubscription._sendData` →
+  /// `_RootZone.runUnaryGuarded` 仍然变成未捕获的 zone 错误，**落点与异步
+  /// controller 完全相同**，只是上报时机从下一个 microtask 提前到同步。
+  ///
+  /// 另：`dispose()` 之后再 `sink.add` 会抛 `Bad state: Cannot add event after
+  /// closing`，但这条不是 `sync: true` 带来的 —— 异步 controller 抛的是一模
+  /// 一样的错误。
   final _sink = StreamController<List<int>>(sync: true);
   final _done = Completer<void>();
   late final StreamSubscription<List<int>> _sub;
