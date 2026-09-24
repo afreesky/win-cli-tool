@@ -112,6 +112,38 @@ void main() {
       expect(output.join(), contains('设备型号：华为 S5700'));
     });
 
+    test('多字节 UTF-8 字符被切成两片时不会被解码成乱码', () async {
+      final (conn, session, output) = await _manualSession();
+      addTearDown(session.close);
+
+      // `你` = E4 BD A0，恰好从第二个字节之后切开
+      final bytes = utf8.encode('你');
+      expect(bytes, [0xE4, 0xBD, 0xA0], reason: '下面切分位置的前提');
+      conn.feed(bytes.sublist(0, 2));
+      conn.feed(bytes.sublist(2));
+
+      await _drain(output);
+
+      // 逐片 utf8.decode 会把两个残片各解成一个替换字符 U+FFFD；流式解码器
+      // 则会把不完整的字节留到下一片一起拼。
+      expect(output.join(), '你');
+    });
+
+    test('多字节字符被切成三片、两侧都是 ASCII 时不会错位', () async {
+      final (conn, session, output) = await _manualSession();
+      addTearDown(session.close);
+
+      // 分片边界落在 `你` 内部，且最后一片里同时有字符尾部与普通 ASCII：
+      // 只把残缺字节攒起来、不与后续内容重新同步的实现会在这里错位。
+      conn.feed([0x6F, 0x6B, 0x3A, 0xE4]); // "ok:" + `你` 的首字节
+      conn.feed([0xBD]); // `你` 的中字节
+      conn.feed([0xA0, 0x21]); // `你` 的末字节 + "!"
+
+      await _drain(output);
+
+      expect(output.join(), 'ok:你!');
+    });
+
     test('对端协商被自动应答，不进入输出流', () async {
       final device = await FakeDeviceServer.start(
         prompt: '[CoreSW]',
@@ -222,6 +254,33 @@ void main() {
       expect(conn.closed, isTrue, reason: '建连期间被 close，刚建好的连接必须关掉');
     });
   });
+}
+
+/// 用一条可手动喂字节的假连接建一个会话，并收集它解码出来的字符串。
+///
+/// 与依赖 OS/TCP 何时切分的用例不同：这里每一片的边界完全由用例决定，
+/// 因此可以确定性地把多字节字符切在分片中间。
+Future<(_FakeConnection, TelnetSession, List<String>)> _manualSession() async {
+  final conn = _FakeConnection();
+  final session = TelnetSession(
+    profile: _profile(1),
+    connector: _GatedConnector(Future.value(conn)),
+  );
+  final output = <String>[];
+  // 必须先订阅再喂字节：_output 是广播流，早到的片段没有回放。
+  session.output.listen(output.add);
+  await session.connect();
+  return (conn, session, output);
+}
+
+/// 等「连接 → 解码 → 输出」这条链跑干净：输出连续两次采样间不再变化。
+Future<void> _drain(List<String> output) async {
+  var previous = output.length;
+  while (true) {
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+    if (output.length == previous) return;
+    previous = output.length;
+  }
 }
 
 Future<void> _waitUntil(

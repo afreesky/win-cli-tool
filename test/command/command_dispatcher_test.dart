@@ -319,6 +319,43 @@ void main() {
       });
     });
 
+    test('反复翻页不重置命令超时，一条命令仍只在 10s 处超时', () {
+      fakeAsync((async) {
+        final h = _Harness();
+        h.dispatcher.enqueue(['display cur', 'next']);
+        async.flushMicrotasks();
+        expect(h.written, ['display cur\n']);
+
+        // 设备在 t≈0s、4s、9s 各翻一页，之后彻底静默。翻页提示用
+        // `---- More ----`：它不以 > 结尾，本来也匹配不上提示符正则，
+        // 于是这里只考察超时有没有被翻页重置，不掺入翻页-vs-提示符的判定。
+        h.dispatcher.onOutput('line1\r\n  ---- More ----');
+        async.elapse(const Duration(seconds: 4));
+        expect(h.completed, isEmpty, reason: '4s 时还没到超时');
+
+        h.dispatcher.onOutput('line2\r\n  ---- More ----');
+        async.elapse(const Duration(seconds: 5));
+        expect(h.completed, isEmpty, reason: '9s 时还没到超时');
+
+        h.dispatcher.onOutput('line3\r\n  ---- More ----');
+
+        // 最后一次翻页落在 9s。spec §5.3 要求翻页**不得**重置命令超时
+        // ——一条命令翻十页仍然只受一个 10s 超时约束。若翻页分支调用了
+        // _restartTimeout()，deadline 会被推到 19s，t=10.2s 处将没有任何
+        // 完成事件；设备一直翻页就能把队列永久挂住，正是该规则要防的。
+        async.elapse(const Duration(milliseconds: 1200)); // 走到 t=10.2s
+
+        expect(h.completed, hasLength(1), reason: '10s 处必须超时收尾');
+        expect(h.completed.single.command, 'display cur');
+        expect(h.completed.single.timedOut, isTrue);
+        expect(
+          h.written,
+          ['display cur\n', ' ', ' ', ' ', 'next\n'],
+          reason: '超时后仍要放行下一条',
+        );
+      });
+    });
+
     test('以 > 结尾的翻页提示不会被误判为命令结束', () {
       fakeAsync((async) {
         // 对照组：`---- More ----` 不以 > 结尾，本来也匹配不上提示符正则，
