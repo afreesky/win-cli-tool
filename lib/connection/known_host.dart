@@ -57,6 +57,15 @@ abstract class HostKeyStore {
 
   /// 保存（同一 [KnownHost.identity] 视为覆盖）。
   Future<void> save(KnownHost host);
+
+  /// 删除这一条记录。
+  ///
+  /// **不是可选项。** 设备确实更换过主机密钥时，[find] 会一直返回旧指纹，
+  /// 于是这台设备被**永久**拒绝连接；计划 3 的错误文案正是让用户
+  /// "在设置中清除该主机的记录后重连"。接口少了这个方法，那句话就是在
+  /// 教用户做一件做不到的事 —— 而"主机密钥变了"恰恰是唯一一个
+  /// 用户绝不能学会忽略的警告。
+  Future<void> remove(String host, int port, String keyType);
 }
 
 /// 内存实现，供测试与"不持久化"的场景使用。
@@ -66,9 +75,20 @@ class InMemoryHostKeyStore implements HostKeyStore {
   /// 已保存记录的快照，供断言。
   List<KnownHost> get all => List.unmodifiable(_byIdentity.values);
 
+  /// 仓库自己的查键。**必须与 [KnownHost.identity] 逐字一致** —— 两边各改
+  /// 各的会让 [find] / [remove] 永远找不到记录，于是每次连接都被当成
+  /// "首次连接"，已经变过密钥的主机也会被重新 TOFU 接受。测试里有一条
+  /// 专门守这个跨类不变式。
+  String _key(String host, int port, String keyType) => '$host:$port:$keyType';
+
   @override
   Future<KnownHost?> find(String host, int port, String keyType) async =>
-      _byIdentity['$host:$port:$keyType'];
+      _byIdentity[_key(host, port, keyType)];
+
+  @override
+  Future<void> remove(String host, int port, String keyType) async {
+    _byIdentity.remove(_key(host, port, keyType));
+  }
 
   @override
   Future<void> save(KnownHost host) async {

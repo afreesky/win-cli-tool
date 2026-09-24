@@ -112,4 +112,31 @@ void main() {
     expect(() => store.all.add(_k(host: 'other')), throwsUnsupportedError);
     expect(store.all, hasLength(1));
   });
+
+  test('remove 之后 find 回到 null（设备换过密钥后的唯一出路）', () async {
+    // 计划 3 的错误文案要求用户"在设置中清除该主机的记录后重连"。
+    // 接口若没有 remove，那句话就是在教用户做一件做不到的事 ——
+    // 指纹一旦变化，这台设备会被**永久**拒绝，而且无处可清。
+    final store = InMemoryHostKeyStore();
+    await store.save(_k());
+
+    await store.remove('10.0.0.1', 22, 'ssh-ed25519');
+
+    expect(await store.find('10.0.0.1', 22, 'ssh-ed25519'), isNull);
+    expect(store.all, isEmpty);
+  });
+
+  test('remove 只删指定算法，同一主机的其他算法不受影响', () async {
+    // 与 save/find 同一条理由：删也必须精确到一把密钥。否则"清掉换过的那把"
+    // 会顺手删掉同主机另一种算法的记录，用户下次连接会被重新问一遍。
+    final store = InMemoryHostKeyStore();
+    await store.save(_k(keyType: 'ssh-ed25519', fingerprint: 'SHA256:x'));
+    await store.save(_k(keyType: 'rsa-sha2-256', fingerprint: 'SHA256:y'));
+
+    await store.remove('10.0.0.1', 22, 'ssh-ed25519');
+
+    expect((await store.find('10.0.0.1', 22, 'rsa-sha2-256'))!.fingerprint,
+        'SHA256:y');
+    expect(store.all, hasLength(1));
+  });
 }
