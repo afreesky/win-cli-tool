@@ -103,6 +103,12 @@ void main() {
 
       // 显式传 null → 清空，回到「用应用数据目录下的 logs/」
       expect(s.copyWith(logDir: null).logDir, isNull);
+
+      // null → 设新值：用户第一次指定日志目录
+      expect(
+        const AppSettings().copyWith(logDir: '/var/log').logDir,
+        '/var/log',
+      );
     });
   });
 }

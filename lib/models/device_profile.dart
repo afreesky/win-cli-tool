@@ -15,9 +15,11 @@ enum DeviceProtocol {
 
 /// 「调用方没传这个参数」的哨兵，用来区分它与「调用方显式传了 null」。
 ///
-/// 见 Task 2 开头对 [DeviceProfile.password]、[DeviceProfile.privateKeyPath]、
-/// [DeviceProfile.promptRegex] 的说明：这几个字段的 null 是有语义的值，不能被
-/// `?? this.x` 吞掉。
+/// [DeviceProfile.password]、[DeviceProfile.privateKeyPath] 与
+/// [DeviceProfile.promptRegex] 的 null 都是有语义的值（不启用密码认证 /
+/// 不启用密钥认证 / 用全局默认提示符正则），不能被 `?? this.x` 吞掉：
+/// 否则用户清空密码改用密钥认证后，旧密码仍留在明文配置里，且界面上
+/// 再没有任何地方能看到它。
 const Object _unset = Object();
 
 /// 一条可复用的命令片段，归属于单台设备。

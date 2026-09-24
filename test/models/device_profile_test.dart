@@ -108,7 +108,6 @@ void main() {
 
       expect(q.password, 'pw');
       expect(q.promptRegex, r'[>#]\s*$');
-      expect(q.privateKeyPath, isNull);
     });
 
     test('copyWith 能把可空字段显式清回 null', () {
@@ -138,6 +137,25 @@ void main() {
       expect(q.host, '10.0.0.1');
       expect(q.port, 22);
       expect(q.id, 'd1');
+    });
+
+    test('copyWith 能把可空字段从 null 设为新值', () {
+      // 哨兵机制有三个分支：保留、清空、设新值。前两个由上面两个用例覆盖，
+      // 这个覆盖第三个 —— 若只在保留/清空上正确而设新值有 bug，用户改的密码
+      // 会被静默丢弃，且因为每次保存都丢掉，用户再编辑也救不回来。
+      const p = DeviceProfile(
+        id: 'd1',
+        name: 'A',
+        protocol: DeviceProtocol.ssh,
+        host: '10.0.0.1',
+        port: 22,
+        username: 'admin',
+      );
+
+      final q = p.copyWith(password: 'new-pw', promptRegex: r'>>>\s*$');
+
+      expect(q.password, 'new-pw');
+      expect(q.promptRegex, r'>>>\s*$');
     });
 
     test('JSON 只有必填字段时，可选项回落到默认值（v1 配置迁移形状）', () {
@@ -206,6 +224,11 @@ void main() {
       expect(cleared.password, isNull);
       expect(cleared.privateKeyPath, isNull);
       expect(cleared.username, 'ops');
+
+      // 设新值
+      final updated = j.copyWith(password: 'new-pw');
+      expect(updated.password, 'new-pw');
+      expect(updated.privateKeyPath, '/home/ops/.ssh/id_ed25519');
     });
   });
 
