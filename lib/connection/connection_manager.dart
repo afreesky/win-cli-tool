@@ -5,6 +5,9 @@ import 'connection_failure.dart';
 ///
 /// 颜色映射（供计划 5 使用）：disconnected→灰、connecting→黄、
 /// connected→绿、reconnecting→黄、failed→红。
+///
+/// 注意"红"：§5.4 的逐事件表里**没有**红（只有黄/黄/绿/灰），红来自
+/// FR-C-06 的"连接失败"。`failed` 何时可达目前尚未定论，见 spec §13.17-3。
 enum DeviceConnectionState {
   /// 未连接。与 [connecting]/[reconnecting] 同为"没有连接"，
   /// 但颜色不同：这两个是黄，本状态是灰。

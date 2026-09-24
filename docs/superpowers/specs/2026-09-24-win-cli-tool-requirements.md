@@ -958,7 +958,7 @@ Foo copyWith({Object? bar = _unset}) => Foo(
 
    `clock` 通常已在传递依赖里，但**必须**在 `pubspec.yaml` 里显式声明为直接依赖才能 `import`。
 
-### 13.17 `ConnectionManager` 的两处实测结论（计划 2 执行期）
+### 13.17 `ConnectionManager` 的三处实测结论（计划 2 执行期）
 
 1. **用户主动断开时，状态必须是 `disconnected`（灰），不是 `failed`（红）—— 而 `_userClosed` 必须同时守住失败分支。**
 
@@ -986,7 +986,7 @@ Foo copyWith({Object? bar = _unset}) => Foo(
 
 3. **`failed`（红）在产品里何时可达 —— 一个尚未决策的 spec 冲突。**
 
-   FR-C-06 要求「连接失败时，设备按钮变红」，但 `ConnectionManager` 的 `autoReconnect` 默认 `true`，且全项目没有调用方传 `false`，于是 `failed` 在实际产品里**永远到不了**。这是 FR-D-09 与 §5.4 两处口径不一致的外显：
+   FR-C-06 要求「连接失败时，设备按钮变红」，但 `ConnectionManager` 的 `autoReconnect` 默认 `true`，且没有任何生产代码传 `false`（只有测试传过），于是 `failed` 在实际产品里**永远到不了**。这是 FR-D-09 与 §5.4 两处口径不一致的外显：
 
    - FR-D-09 概述为「红=连接失败**或已断开**」；
    - §5.4 的逐事件表却是：检测到断开→**黄**、重连失败→**维持黄**、用户主动断开→**灰** —— 表里**没有红**，也没为「首次建连就失败」留一行。

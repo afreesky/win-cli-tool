@@ -71,6 +71,9 @@ import 'connection_failure.dart';
 ///
 /// 颜色映射（供计划 5 使用）：disconnected→灰、connecting→黄、
 /// connected→绿、reconnecting→黄、failed→红。
+///
+/// 注意"红"：§5.4 的逐事件表里**没有**红（只有黄/黄/绿/灰），红来自
+/// FR-C-06 的"连接失败"。`failed` 何时可达目前尚未定论，见 spec §13.17-3。
 enum DeviceConnectionState {
   /// 未连接。与 [connecting]/[reconnecting] 同为"没有连接"，
   /// 但颜色不同：这两个是黄，本状态是灰。
@@ -173,8 +176,8 @@ Expected: **3 条**错误，全部来自 `connection_failure.dart` 尚未创建�
 
 ```
 error - connection_manager.dart:2:8 - Target of URI doesn't exist: 'connection_failure.dart'. - uri_does_not_exist
-error - connection_manager.dart:85:9 - Undefined class 'ConnectionFailure'. - undefined_class
-error - connection_manager.dart:98:9 - Undefined class 'ConnectionFailure'. - undefined_class
+error - connection_manager.dart:88:9 - Undefined class 'ConnectionFailure'. - undefined_class
+error - connection_manager.dart:101:9 - Undefined class 'ConnectionFailure'. - undefined_class
 ```
 
 **不得出现 `unused_import`** —— 若出现，说明 `command_dispatcher.dart` 没被用到（`SessionReady` 的载荷就是它）。
@@ -335,7 +338,7 @@ void main() {
 }
 ```
 
-> 测试里用到 `SocketException`，需在文件顶部加 `import 'dart:io';`。
+> 上面的 import 已含 `dart:io`（最后一条用例要用 `SocketException` 验证"错误不被静默吞掉"）。
 
 - [ ] **Step 3: 运行测试确认失败**
 
@@ -1300,7 +1303,7 @@ class SshSession implements Session {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `flutter test test/connection/ssh_session_test.dart`
-Expected: 5 个用例全部 PASS
+Expected: 4 个用例全部 PASS
 
 - [ ] **Step 5: 反证测试的非空性**
 
@@ -2028,6 +2031,9 @@ import 'session_factory.dart';
 ///
 /// 颜色映射（供计划 5 使用）：disconnected→灰、connecting→黄、
 /// connected→绿、reconnecting→黄、failed→红。
+///
+/// 注意"红"：§5.4 的逐事件表里**没有**红（只有黄/黄/绿/灰），红来自
+/// FR-C-06 的"连接失败"。`failed` 何时可达目前尚未定论，见 spec §13.17-3。
 enum DeviceConnectionState {
   /// 未连接。与 [connecting]/[reconnecting] 同为"没有连接"，
   /// 但颜色不同：这两个是黄，本状态是灰。
@@ -2886,7 +2892,7 @@ flutter test && dart analyze
 
 ## 未决项：`failed`（红）在产品里何时可达（**需要决策，不阻塞 Task 1–5**）
 
-FR-C-06 要求「连接失败时，设备按钮变红」，但本计划的 `ConnectionManager` 里 `autoReconnect` **默认 true、且全项目没有任何调用方传 false** —— 也就是说 `failed` 这个状态在实际产品里**永远到不了**，红按钮不会被点亮。这与 FR-C-06 是冲突的。
+FR-C-06 要求「连接失败时，设备按钮变红」，但本计划的 `ConnectionManager` 里 `autoReconnect` **默认 true、且没有任何生产代码传 false**（只有下面的测试传过） —— 也就是说 `failed` 这个状态在实际产品里**永远到不了**，红按钮不会被点亮。这与 FR-C-06 是冲突的。
 
 冲突的根源是 spec 里两处口径不一致：
 
