@@ -157,6 +157,28 @@ void main() {
       await expectLater(session.connect(), throwsA(isA<SocketException>()));
     });
 
+    test('从未连接的会话上 close() 能完成（不挂起）', () async {
+      final session = TelnetSession(profile: _profile(1));
+
+      // 单订阅 StreamController 的 close() Future 要等到有监听者订阅才会兑现；
+      // 从未连上的会话没有监听者，await 会永久挂起。加超时是为了让回归以
+      // 「失败」而不是「卡死整个测试套件」的方式暴露出来。
+      await session.close().timeout(const Duration(seconds: 2));
+    });
+
+    test('connect 抛异常后 close() 能完成（不挂起）', () async {
+      final device = await FakeDeviceServer.start();
+      final port = device.port;
+      await device.stop();
+
+      final session = TelnetSession(profile: _profile(port));
+      await expectLater(session.connect(), throwsA(isA<SocketException>()));
+
+      // 「连不上 → 清理」是最常见的调用路径。connect 抛异常时 _decodeSub 还没
+      // 赋值，_dataBytes 也就从没被监听，close() 同样会永久挂起。
+      await session.close().timeout(const Duration(seconds: 2));
+    });
+
     test('connect 等待期间被 close：连接被关闭且没有异常逃逸到 zone', () async {
       final conn = _FakeConnection();
       final gate = Completer<Connection>();

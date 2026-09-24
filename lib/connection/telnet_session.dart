@@ -92,7 +92,11 @@ class TelnetSession implements Session {
     await _inputSub?.cancel();
     await _decodeSub?.cancel();
     await _conn?.close();
-    await _dataBytes.close();
-    await _output.close();
+    // 这里不能 await：单订阅 StreamController 的 close() Future 要等到有
+    // 监听者订阅才会完成，而「从未连上」或「connect 抛异常」的会话永远没有
+    // 监听者，await 会永久挂起（切设备、连不上后清理、关窗口时卡死）。
+    // 这两个只是内存对象，真正需要释放的资源是上面的 socket。
+    unawaited(_dataBytes.close());
+    unawaited(_output.close());
   }
 }
