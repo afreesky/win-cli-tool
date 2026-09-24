@@ -866,8 +866,19 @@ Foo copyWith({Object? bar = _unset}) => Foo(
 4. **`SSHSession.stdout` 是 `Stream<Uint8List>`，照抄 Telnet 的管道会在运行时报错。**
    与 §8.5 `connector.dart` 中 `_SocketConnection.input` 记录的**同一个协变陷阱**：静态类型兼容，但 `Stream.transform` 按运行时类型校验 transformer，于是 `.transform(Utf8Decoder())` 编译通过、运行时抛 `type 'Utf8Decoder' is not a subtype of type 'StreamTransformer<Uint8List, String>'`。**必须 `.cast<List<int>>()`。** Telnet 侧已经踩过并写下了注释，SSH 侧是同一条坑。
 
-5. **`SSHSession.close()` 不会完成 `session.done`。**
-   这**正好符合** `Session.done` 的契约（「主动 `close()` 不触发 `done`，只有意外断线才触发」），无需额外处理 —— 但要知道这一点是刻意依赖库行为的，别在后续重构里「顺手」改成 `close()` 里也完成 `done`。
+5. **`session.close()` 不完成 `session.done`，但 `client.close()` 会 —— 而 `SshSession.close()` 两个都要调。**
+   实测（2026-09-24，回环 sshd，见下表）四种路径：
+
+   | 触发方式 | `session.done` | 是否符合 `Session.done` 契约 |
+   |---|---|---|
+   | 我方 `session.close()` | 保持未完成 | ✅ 符合 |
+   | **我方 `client.close()`（会话仍活着）** | **完成** | ❌ **违反** |
+   | 对端 `exit` | 完成 | ✅ 符合（就是要的信号） |
+   | 底层 socket 被销毁 | 完成 | ✅ 符合 |
+
+   第二行是陷阱：`SshSession.close()` **必然**会调 `client.close()`，于是「主动关闭」会被 `done` 的监听者看成一次**意外断线**。后果不是少一个信号，而是**退出应用或用户主动断开时，每台设备都触发一次 FR-C-07 自动重连** —— 用户点了断开/关了窗口，工具却在拼命重连。
+
+   **约束：`SshSession` 转发 `session.done` 时必须先查 `_closed` 标志（`if (_closed) return;`），不能直接透传。** 这与 `TelnetSession._onDisconnected` 里的写法一致。已实测该守卫**充分且必要**：带守卫时主动关闭 0 个事件、对端断开 1 个事件；去掉守卫则主动关闭也报 1 个事件。因此这一条可以直接写成一对互为反向的回归测试（主动关闭 → `done` 不完成；对端断开 → `done` 完成）。
 
 6. **`keepAliveInterval` 默认 10 秒。**
    对 FR-C-07 的重连有直接影响：设备侧静默断开时，dartssh2 会先靠自己发现的 keepalive 失败来结束 `done`，而不是等 TCP 超时。计划 2 若要调整该值，需与 FR-C-07 的退避序列一起考虑，避免「keepalive 判定断开」与「重连退避」互相打架。
