@@ -955,6 +955,11 @@ class DeviceStore {
   ///
   /// 跳板机已放弃（spec §10.2），V1 既不解释也不修改这个字段；留着的唯一目的是
   /// **不丢用户数据** —— 手写的 `jumpHosts` 不该被本程序的一次保存抹掉。
+  ///
+  /// **但"原样写回"是有前提的，别读成无条件的**：写回的是**本实例 `load()` 记下的
+  /// 那一份**。没在本实例上 `load()` 过就直接 `save()`，这里还是初始的 `const []`，
+  /// 于是文件里手写的 `jumpHosts` **会被抹成空数组**（实测过，有测试钉着这个行为）。
+  /// 所以：**同一个文件不要建两个 store，一个读一个写** —— 计划 5 尤其注意。
   List<Object?> _rawJumpHosts = const [];
 
   /// 读盘。
@@ -1252,8 +1257,15 @@ void main() {
       ],
       'devices': <Object?>[],
     }));
-    final loaded = await store().load();
-    await store().save(loaded.devices);
+    // **必须用同一个 store 实例。** `_rawJumpHosts` 是**每个 DeviceStore 各自的**
+    // 状态，只有 `load()` 会填它；而 `store()` 辅助函数每次调用都新建一个。写成
+    // `store().load()` + `store().save(...)` 就是"一个实例读、另一个实例写" ——
+    // 写的那边从没读过盘，只会写回空数组，这条用例必红（实测过，Actual: []）。
+    // 要钉的是"**读过的那个实例**写回时不丢用户手写的 jumpHosts"。
+    // 顺带记住这条设计对计划 5 的含义：别对同一个文件建两个 store，一个读一个写。
+    final s = store();
+    final loaded = await s.load();
+    await s.save(loaded.devices);
 
     final raw = jsonDecode(await file.readAsString()) as Map<String, Object?>;
     expect(raw['jumpHosts'], [
@@ -1324,8 +1336,13 @@ class DuplicateDeviceNameError implements Exception {
 
   final String name;
 
+  /// 可直接展示给用户的中文说明。与 [LoadIssue.message] 以及
+  /// `ConnectionFailure.message` 一致 —— 界面对这三者的渲染方式应该是同一种，
+  /// 别让计划 5 去 `'$e'`（那会把异常的 `toString()` 直接摆给用户）。
+  String get message => '设备名称重复：$name';
+
   @override
-  String toString() => '设备名称重复：$name';
+  String toString() => message;
 }
 ```
 
@@ -1335,6 +1352,11 @@ class DuplicateDeviceNameError implements Exception {
   /// 存盘。**先全校验，再动文件**（原因见 [DuplicateDeviceNameError]）。
   ///
   /// 顺序即显示顺序（§13.2）：本方法逐条编码，**不排序**。
+  ///
+  /// **只校验名称唯一，不校验 id。** id 由计划 5 生成，唯一性归它管 —— 这里是
+  /// **有意的留白，不是漏了**；真出现两个同 id，密钥库实现会把两者的凭据串起来。
+  ///
+  /// 另见 [_rawJumpHosts]：`jumpHosts` 只对**在本实例上 load() 过**的文件才是原样写回。
   Future<void> save(List<DeviceProfile> devices) async {
     final seen = <String>{};
     for (final device in devices) {

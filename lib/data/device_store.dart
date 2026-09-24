@@ -28,6 +28,26 @@ class DeviceLoadResult {
   final List<LoadIssue> issues;
 }
 
+/// 设备名称重复（FR-D-04：名称在列表内必须唯一）。
+///
+/// **在存盘时抛出，而不是提供一个 `bool isNameTaken` 让调用方自己判断。**
+/// 唯一性是**文件级**不变量：单看一个 profile 判断不了，必须看整个列表；
+/// 让调用方自己判，就总有那么一条路径忘了判，而后果是写出一个读不回来
+/// （或读回来两台同名）的文件。
+class DuplicateDeviceNameError implements Exception {
+  const DuplicateDeviceNameError(this.name);
+
+  final String name;
+
+  /// 可直接展示给用户的中文说明。与 [LoadIssue.message] 以及
+  /// `ConnectionFailure.message` 一致 —— 界面对这三者的渲染方式应该是同一种，
+  /// 别让计划 5 去 `'$e'`（那会把异常的 `toString()` 直接摆给用户）。
+  String get message => '设备名称重复：$name';
+
+  @override
+  String toString() => message;
+}
+
 /// `devices.json` 的读写（FR-D-10、NFR-R-03、NFR-R-04）。
 class DeviceStore {
   DeviceStore({required this.file, required this.credentials});
@@ -39,6 +59,11 @@ class DeviceStore {
   ///
   /// 跳板机已放弃（spec §10.2），V1 既不解释也不修改这个字段；留着的唯一目的是
   /// **不丢用户数据** —— 手写的 `jumpHosts` 不该被本程序的一次保存抹掉。
+  ///
+  /// **但"原样写回"是有前提的，别读成无条件的**：写回的是**本实例 `load()` 记下的
+  /// 那一份**。没在本实例上 `load()` 过就直接 `save()`，这里还是初始的 `const []`，
+  /// 于是文件里手写的 `jumpHosts` **会被抹成空数组**（实测过，有测试钉着这个行为）。
+  /// 所以：**同一个文件不要建两个 store，一个读一个写** —— 计划 5 尤其注意。
   List<Object?> _rawJumpHosts = const [];
 
   /// 读盘。
@@ -168,5 +193,40 @@ class DeviceStore {
     }
 
     return DeviceLoadResult(devices: devices, issues: issues);
+  }
+
+  /// 存盘。**先全校验，再动文件**（原因见 [DuplicateDeviceNameError]）。
+  ///
+  /// 顺序即显示顺序（§13.2）：本方法逐条编码，**不排序**。
+  ///
+  /// **只校验名称唯一，不校验 id。** id 由计划 5 生成，唯一性归它管 —— 这里是
+  /// **有意的留白，不是漏了**；真出现两个同 id，密钥库实现会把两者的凭据串起来。
+  ///
+  /// 另见 [_rawJumpHosts]：`jumpHosts` 只对**在本实例上 load() 过**的文件才是原样写回。
+  Future<void> save(List<DeviceProfile> devices) async {
+    final seen = <String>{};
+    for (final device in devices) {
+      if (!seen.add(device.name)) {
+        throw DuplicateDeviceNameError(device.name);
+      }
+    }
+
+    final encoded = <Object?>[];
+    for (final device in devices) {
+      // 凭据**只**经由接口进出（NFR-S-01）：先剥掉模型吐出来的凭据字段，
+      // 再让接口决定它落在哪里 —— 明文实现会写回同一个字段，
+      // 密钥库实现则什么都不写，于是文件里没有凭据。
+      final record = credentials.strip(device.toJson());
+      credentials.write(record, device.password);
+      encoded.add(record);
+    }
+
+    await writeJsonObject(file, {
+      'schemaVersion': kDevicesSchemaVersion,
+      // 原样搬运，不解释也不修改 —— 跳板机已放弃（spec §10.2），
+      // 这里唯一的目的就是别把用户手写的数据抹掉。
+      'jumpHosts': _rawJumpHosts,
+      'devices': encoded,
+    });
   }
 }
