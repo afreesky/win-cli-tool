@@ -1745,7 +1745,10 @@ git commit -m "feat: FR-C-06 失败原因分类，区分主机密钥与算法协
 - [ ] **Step 1: 写失败测试**
 
 ```dart
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
+import 'package:win_cli_tool/connection/connection_failure.dart';
 import 'package:win_cli_tool/connection/connector.dart';
 import 'package:win_cli_tool/connection/known_host.dart';
 import 'package:win_cli_tool/connection/ssh_session.dart';
@@ -1773,6 +1776,28 @@ class _FailingConnector implements Connector {
   Future<Connection> open(String host, int port, {Duration? timeout}) async {
     throw error;
   }
+}
+
+/// 把一个必然失败的 future 抛出的 [ConnectionFailure] 取出来。
+///
+/// 不用 `throwsA`：这些用例要断言失败对象的**内容**（文案把人指向哪儿），
+/// `throwsA(isA<ConnectionFailure>())` 拿不到对象。抛的若是别的异常，这里
+/// 不接、直接冒出去 —— 用例随即变红，而那正是我们要的（说明翻译没生效，
+/// 比如英文类名被漏给了用户）。
+Future<ConnectionFailure> _failureOf(Future<void> future) async {
+  try {
+    await future;
+  } on ConnectionFailure catch (failure) {
+    return failure;
+  }
+  fail('本该抛出 ConnectionFailure，却正常返回了');
+}
+
+/// 把一段内容写进系统临时目录里的固定文件，返回路径。
+String _writeTemp(String name, String content) {
+  final file = File('${Directory.systemTemp.path}/wct_t4_$name');
+  file.writeAsStringSync(content);
+  return file.path;
 }
 
 void main() {
@@ -1834,6 +1859,153 @@ void main() {
     expect(session.debugHostKeyCallbackIsNull, isFalse);
   });
 
+  // ---------------------------------------------------------------------
+  // 以下四条守 `_identities()` 的翻译。**这是 Task 4 里唯一不需要假 SSH
+  // 服务端就能测的真行为** —— 因为实现把加载私钥排在建连**之前**（见 Step 3
+  // 的 connect()），所以一个必然失败的 connector 就足以证明"先失败的是私钥"。
+  //
+  // 每条用例喂的输入都在 2026-09-24 实测过，抛出的类型写在注释里。
+  // 五条合起来覆盖 `_identities()` 的每一支：PathNotFound / UnsupportedError /
+  // FormatException / SSHKeyDecryptError / 兜底。
+  // **每一条分支都必须有对应用例** —— 少一条就有一支失去约束。
+  // ---------------------------------------------------------------------
+
+  test('私钥路径写错 → 中文 ConnectionFailure，且先于建连失败', () async {
+    // §13.19-9 里最可能发生的输入。实测：`File(path).readAsStringSync()`
+    // 抛 `PathNotFoundException`（`FileSystemException` 的子类），分类器
+    // 认不出，用户会看到「连接失败：PathNotFoundException: Cannot open file…」。
+    //
+    // 这里故意用**必然失败**的 connector：实现若把建连排在加载私钥之前，
+    // 抛出来的就会是 connector 那个异常，这条用例随即红 —— 所以它同时钉住了
+    // "先加载私钥、再开 socket"。
+    final session = SshSession(
+      profile: _profile(keyPath: '/definitely/not/here/id_rsa'),
+      connector: _FailingConnector(Exception('不该走到这里：私钥应当先失败')),
+      hostKeyStore: InMemoryHostKeyStore(),
+    );
+
+    final failure = await _failureOf(session.connect());
+
+    expect(failure.kind, ConnectionFailureKind.authFailed);
+    expect(failure.message, contains('私钥'));
+    expect(failure.message, contains('/definitely/not/here/id_rsa'));
+    // 英文类名不能漏给用户。
+    expect(failure.message, isNot(contains('PathNotFoundException')));
+  });
+
+  test('选中的是公钥文件 → 文案指向"公钥"，而不是"格式不支持"', () async {
+    // §13.19-9 第 1 行。实测：`-----BEGIN PUBLIC KEY-----` 的文件抛
+    // `UnsupportedError('Unsupported key type: PUBLIC KEY')`。
+    // 这是**用户操作错了**（换一个文件就好），与"本版本不支持这个格式"
+    // 是两回事 —— 混成一句，用户会去反复确认自己的私钥没问题。
+    final session = SshSession(
+      profile: _profile(
+        keyPath: _writeTemp(
+          'id_rsa.pub',
+          '-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n',
+        ),
+      ),
+      connector: _FailingConnector(Exception('不该走到这里')),
+      hostKeyStore: InMemoryHostKeyStore(),
+    );
+
+    final failure = await _failureOf(session.connect());
+
+    expect(failure.kind, ConnectionFailureKind.authFailed);
+    expect(failure.message, contains('公钥'));
+    expect(failure.message, isNot(contains('Unsupported')));
+  });
+
+  test('不是 PEM 的文件 → 文案说"不是 PEM"，不说"格式不支持"', () async {
+    // 实测：`hello world` 抛
+    // `FormatException: PEM header must start with -----BEGIN `。
+    // 分类器认不出它（`FormatException` 遍布 `dart:core`）。
+    final session = SshSession(
+      profile: _profile(keyPath: _writeTemp('not_a_key.txt', 'hello world\n')),
+      connector: _FailingConnector(Exception('不该走到这里')),
+      hostKeyStore: InMemoryHostKeyStore(),
+    );
+
+    final failure = await _failureOf(session.connect());
+
+    expect(failure.kind, ConnectionFailureKind.authFailed);
+    expect(failure.message, contains('PEM'));
+    expect(failure.message, isNot(contains('FormatException')));
+  });
+
+  test('损坏的 OPENSSH 私钥 → 绝不能报成"协议错误"', () async {
+    // §13.19-9 第 4 行，也是那张表里**方向错得最狠**的一行。实测：截断的
+    // OPENSSH 私钥抛 `SSHPacketError`，而分类器把 `SSHPacketError` 全局映射成
+    // `protocolError`（它在传输层有 18 个抛出点，不能全局改）—— 用户会去
+    // 查算法，实际是他的密钥文件坏了。
+    //
+    // 这一条走的是 `_identities()` 的兜底 `catch`，所以它也证明那个兜底存在。
+    final session = SshSession(
+      profile: _profile(
+        keyPath: _writeTemp(
+          'id_ed25519',
+          '-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n'
+              '-----END OPENSSH PRIVATE KEY-----\n',
+        ),
+      ),
+      connector: _FailingConnector(Exception('不该走到这里')),
+      hostKeyStore: InMemoryHostKeyStore(),
+    );
+
+    final failure = await _failureOf(session.connect());
+
+    expect(failure.kind, ConnectionFailureKind.authFailed);
+    expect(failure.message, contains('私钥'));
+    // 关键：不能把方向指到协议/算法上去。
+    expect(failure.message, isNot(contains('协议错误')));
+    expect(failure.message, isNot(contains('算法')));
+    // 原文**要留着**（§13.19-1「永远不吞掉异常」），与分类器 `unknown` 那一格
+    // 同一个设计：认得出的给干净中文，认不出的给中文框架 + 原文。少了这条断言，
+    // 把兜底消息里的 `$error` 删掉是一样的绿 —— 而那就把异常吞了。
+    expect(failure.message, contains('SSHPacketError'));
+  });
+
+  test('带口令的 OPENSSH 私钥 → 走分类器，绝不能漏出字面 null', () async {
+    // 守 `_identities()` 里 `on SSHKeyDecryptError` 那一支。**这一支不能删**
+    // —— 删了它，这个异常会落进兜底 `catch`，而 `SSHKeyDecryptError` 的
+    // `error` 字段**就是 null**（实测
+    // `SSHKeyDecryptError(Private key is encrypted, null)`），于是用户看到
+    // 「无法读取私钥：<路径>\n原始信息：SSHKeyDecryptError(Private key is
+    // encrypted, null)」—— §13.19-7 修好的那个 null 泄漏，换一层原样复活，
+    // 而 Task 3 的用例**照绿**（它们直接测分类器，不经过 `_identities()`）。
+    //
+    // 也**不能改成 `rethrow`**：那样 `connect()` 抛出的就不是
+    // `ConnectionFailure` 了，用户看到什么取决于调用方有没有记得分类。
+    //
+    // 下面是**一次性的测试夹具**，用
+    // `ssh-keygen -t ed25519 -N fixture-pass` 生成，口令就是 `fixture-pass`。
+    // 它不是任何真实设备的密钥，也不对应任何生产凭据。
+    final session = SshSession(
+      profile: _profile(
+        keyPath: _writeTemp(
+          'id_ed25519_enc',
+          '-----BEGIN OPENSSH PRIVATE KEY-----\n'
+              'b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABDzJhElhL\n'
+              'ZC4quN68dxaD+oAAAAEAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAII0XNBvuCWPL5haR\n'
+              'rSk1xpK71hXUAuqLHEPOyTlfjc88AAAAkNDLCL2UJGRbxc6VlATFngWCsfvB6KgC0yVoll\n'
+              'gOThm5FkwLY8OBCJaixXln+cYCoVedYFxjHnVAan3J9/Ut3Wk9RBlB6VZTU+DnKWachIoA\n'
+              'ZQYFaAE4Gpz7N8X5M7sCUYtppdK8w3iErB9jfbCCVP/jJTW7bjheC6OBRW0vF554yfTIYa\n'
+              'qeLJmqgQ9WYle79Q==\n'
+              '-----END OPENSSH PRIVATE KEY-----\n',
+        ),
+      ),
+      connector: _FailingConnector(Exception('不该走到这里')),
+      hostKeyStore: InMemoryHostKeyStore(),
+    );
+
+    final failure = await _failureOf(session.connect());
+
+    expect(failure.kind, ConnectionFailureKind.authFailed);
+    // 给的是"去掉口令"这条可操作的方向。
+    expect(failure.message, contains('口令'));
+    expect(failure.message, isNot(contains('null')));
+    expect(failure.message, isNot(contains('SSHKeyDecryptError')));
+  });
 }
 ```
 
@@ -1853,6 +2025,7 @@ import 'dart:typed_data';
 import 'package:dartssh2/dartssh2.dart';
 
 import '../models/device_profile.dart';
+import 'connection_failure.dart';
 import 'connection_socket.dart';
 import 'connector.dart';
 import 'known_host.dart';
@@ -1973,6 +2146,15 @@ class SshSession implements Session {
 
   @override
   Future<void> connect() async {
+    // **先加载私钥，再开 socket。** 两个理由：
+    //   1. 私钥读不出来是**本地配置错误**，与网络无关。让它先失败，就不必为
+    //      一个注定连不上的会话开连接；否则 `_socket` 已赋值、`_client` 还没建，
+    //      会出现第三种"半初始化"状态（另两种见下面两处 `if (_closed)` 守卫）。
+    //   2. 这让"私钥翻译"这条路径**不需要假 SSH 服务端就能测**：用一个必然
+    //      失败的 connector 就能证明它**先**失败（见 Step 1 的用例）。Task 4
+    //      的其余几条要么不碰网络、要么留给 Task 7，唯有这一条既重要又可测。
+    final identities = _identities();
+
     final conn = await connector.open(
       profile.host,
       profile.port,
@@ -1994,7 +2176,7 @@ class SshSession implements Session {
     final client = SSHClient(
       socket,
       username: profile.username,
-      identities: _identities(),
+      identities: identities,
       onPasswordRequest: _onPasswordRequest,
       // 始终非 null，见 _buildHostKeyCallback 的说明。
       onVerifyHostKey: _buildHostKeyCallback(),
@@ -2039,12 +2221,78 @@ class SshSession implements Session {
     );
   }
 
+  /// 加载私钥，并把**本地能判定的失败**翻译成中文的 [ConnectionFailure]。
+  ///
+  /// §13.19-9 记录了七种实测的 `fromPem` 失败形态，分类器**认不出**其中三种：
+  /// 它只拿到一个裸 `Object`，无从知道某个 `FormatException` 来自"读私钥"还是
+  /// 别处（`SSHPacketError` 在传输层有 18 个抛出点，`FormatException` 遍布
+  /// `dart:core`）。上下文只有这里知道，所以翻译必须在**调用点**做。
+  ///
+  /// 分类器对 [ConnectionFailure] 是幂等的（§13.19-10），这里直接抛即可。
+  ///
+  /// **判据是"这一层不许漏"，不是"覆盖 §13.19-9 表里那七种"** —— 那张表是照着
+  /// 实测输入列的、未必穷尽，所以末尾必须留一个兜底 `catch`。
   List<SSHIdentity>? _identities() {
     final path = profile.privateKeyPath;
     if (path == null || path.isEmpty) return null;
-    final pem = File(path).readAsStringSync();
-    // 这里不处理带口令的私钥：口令要从凭据接口取，属于计划 4。
-    return SSHKeyPair.fromPem(pem);
+
+    try {
+      final pem = File(path).readAsStringSync();
+      // 这里不处理带口令的私钥：口令要从凭据接口取，属于计划 4。
+      return SSHKeyPair.fromPem(pem);
+    } on PathNotFoundException {
+      // 最可能发生的一种（路径打错、文件被挪走）—— 单独一支，方向最明确。
+      // 其余 I/O 失败（选到了目录、权限不足）不单独设支：它们会落到下面的
+      // 兜底，那条同样带上路径与原文，而兜底已经有用例钉住（见 Step 1）。
+      // **不为没有用例的支数写代码** —— 写一条没人守的分支，就是给后来人
+      // 留一条可以静默改坏的路径。
+      throw ConnectionFailure(
+        ConnectionFailureKind.authFailed,
+        '无法读取私钥文件：路径不存在。请检查设备设置里的私钥路径。\n$path',
+      );
+    } on UnsupportedError {
+      // 公钥文件，或本版本不支持的 PKCS#8（明文与加密都落在这里）。
+      // **两种原因必须分开说**：选错文件是用户操作错了、换一个就好；
+      // 格式不支持是本版本的缺口。混成一句"格式不支持"，用户会去反复确认
+      // 自己的私钥没问题 —— 与 §13.15 同一个坑。
+      throw ConnectionFailure(
+        ConnectionFailureKind.authFailed,
+        '无法使用这个私钥：$path\n'
+        '两个常见原因：选中的是公钥文件（.pub），'
+        '或这个私钥格式（PKCS#8）本版本暂不支持。'
+        '请选择 PEM 格式的 RSA 私钥（-----BEGIN RSA PRIVATE KEY-----）。',
+      );
+    } on FormatException {
+      throw ConnectionFailure(
+        ConnectionFailureKind.authFailed,
+        '无法解析这个文件：$path\n它看起来不是 PEM 格式的私钥。',
+      );
+    } on SSHKeyDecryptError {
+      // 带口令的 OPENSSH 私钥。**分类器也认得这一支**（§13.19-9 论证过：这两个
+      // 类的抛出点全关在 dartssh2 的 `lib/src/key_pair/` 里，全局映射是安全的），
+      // 所以这里是一次**刻意的重复**。理由是维持一条可检验的不变量：
+      //
+      //   **`connect()` 不该为本地密钥问题漏出非 `ConnectionFailure` 的异常。**
+      //
+      // 若改成 `rethrow` 放行给分类器，用户看到什么就取决于调用方有没有记得
+      // 分类 —— 而 §13.19-7 那个 `null` 泄漏正是这样一层一层漏过去的。
+      // 下面这句话与分类器里那一句是同一句，**两处要一起改**。
+      throw ConnectionFailure(
+        ConnectionFailureKind.authFailed,
+        '私钥已加密，本版本暂不支持带口令的私钥。'
+        '请改用不带口令的私钥，或等待后续版本支持。',
+      );
+    } catch (error) {
+      // 兜底：损坏的 OPENSSH（`SSHPacketError`）、带口令的 PKCS#1
+      // （`ArgumentError`），以及 §13.19-9 还没量到的形态。**这一支不能省** ——
+      // 省了它们就漏到分类器，用户看到英文类名，其中 `SSHPacketError` 还会被
+      // 报成"协议错误"，把方向指到算法上去。
+      throw ConnectionFailure(
+        ConnectionFailureKind.authFailed,
+        '无法读取私钥：$path\n原始信息：$error',
+        cause: error,
+      );
+    }
   }
 
   FutureOr<String?> _onPasswordRequest() => profile.password;
@@ -2092,19 +2340,51 @@ class SshSession implements Session {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `flutter test test/connection/ssh_session_test.dart`
-Expected: 4 个用例全部 PASS
+Expected: 9 个用例全部 PASS
 
 - [ ] **Step 5: 反证测试的非空性**
 
-本 Task 的 4 条单测能守住的只有两件事。逐条变异验证，**每次改完逐字还原**：
+本 Task 的 9 条单测逐条变异验证，**每次改完逐字还原**：
 
 1. `_client?.close()` 改成 `_client!.close()`（`_decodeSub?.cancel()`、
    `_session?.close()` 同理）：必须让前 3 条用例变红 —— 它们守的就是
    `close()` 的空路径。
 2. 让 `_buildHostKeyCallback()` 在 `verifyHostKey == false` 时返回 null：
    必须让 `verify 回调必须被显式传入` 变红。
+3. 删掉 `on PathNotFoundException` 那一支：必须让「私钥路径写错」变红。
+   它会落到兜底，消息里仍然有"私钥"和路径，**红的是
+   `isNot(contains('PathNotFoundException'))` 这一条** —— 这正是那条断言存在的
+   理由（兜底的 `原始信息：$error` 会把英文类名带回来）。
+4. 删掉 `on UnsupportedError` 那一支：必须让「选中的是公钥文件」变红。
+5. 删掉 `on FormatException` 那一支：必须让「不是 PEM 的文件」变红。
+6. 删掉 `on SSHKeyDecryptError` 那一支：必须让「带口令的 OPENSSH 私钥」变红
+   （字面 `null` 与 `SSHKeyDecryptError` 会从兜底漏出去）。
+   **这一条是本 Task 最值得跑的一条** —— 它守的缺陷在 Task 3 里刚修过，
+   换一层就复活，而 Task 3 的用例看不见（它们不经过 `_identities()`）。
+   把那一支改成 `rethrow` 也应当变红（抛出的不再是 `ConnectionFailure`，
+   `_failureOf` 不接）。
+7. 删掉兜底 `catch (error)` 那一支：必须让「损坏的 OPENSSH 私钥」变红
+   （`SSHPacketError` 会直接冒到分类器，报成"协议错误"）。
+8. 把 `final identities = _identities();` 移回 `connector.open()` **之后**：
+   必须让「私钥路径写错」变红 —— 抛出来的会变成 connector 那个异常
+   （`_failureOf` 不接非 `ConnectionFailure`，用例直接红）。
+9. 把兜底消息里的 `$error` 删掉：必须让「损坏的 OPENSSH 私钥」变红
+   （`contains('SSHPacketError')` 那一条）。
+
+**本表已由计划作者在隔离副本里实跑过一遍**（把两个 fence 抽出来放进一份临时拷贝，
+没动本仓库）。观察到的红与上面逐条一致：第 1 条 3 红，第 2—7、9 条各 1 红，
+第 8 条 5 红，**零假红**（没有一条红是点名文件的加载/编译失败）。所以上面那些
+"必须让某条变红"不是估计，是量过的 —— 你跑出来不一样就是发现，请报告。
+**但你自己仍要跑一遍**：Step 2 的红、Step 4 的绿、这里的变异红，是三个不同的
+证据，缺一个都不算完成。
 
 Run: `flutter test test/connection/ssh_session_test.dart`
+
+**私钥翻译这条路径是覆盖到的，而且不需要假服务端** —— 因为实现把加载私钥排在
+建连**之前**（第 3—9 条变异都在守这一点）。这是本 Task 里唯一既重要、又能用
+一个必然失败的 connector 测到真行为的地方。**别为了"更真实"把它挪回
+`connector.open()` 之后** —— 那样这五条用例会一起失效，而它们守的正是
+§13.19-9 那个"英文类名漏给用户"的洞。
 
 **本 Task 覆盖不到的部分 —— 这是量的结论，不要当作通过：**
 

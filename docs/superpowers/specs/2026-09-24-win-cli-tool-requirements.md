@@ -1277,6 +1277,21 @@ Foo copyWith({Object? bar = _unset}) => Foo(
    **调用点**：`SshSession._identities()` 知道自己在加载私钥，就该在那里把
    **全部**异常翻译成一个带中文说明的 `ConnectionFailure` 再抛。
 
+   **落地时预演发现的两种偷懒写法（Task 4 fence 已按此定稿）。**"在调用点翻译"
+   对 `SSHKeyDecryptError` 有两个看起来合理的替代，两种都会把洞放回来：
+
+   - **改成 `rethrow` 放行给分类器**（理由是"分类器认得它"）。后果是
+     `connect()` 不再满足"本地密钥问题必然抛 `ConnectionFailure`"，用户看到
+     什么就取决于调用方有没有记得分类 —— 而 §13.19-7 的 `null` 泄漏正是这样
+     一层一层漏过去的。
+   - **不单独设支，让它落进兜底 `catch`。** `SSHKeyDecryptError` 的 `error`
+     字段**就是 `null`**，它会连同英文类名一起被拼进消息：§13.19-7 修好的
+     缺陷换一层原样复活，而 Task 3 的用例**照绿**（它们直接测分类器，
+     不经过 `_identities()`）。
+
+   判据记在这里：**`connect()` 不该为本地密钥问题漏出非 `ConnectionFailure`
+   的异常。** 这条不变量同时排除上面两种写法。
+
    为此分类器新增了幂等分支（`if (error is ConnectionFailure) return error;`），
    否则那个对象会被再包一层，变成「连接失败：ConnectionFailure(authFailed): …」。
    **Task 4 的 fence 与用例必须覆盖这一点**，尤其是"路径写错"那条最可能的输入。
