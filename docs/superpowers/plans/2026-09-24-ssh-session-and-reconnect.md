@@ -466,7 +466,7 @@ void main() {
 - [ ] **Step 3: 运行测试确认失败**
 
 Run: `flutter test test/connection/connection_socket_test.dart`
-Expected: 编译失败 —— `Target of URI doesn't exist: 'package:win_cli_tool/connection/connection_socket.dart'`
+Expected: 编译失败，**0 个用例被执行**。`flutter test` 走的是 CFE 而不是解析器，实际措辞是 `Error when reading '<文件>': No such file or directory` 加一串 `Type '...' not found`，**不是** `Target of URI doesn't exist`（后者是 `dart analyze` 的用词）。判据是"编译没过、一个用例都没跑"，不是那句话本身。
 
 - [ ] **Step 4: 实现**
 
@@ -609,14 +609,21 @@ git commit -m "feat: Connection -> SSHSocket 适配器"
 import 'package:flutter_test/flutter_test.dart';
 import 'package:win_cli_tool/connection/known_host.dart';
 
+KnownHost _k({
+  String host = '10.0.0.1',
+  int port = 22,
+  String keyType = 'ssh-ed25519',
+  String fingerprint = 'SHA256:abc123',
+}) => KnownHost(
+  host: host,
+  port: port,
+  keyType: keyType,
+  fingerprint: fingerprint,
+);
+
 void main() {
   test('往返 JSON 一致', () {
-    final k = KnownHost(
-      host: '10.0.0.1',
-      port: 22,
-      keyType: 'ssh-ed25519',
-      fingerprint: 'SHA256:abc123',
-    );
+    final k = _k();
 
     final back = KnownHost.fromJson(k.toJson());
 
@@ -626,19 +633,21 @@ void main() {
     expect(back.fingerprint, 'SHA256:abc123');
   });
 
+  test('toJson 的键名是持久化格式，不得随手改名', () {
+    // 计划 4 会把这些键写进磁盘。改名不会报错，只会让已存的文件读不出来 ——
+    // 于是每台设备都被当成"首次连接"，FR-C-11 的确认形同虚设，而且**已经
+    // 变过密钥的主机也会被重新 TOFU 接受**。所以钉死键名，而不只是钉住往返。
+    expect(_k().toJson(), {
+      'host': '10.0.0.1',
+      'port': 22,
+      'keyType': 'ssh-ed25519',
+      'fingerprint': 'SHA256:abc123',
+    });
+  });
+
   test('identity 由 host/port/keyType 三者共同决定', () {
-    final a = KnownHost(
-      host: 'h',
-      port: 22,
-      keyType: 'ssh-ed25519',
-      fingerprint: 'SHA256:x',
-    );
-    final b = KnownHost(
-      host: 'h',
-      port: 22,
-      keyType: 'ssh-rsa',
-      fingerprint: 'SHA256:y',
-    );
+    final a = _k(host: 'h', keyType: 'ssh-ed25519', fingerprint: 'SHA256:x');
+    final b = _k(host: 'h', keyType: 'ssh-rsa', fingerprint: 'SHA256:y');
 
     // 同一主机、不同算法 → 身份证不同，因此互不覆盖，
     // 也不会把算法变更误报成"密钥变了"。
@@ -646,18 +655,8 @@ void main() {
   });
 
   test('同一主机同一算法重新保存会覆盖（identity 相同）', () {
-    final a = KnownHost(
-      host: 'h',
-      port: 22,
-      keyType: 'ssh-ed25519',
-      fingerprint: 'SHA256:old',
-    );
-    final b = KnownHost(
-      host: 'h',
-      port: 22,
-      keyType: 'ssh-ed25519',
-      fingerprint: 'SHA256:new',
-    );
+    final a = _k(host: 'h', keyType: 'ssh-ed25519', fingerprint: 'SHA256:old');
+    final b = _k(host: 'h', keyType: 'ssh-ed25519', fingerprint: 'SHA256:new');
 
     expect(a.identity, b.identity);
   });
@@ -665,15 +664,88 @@ void main() {
   test('指纹为 null 以外的空串是非法值，构造时拒绝', () {
     // 空指纹会让"指纹不匹配"永远为真，从而把每一次连接都判成
     // 主机密钥变更 —— 必须在这里挡住，而不是让它在比较时才发作。
-    expect(
-      () => KnownHost(
-        host: 'h',
-        port: 22,
-        keyType: 'ssh-ed25519',
-        fingerprint: '',
-      ),
-      throwsArgumentError,
-    );
+    expect(() => _k(fingerprint: ''), throwsArgumentError);
+  });
+
+  test('空仓库里 find 返回 null', () async {
+    final store = InMemoryHostKeyStore();
+
+    expect(await store.find('10.0.0.1', 22, 'ssh-ed25519'), isNull);
+  });
+
+  test('save 之后 find 能取回同一条（identity 与 find 的键必须一致）', () async {
+    // 这条守的是一个**跨类不变式**：KnownHost.identity 拼出的键，
+    // 必须和 InMemoryHostKeyStore.find 自己拼的键一模一样。两边一旦各改各的，
+    // find 会永远返回 null —— 于是每次连接都被当成"首次连接"，不仅反复弹
+    // 确认，更糟的是**已经变过密钥的主机也会被重新接受**。
+    final store = InMemoryHostKeyStore();
+    final k = _k();
+
+    await store.save(k);
+
+    final got = await store.find(k.host, k.port, k.keyType);
+    expect(got, isNotNull);
+    expect(got!.fingerprint, 'SHA256:abc123');
+  });
+
+  test('同一 identity 再次 save 是覆盖，不是追加', () async {
+    final store = InMemoryHostKeyStore();
+
+    await store.save(_k(fingerprint: 'SHA256:old'));
+    await store.save(_k(fingerprint: 'SHA256:new'));
+
+    expect(store.all, hasLength(1));
+    expect((await store.find('10.0.0.1', 22, 'ssh-ed25519'))!.fingerprint,
+        'SHA256:new');
+  });
+
+  test('同一主机不同算法各自成条，互不覆盖', () async {
+    // 这正是本 Task 按 keyType 分别存储的理由：只按 host:port 存的话，
+    // 设备换一种算法协商就会被判成"主机密钥变了" ——
+    // 一个正常的算法协商被报成疑似中间人攻击。
+    final store = InMemoryHostKeyStore();
+
+    await store.save(_k(keyType: 'ssh-ed25519', fingerprint: 'SHA256:x'));
+    await store.save(_k(keyType: 'rsa-sha2-256', fingerprint: 'SHA256:y'));
+
+    expect(store.all, hasLength(2));
+    expect((await store.find('10.0.0.1', 22, 'rsa-sha2-256'))!.fingerprint,
+        'SHA256:y');
+  });
+
+  test('all 是不可变快照，改不动仓库', () async {
+    final store = InMemoryHostKeyStore();
+    await store.save(_k());
+
+    expect(() => store.all.add(_k(host: 'other')), throwsUnsupportedError);
+    expect(store.all, hasLength(1));
+  });
+
+  test('remove 之后 find 回到 null（设备换过密钥后的唯一出路）', () async {
+    // 计划 3 的错误文案要求用户"在设置中清除该主机的记录后重连"。
+    // 接口若没有 remove，那句话就是在教用户做一件做不到的事 ——
+    // 指纹一旦变化，这台设备会被**永久**拒绝，而且无处可清。
+    final store = InMemoryHostKeyStore();
+    await store.save(_k());
+
+    await store.remove('10.0.0.1', 22, 'ssh-ed25519');
+
+    expect(await store.find('10.0.0.1', 22, 'ssh-ed25519'), isNull);
+    expect(store.all, isEmpty);
+  });
+
+  test('remove 只删指定算法，同一主机的其他算法不受影响', () async {
+    // 与 save/find 同一条理由：删也必须精确到一把密钥。否则"清掉换过的那把"
+    // 会顺手删掉同主机另一种算法的记录，用户下次连接会被重新问一遍。
+    final store = InMemoryHostKeyStore();
+    await store.save(_k(keyType: 'ssh-ed25519', fingerprint: 'SHA256:x'));
+    await store.save(_k(keyType: 'rsa-sha2-256', fingerprint: 'SHA256:y'));
+
+    await store.remove('10.0.0.1', 22, 'ssh-ed25519');
+
+    expect((await store.find('10.0.0.1', 22, 'rsa-sha2-256'))!.fingerprint,
+        'SHA256:y');
+    expect(store.all, hasLength(1));
   });
 }
 ```
@@ -681,7 +753,7 @@ void main() {
 - [ ] **Step 2: 运行测试确认失败**
 
 Run: `flutter test test/connection/known_host_test.dart`
-Expected: 编译失败 —— `Target of URI doesn't exist`
+Expected: 编译失败，**0 个用例被执行**（`flutter test` 走 CFE，措辞见 Task 1 Step 3：`Error when reading ...: No such file or directory` 加一串 `Type 'KnownHost' not found`，**不是** `Target of URI doesn't exist`）
 
 - [ ] **Step 3: 实现**
 
@@ -745,6 +817,15 @@ abstract class HostKeyStore {
 
   /// 保存（同一 [KnownHost.identity] 视为覆盖）。
   Future<void> save(KnownHost host);
+
+  /// 删除这一条记录。
+  ///
+  /// **不是可选项。** 设备确实更换过主机密钥时，[find] 会一直返回旧指纹，
+  /// 于是这台设备被**永久**拒绝连接；计划 3 的错误文案正是让用户
+  /// "在设置中清除该主机的记录后重连"。接口少了这个方法，那句话就是在
+  /// 教用户做一件做不到的事 —— 而"主机密钥变了"恰恰是唯一一个
+  /// 用户绝不能学会忽略的警告。
+  Future<void> remove(String host, int port, String keyType);
 }
 
 /// 内存实现，供测试与"不持久化"的场景使用。
@@ -754,9 +835,20 @@ class InMemoryHostKeyStore implements HostKeyStore {
   /// 已保存记录的快照，供断言。
   List<KnownHost> get all => List.unmodifiable(_byIdentity.values);
 
+  /// 仓库自己的查键。**必须与 [KnownHost.identity] 逐字一致** —— 两边各改
+  /// 各的会让 [find] / [remove] 永远找不到记录，于是每次连接都被当成
+  /// "首次连接"，已经变过密钥的主机也会被重新 TOFU 接受。测试里有一条
+  /// 专门守这个跨类不变式。
+  String _key(String host, int port, String keyType) => '$host:$port:$keyType';
+
   @override
   Future<KnownHost?> find(String host, int port, String keyType) async =>
-      _byIdentity['$host:$port:$keyType'];
+      _byIdentity[_key(host, port, keyType)];
+
+  @override
+  Future<void> remove(String host, int port, String keyType) async {
+    _byIdentity.remove(_key(host, port, keyType));
+  }
 
   @override
   Future<void> save(KnownHost host) async {
@@ -765,18 +857,16 @@ class InMemoryHostKeyStore implements HostKeyStore {
 }
 ```
 
-> `package:meta` 是 Flutter 的传递依赖，`@immutable` 可直接使用；若分析器报未声明依赖，改为 `flutter pub add meta`。
-
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `flutter test test/connection/known_host_test.dart`
-Expected: 4 个用例全部 PASS
+Expected: 12 个用例全部 PASS
 
 - [ ] **Step 5: 提交**
 
 ```bash
 dart analyze lib/connection/known_host.dart test/connection/known_host_test.dart
-git add lib/connection/known_host.dart test/connection/known_host_test.dart pubspec.yaml
+git add lib/connection/known_host.dart test/connection/known_host_test.dart
 git commit -m "feat: KnownHost 模型与注入式 HostKeyStore 接口"
 ```
 
@@ -922,7 +1012,7 @@ void main() {
 - [ ] **Step 2: 运行测试确认失败**
 
 Run: `flutter test test/connection/connection_failure_test.dart`
-Expected: 编译失败 —— `Target of URI doesn't exist`
+Expected: 编译失败，**0 个用例被执行**（CFE 措辞见 Task 1 Step 3：`Error when reading ...`，不是 `Target of URI doesn't exist`）
 
 - [ ] **Step 3: 实现**
 
@@ -1219,7 +1309,7 @@ void main() {
 - [ ] **Step 2: 运行测试确认失败**
 
 Run: `flutter test test/connection/ssh_session_test.dart`
-Expected: 编译失败 —— `Target of URI doesn't exist`
+Expected: 编译失败，**0 个用例被执行**（CFE 措辞见 Task 1 Step 3：`Error when reading ...`，不是 `Target of URI doesn't exist`）
 
 - [ ] **Step 3: 实现**
 
@@ -1541,7 +1631,7 @@ void main() {
 - [ ] **Step 2: 运行测试确认失败**
 
 Run: `flutter test test/connection/session_factory_test.dart`
-Expected: 编译失败 —— `Target of URI doesn't exist`
+Expected: 编译失败，**0 个用例被执行**（CFE 措辞见 Task 1 Step 3：`Error when reading ...`，不是 `Target of URI doesn't exist`）
 
 - [ ] **Step 3: 实现**
 
