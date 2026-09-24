@@ -3331,6 +3331,57 @@ flutter test && dart analyze
 
 ---
 
+## 未决项：`Session.done` 不带错误，断开原因在 Task 6 里被丢掉（**需要决策，阻塞 Task 6**）
+
+Task 6 的 fence 是这样取失败原因的：
+
+```dart
+    session.done.then(
+      (_) => _onSessionDone(),
+      onError: (Object e, StackTrace _) => _onSessionDone(e),
+    );
+```
+
+`_onSessionDone(error)` 里再 `SessionLost(classifyConnectionFailure(error))`。
+
+**但 `Session.done` 永远不会以错误完成。** 两个实现都是：
+
+- `telnet_session.dart:77-80`：`_onDisconnected([Object? _])` —— 形参直接写成 `_`，
+  错误被丢掉；随后 `_done.complete()` 不带参数。
+- Task 4 的 `SshSession._onDisconnected`：先 `if (error != null) _lastError = error;`，
+  然后同样是 `_done.complete()`（不带参数）。
+
+于是 `onError` 那条分支**永远不会执行**，`_onSessionDone()` 恒收到 `null`，
+`SessionLost(null)` —— **失败原因一次都没到过界面**。这正是 §13.12 抱怨的形态
+（「连接被重置」与「主机不可达」在调用方看来完全一样），只是往上挪了一层：
+错误对象确实被 `SshSession.lastError` 留下了，但**没有任何人读它**。
+
+`SshSession.lastError` 也救不了：`Session` 接口（`lib/connection/session.dart`）
+上**没有** `lastError`，而 `ConnectionManager` 只认 `Session` 这个类型。
+
+### 建议的修法
+
+1. `Session` 接口加 `Object? get lastError;`。**要抽象成员，不要默认 `=> null`** ——
+   默认值会让新的实现静默地返回 null，正是这类缺陷的温床。
+2. `TelnetSession` 补上（三行：字段、getter、`_onDisconnected` 里先存再 `complete`），
+   并加一条用例：喂一个 `addError` 之后 `await session.done` 必须**正常完成**，
+   且 `lastError` 就是那个错误对象。
+3. `SshSession` 的 getter 改成 `@override`（Task 4 已经有它）。
+4. Task 6 的 fence 改成 `session.done.then((_) => _onSessionDone(session.lastError))`，
+   并**删掉**那条死的 `onError` 分支 —— 或者保留但注明它只是防御性的。
+   一条永远不会执行的错误分支比没有更糟：它读起来像"原因就是从这儿传下去的"。
+
+### 为什么不让 `done` 直接以错误完成
+
+那是最省事的写法，但每个 `await session.done` 的人都被迫处理这个错误，而
+"为什么断的"是给用户看的诊断信息，不是控制流信号；无人监听的 `completeError`
+还会变成未捕获的异步错误。§13.12 给的也正是这两个选项（「新增错误事件或
+`lastError`」）。
+
+**必须在 Task 6 实现之前落地。** 否则 Task 6 的单测会照常通过（它测的是
+`SessionLost` 事件发出来了，不是它带了什么），而产品里断线原因永远是空的。
+已同步记入 spec §13.20。
+
 ## 未决项：`failed`（红）在产品里何时可达（**需要决策，不阻塞 Task 1–5**）
 
 FR-C-06 要求「连接失败时，设备按钮变红」，但本计划的 `ConnectionManager` 里 `autoReconnect` **默认 true、且没有任何生产代码传 false**（只有下面的测试传过） —— 也就是说 `failed` 这个状态在实际产品里**永远到不了**，红按钮不会被点亮。这与 FR-C-06 是冲突的。

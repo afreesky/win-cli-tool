@@ -1145,3 +1145,74 @@ Foo copyWith({Object? bar = _unset}) => Foo(
    **教训：**「这条需求有对应代码」不等于「这条需求被测试约束」。§13.15 这类
    **降级/兜底**分支尤其容易写成"看起来覆盖了" —— 因为要让它们变红，输入必须
    真的是**认不出的**那一种。
+
+4. **`kind` 被钉住了，文案没有 —— 而 FR-C-06 的交付物就是文案。**
+
+   规范符合性评审发现，把主机密钥那条消息整段换成「认证失败：用户名、口令或
+   私钥不正确」，**14 条用例全绿**（实测）：`kind` 仍是 `hostKey`，没有任何断言
+   看文案。于是用户可以拿到一个分类正确、却把他指向口令的消息 —— **正是 §13.15
+   存在的唯一理由**。同类漏洞还有两个，同样全绿：整支删掉
+   `is SSHInternalError`（兜底返回的 kind 一样，只有文案退化）、整支删掉
+   `is SSHError`（`SSHStateError` 掉进 `unknown`，而 §13.15 明说 unknown 只留给
+   非 `SSHError` 的意外）。
+
+   已补三条用例，钉的是「文案把人指向哪里」而不是逐字文本（`contains('指纹')`、
+   `isNot(contains('口令'))`）：这样改措辞不会误报，改**方向**才会。
+
+   **教训：**分类器的测试如果只断言 `kind`，那它测的是"我们分对了类"，不是
+   "用户看懂了"。
+
+5. **三条「字面上没错、但可能不是用户想要的」路径（评审提出，未改代码）。**
+
+   - **跳板机上下文会盖掉 §13.15 的区分。** `hop != null` 时 kind 一律是
+     `jumpHostFailed`，于是「主机密钥被拒」与「算法协商失败」在带 hop 时 kind
+     相同 —— §13.15 那条"两者必须分类不同"的回归测试此时不成立。这是**有意**
+     的（FR-J-05 要求先告诉用户哪一跳失败，实现里有注释说明），且 message 仍带着
+     内层原因（「第 1 跳 X 失败：主机密钥校验未通过：…」），用户仍被指向指纹。
+     但要注意：**若计划 5 的界面按 kind 决定颜色/图标，跳板机上的主机密钥问题就
+     失去它的专属外观了** —— §13.17-3 定颜色口径时要一并考虑。
+   - **裸 `SSHHostkeyError` 不算主机密钥问题。** `classifyConnectionFailure(
+     SSHHostkeyError(...))` → `protocolError`，用户不会被提示去确认指纹。连接
+     路径上它总被包进 `SSHAuthAbortError`，所以**现在**够不到；但**活会话**上
+     （rekey 时密钥变了，`ssh_transport.dart:1901/1925`）它是裸的，而 §13.12 要求
+     会话级错误也要报给用户 —— 即 **§13.20 一修好，这条路径就通了**。
+     建议 §13.20 落地时一并决定：给顶层 `SSHHostkeyError` 也加一支，还是在
+     §13.20 的用例里写明"它归 protocolError"是接受的。
+   - **`SSHSocketError` 嵌在 `.reason` 里时不拆包。** 顶层会拆（→ `unreachable` /
+     `timeout`），但 `SSHAuthAbortError(..., SSHSocketError(SocketException(...)))`
+     落到兜底 → `protocolError`，而 §13.12 点名了「连接被重置」这个场景。
+     §13.15 的字面要求是"认不出的 `reason` 优雅降级"，所以这**不算违规**；记在
+     这里是因为同一类输入在两条路径上得到不同的精度，将来读代码的人会疑惑。
+
+### 13.20 断开原因到不了界面（计划 2 执行期发现，Task 6 之前必须修）
+
+§13.12 要求把会话断开的错误对象保留下来。计划 2 的做法是在 `SshSession` 上加了
+`lastError` —— 但**这个字段没有任何人读**，而且它不在 `Session` 接口上。
+
+证据链：
+
+- `Session` 接口（`lib/connection/session.dart`）只有 `output` / `done` /
+  `connect` / `write` / `close`，**没有** `lastError`。`ConnectionManager` 只认
+  `Session` 这个类型，因此够不着它。
+- `ConnectionManager` 于是改用 `session.done.then(..., onError: (e) => ...)` 取错误。
+- 但 `done` **永远不以错误完成**：`TelnetSession._onDisconnected([Object? _])`
+  把形参写成 `_` 直接丢掉，`SshSession._onDisconnected` 则存进 `_lastError` 后
+  同样 `_done.complete()`（不带参数）。
+- 结果：`onError` 分支永不执行 → `SessionLost(null)` 恒成立 → **失败原因一次都
+  没到过界面**。
+
+也就是说 §13.12 描述的症状（「连接被重置」与「主机不可达」在调用方看来完全一样）
+并没有被消除，只是上移了一层：错误被保留了，但没有出口。
+
+**修法（计划文件的「未决项」一节有完整步骤）：** 把 `lastError` 提升为 `Session`
+的**抽象**成员（不要默认 `=> null` —— 默认值会让新实现静默返回 null），
+`TelnetSession` 补上，Task 6 改读 `session.lastError` 并删掉那条死的 `onError`
+分支。
+
+**为什么不让 `done` 以错误完成：** 那样每个 `await done` 的人都得处理它，而断开
+原因是诊断信息、不是控制流信号；无人监听的 `completeError` 还会变成未捕获的
+异步错误。§13.12 给的正是这两个选项（「新增错误事件或 `lastError`」）。
+
+**为什么这条重要：** Task 6 的单测会照常通过 —— 它断言的是 `SessionLost` **事件
+发出来了**，不是它**带了什么**。所以这个缺陷不会在测试里露头，只会在产品里表现
+为"断线了，但不知道为什么"。
