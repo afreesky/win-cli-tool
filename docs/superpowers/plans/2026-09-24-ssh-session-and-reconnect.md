@@ -6143,10 +6143,12 @@ void main() {
 
     await session.connect();
 
+    final promptDetector = PromptDetector();
+
     // 把提示符设成一个网络设备风格的串，让默认提示符正则能命中。
     final dispatcher = CommandDispatcher(
       write: session.write,
-      promptDetector: PromptDetector(),
+      promptDetector: promptDetector,
       morePager: MorePager(),
       lineEnding: '\n',
     );
@@ -6160,10 +6162,18 @@ void main() {
       dispatcher.onOutput(chunk);
     });
 
-    // 先摆好提示符，再等它出现
+    // 先摆好提示符，再等它**真的**出现。
+    //
+    // 判据不能是 `output.contains('RTR> ')`：PTY 会把这一行命令原样回显，
+    // 于是那个串在**回显**里就已经出现了 —— 循环会在一行提示符都没打印
+    // 出来之前退出（实测确实如此），调度器紧接着就往一个还没走到提示符的
+    // shell 里写命令。改成「缓冲区里最后一个非空行就是提示符」，与
+    // [PromptDetector] 判定命令结束用的是**同一个谓词**：回显行
+    // `PS1='RTR> '` 以引号结尾，匹配不上默认正则（`[>#\]]\s*$`），
+    // 因此只有对端真的把提示符打出来，这个循环才会退出。
     session.write("PS1='RTR> '\n");
     final settle = DateTime.now().add(const Duration(seconds: 10));
-    while (!output.toString().contains('RTR> ') &&
+    while (!promptDetector.matches(output.toString()) &&
         DateTime.now().isBefore(settle)) {
       await Future<void>.delayed(const Duration(milliseconds: 50));
     }
@@ -6202,6 +6212,30 @@ Run: `flutter test test/e2e/ssh_dispatch_e2e_test.dart`
 Expected: PASS（或在本机无 sshd 时 skipped）
 
 > **若 `timedOut` 为 true**：说明提示符没被识别。先确认 `PS1` 是否真的生效 —— 非交互式 shell 可能不读 `PS1`。这种情况下改用 `bash -i` 或直接把 `promptDetector` 换成一个能匹配对端实际提示符的正则，**不要**为了让测试变绿而放宽默认提示符正则（spec §13.9 明确禁止靠改正则回避问题）。
+
+**实测补记（`05825b3`）：上面这条提示猜错了方向，真正出问题的是 settle 循环。**
+计划给的那段代码**跑得过**，但那个"过"不可信 —— 加时间戳探针看 RX 分片后，真相是
+settle 循环被 **PTY 对命令行的回显**满足了：
+
+```
+RX PS1='RTR> '<CR><LF>      <- 回显，不是提示符
+SETTLE LOOP EXITED          <- 循环在这里退出，shell 一行提示符都还没打
+EVENT CommandSent(echo E2E_MARKER)
+RX [lwliu@localhost ~]$     <- bash 的第一条真提示符（默认 PS1）
+RX RTR>                     <- PS1 生效后的提示符
+```
+
+`output.contains('RTR> ')` 会被回显满足，于是调度器**在一个还没走到提示符的 shell 上**
+开始写命令；它新缓冲区里第一个 `RTR> ` 其实属于**上一轮**。这是个潜在的"提前判定完成"
+竞态（真触发需要 ≥120ms 的静默窗，本轮没触发）。修法是把判据换成
+`promptDetector.matches(...)` —— **与调度器判定命令结束用的是同一个谓词**（回显行以引号
+结尾，匹配不上 `[>#\]]\s*$`），且复用**同一个 detector 实例**，让"测试的前置条件"与
+"调度器的判断"字面上是同一个对象。
+
+**`PS1` 其实是生效的**：`SshSession` 用 `client.shell(pty: …)`，sshd 起的是交互式登录
+shell。所以上面那条"非交互式 shell 可能不读 PS1"的猜测不成立 —— 默认提示符是
+`[lwliu@localhost ~]$`（以 `$` 结尾，默认正则**匹配不上**），真正该等的那个 `RTR> ` 得
+等 PS1 生效。默认正则自始至终没被动过，`lib/` 一行未改。
 
 - [ ] **Step 3: 反证「串行下发」的非空性**
 

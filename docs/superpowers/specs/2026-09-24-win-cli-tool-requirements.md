@@ -538,6 +538,13 @@ lib/
     telnet_session.dart     自研 Telnet 实现
     telnet_protocol.dart    Telnet IAC 协商与控制序列剥离
     connection_manager.dart 会话生命周期与重连
+    connection_socket.dart  Connection → SSHSocket 适配器（计划 2）
+    known_host.dart         已知主机密钥模型与注入式接口 HostKeyStore（计划 2）
+    connection_failure.dart FR-C-06 失败原因分类（计划 2）
+    session_factory.dart    按协议构造会话（计划 2）
+    （host_key_verifier.dart 计划里原本列了这个文件，实际**未建**：主机密钥
+      校验逻辑落在 ssh_session.dart 的 _buildHostKeyCallback 与 known_host.dart
+      的 HostKeyStore 里。此处按实际记录，不照抄计划。）
   command/
     command_dispatcher.dart 命令队列与串行状态机
     prompt_detector.dart    提示符判定
@@ -552,9 +559,13 @@ lib/
     dialogs/                设备编辑 / 设置 / 确认
     widgets/                通用组件（状态点、可拖拽分隔条等）
 test/
-  unit/                     纯 Dart 单元测试
-  widget/                   界面行为测试
-  fixtures/                 假设备服务器（测试用）
+  connection/               连接层测试（含 ssh_session_integration_test.dart，
+                            真 sshd 回环集成测试，无 sshd 环境自动 skip）
+  command/                  命令队列 / 提示符 / 翻页
+  models/                   数据模型
+  render/                   ANSI 解析
+  e2e/                      端到端（命令经真会话下发、执行、输出回流）
+  fixtures/                 sshd_harness.dart（真本地 sshd）、假设备服务器
 ```
 
 ### 8.6 数据文件格式
