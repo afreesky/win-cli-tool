@@ -1896,9 +1896,11 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 ```dart
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:win_cli_tool/connection/connector.dart';
 import 'package:win_cli_tool/connection/telnet_session.dart';
 import 'package:win_cli_tool/models/device_profile.dart';
 
@@ -1912,6 +1914,46 @@ DeviceProfile _profile(int port, {String name = '测试设备'}) => DeviceProfil
       port: port,
       username: 'admin',
     );
+
+/// 建连时机可控的 Connector：`open` 返回调用方给的 Future。
+class _GatedConnector implements Connector {
+  _GatedConnector(this.result);
+
+  final Future<Connection> result;
+
+  @override
+  Future<Connection> open(String host, int port, {Duration? timeout}) => result;
+}
+
+/// 一条记名式的假连接：能人为喂入字节，并记录是否被关闭。
+class _FakeConnection implements Connection {
+  final _input = StreamController<List<int>>();
+  var closed = false;
+
+  @override
+  Stream<List<int>> get input => _input.stream;
+
+  /// 喂入一段来自对端的字节。已关闭的连接直接忽略。
+  void feed(List<int> bytes) {
+    if (closed) return;
+    _input.add(bytes);
+  }
+
+  @override
+  void write(List<int> data) {}
+
+  @override
+  Future<void> flush() async {}
+
+  @override
+  Future<void> close() async {
+    if (closed) return;
+    closed = true;
+    // 不 await：单订阅流在无人监听时，close() 的 Future 要等到有人订阅
+    // 才会兑现（见下面那个 close-during-connect 的用例）。
+    unawaited(_input.close());
+  }
+}
 
 void main() {
   group('TelnetSession', () {
@@ -2011,6 +2053,71 @@ void main() {
       final session = TelnetSession(profile: _profile(port));
       await expectLater(session.connect(), throwsA(isA<SocketException>()));
     });
+
+    test('从未连接的会话上 close() 能完成（不挂起）', () async {
+      final session = TelnetSession(profile: _profile(1));
+
+      // 单订阅 StreamController 的 close() Future 要等到有监听者订阅才会兑现；
+      // 从未连上的会话没有监听者，await 会永久挂起。加超时是为了让回归以
+      // 「失败」而不是「卡死整个测试套件」的方式暴露出来。
+      await session.close().timeout(const Duration(seconds: 2));
+    });
+
+    test('connect 抛异常后 close() 能完成（不挂起）', () async {
+      final device = await FakeDeviceServer.start();
+      final port = device.port;
+      await device.stop();
+
+      final session = TelnetSession(profile: _profile(port));
+      await expectLater(session.connect(), throwsA(isA<SocketException>()));
+
+      // 「连不上 → 清理」是最常见的调用路径。connect 抛异常时 _decodeSub 还没
+      // 赋值，_dataBytes 也就从没被监听，close() 同样会永久挂起。
+      await session.close().timeout(const Duration(seconds: 2));
+    });
+
+    test('connect 等待期间被 close：连接被关闭且没有异常逃逸到 zone', () async {
+      final conn = _FakeConnection();
+      final gate = Completer<Connection>();
+      final session = TelnetSession(
+        profile: _profile(1),
+        connector: _GatedConnector(gate.future),
+      );
+
+      Object? zoneError;
+      StackTrace? zoneStack;
+
+      await runZonedGuarded(() async {
+        // 建连还挂在 open 上时用户切了设备/关了窗口
+        final connecting = session.connect();
+        // 只发起、不等待 close()：_dataBytes 是单订阅流且此时还无人监听，
+        // 它的 close() 直到有人订阅才会完成。真正要验的是 close() 的效果，
+        // 不是它的 Future 何时兑现。
+        unawaited(session.close());
+        // 先把 close() 的拆除动作放干净（此时 _conn 还是 null，它什么也拆不掉，
+        // 随后挂在 _dataBytes.close() 上），再让 connect() 醒来。
+        await Future<void>.delayed(Duration.zero);
+        await Future<void>.delayed(Duration.zero);
+        gate.complete(conn);
+        await connecting;
+
+        // 让刚建立的连接吐点字节：修复前 _dataBytes 已关闭，
+        // 这里会从 _onBytes 抛出 "Cannot add event after closing"
+        conn.feed(utf8.encode('banner'));
+        await Future<void>.delayed(Duration.zero);
+        await Future<void>.delayed(Duration.zero);
+      }, (e, s) {
+        zoneError = e;
+        zoneStack = s;
+      });
+
+      expect(
+        zoneError,
+        isNull,
+        reason: '不该有异常逃逸到 zone，实际拿到：$zoneError\n$zoneStack',
+      );
+      expect(conn.closed, isTrue, reason: '建连期间被 close，刚建好的连接必须关掉');
+    });
   });
 }
 
@@ -2108,6 +2215,13 @@ class TelnetSession implements Session {
   Future<void> connect() async {
     final conn =
         await connector.open(profile.host, profile.port, timeout: connectTimeout);
+    // 建连期间可能已经被 close()（用户切设备、关窗口）。此时必须把刚拿到的
+    // 连接关掉并直接返回，否则 socket 泄漏，且 _dataBytes 已关闭，后续
+    // _onBytes 里的 add 会抛 "Cannot add event after closing"。
+    if (_closed) {
+      await conn.close();
+      return;
+    }
     _conn = conn;
 
     // 用流式解码器而非逐片 utf8.decode：多字节字符可能跨分片边界，
@@ -2152,8 +2266,12 @@ class TelnetSession implements Session {
     await _inputSub?.cancel();
     await _decodeSub?.cancel();
     await _conn?.close();
-    await _dataBytes.close();
-    await _output.close();
+    // 这里不能 await：单订阅 StreamController 的 close() Future 要等到有
+    // 监听者订阅才会完成，而「从未连上」或「connect 抛异常」的会话永远没有
+    // 监听者，await 会永久挂起（切设备、连不上后清理、关窗口时卡死）。
+    // 这两个只是内存对象，真正需要释放的资源是上面的 socket。
+    unawaited(_dataBytes.close());
+    unawaited(_output.close());
   }
 }
 ```
@@ -2164,7 +2282,7 @@ class TelnetSession implements Session {
 flutter test test/connection/telnet_session_test.dart
 ```
 
-Expected：PASS，6 个测试全绿。
+Expected：PASS，9 个测试全绿。
 
 - [ ] **Step 6: 提交**
 
@@ -2498,9 +2616,9 @@ import 'package:win_cli_tool/command/prompt_detector.dart';
 
 /// 测试脚手架：记录写出的内容，暴露事件流。
 class _Harness {
-  _Harness({String lineEnding = '\n'}) {
+  _Harness({String lineEnding = '\n', void Function(String)? write}) {
     dispatcher = CommandDispatcher(
-      write: (data) => written.add(data),
+      write: write ?? (data) => written.add(data),
       promptDetector: PromptDetector(),
       morePager: MorePager(),
       lineEnding: lineEnding,
@@ -2715,6 +2833,40 @@ void main() {
       });
     });
 
+    test('write 同步抛异常时队列仍由超时兜底放行', () {
+      fakeAsync((async) {
+        final written = <String>[];
+        var firstWrite = true;
+        final h = _Harness(
+          write: (data) {
+            if (firstWrite) {
+              firstWrite = false;
+              // 模拟 StreamSink.add 落在已关闭的 controller 上这类同步抛出
+              throw StateError('模拟 write 同步抛出');
+            }
+            written.add(data);
+          },
+        );
+
+        expect(
+          () => h.dispatcher.enqueue(['hang', 'next']),
+          throwsA(isA<StateError>()),
+        );
+        async.flushMicrotasks();
+
+        // 异常照常向外传播，但队列不能就此永久卡在"忙"状态：
+        // 超时计时器必须已经起好，兜底强制放行。
+        expect(h.dispatcher.isBusy, isTrue);
+
+        async.elapse(const Duration(seconds: 11));
+
+        expect(written, ['next\n'], reason: '超时后必须继续下发下一条');
+        expect(h.completed, hasLength(1));
+        expect(h.completed.single.command, 'hang');
+        expect(h.completed.single.timedOut, isTrue);
+      });
+    });
+
     test('超时计时器在正常完成时被取消', () {
       fakeAsync((async) {
         final h = _Harness();
@@ -2774,6 +2926,33 @@ void main() {
 
         expect(h.completed.single.command, 'display cur');
         expect(h.written, ['display cur\n', ' ', 'next\n']);
+      });
+    });
+
+    test('以 > 结尾的翻页提示不会被误判为命令结束', () {
+      fakeAsync((async) {
+        // 对照组：`---- More ----` 不以 > 结尾，本来也匹配不上提示符正则，
+        // 所以它在修复前后都不会被误判 —— 两边一比就能看出问题只在尾巴形态。
+        final control = _Harness();
+        control.dispatcher.enqueue(['display cur', 'next']);
+        async.flushMicrotasks();
+        control.dispatcher.onOutput('line1\r\n  ---- More ----');
+        async.elapse(const Duration(milliseconds: 200));
+        expect(control.completed, isEmpty);
+        expect(control.written, ['display cur\n', ' ']);
+
+        // 缺陷组：H3C 的 `<--- More --->` 以 > 结尾，能匹配提示符正则。
+        // 去抖到点后若不显式排除翻页尾巴，命令会被判为完成，下一条命令
+        // 就会被写进仍在翻页的设备，并被当作翻页键吃掉。
+        final h = _Harness();
+        h.dispatcher.enqueue(['display cur', 'next']);
+        async.flushMicrotasks();
+        h.dispatcher.onOutput('line1\r\n  <--- More --->');
+        async.elapse(const Duration(milliseconds: 200));
+
+        expect(h.completed, isEmpty, reason: '翻页提示不是提示符，命令仍在途');
+        expect(h.written, ['display cur\n', ' '], reason: '不该下发下一条命令');
+        expect(h.dispatcher.isBusy, isTrue);
       });
     });
   });
@@ -3029,6 +3208,11 @@ class CommandDispatcher {
   ///
   /// 完全空白的行会被跳过（spec FR-E-08）—— 避免空回车污染回显。行首尾
   /// 空白会被去掉。若清洗后为空则什么都不做。
+  ///
+  /// 批次执行中调用会**追加**到当前批次，批次总数随之变大：先前报
+  /// `3/8` 的进度事件，之后再报就是 `4/10`。因此 [CommandSent.total]
+  /// / [CommandCompleted.total] 反映的是**事件发出那一刻**的批次规模，
+  /// 不是最终规模。
   void enqueue(Iterable<String> commands) {
     if (_disposed) return;
     final cleaned = commands
@@ -3068,8 +3252,9 @@ class CommandDispatcher {
       // 不产生队列进度变化，也**不重置命令超时** —— 一条命令翻十页仍然
       // 只受一个 10s 超时约束。
       //
-      // 去抖计时照常重置：翻页提示本身就是"新数据到达"，此时缓冲区末尾
-      // 是 `---- More ----`，本来也匹配不上提示符正则。
+      // 去抖计时照常重置：翻页提示本身就是"新数据到达"。
+      // 此刻缓冲区末尾仍是翻页提示，_checkPrompt 必须显式排除它，
+      // 否则 `<--- More --->` 这类以 `>` 结尾的提示会被误判成命令结束。
       write(MorePager.continueKey);
       _events.add(const PagerContinued());
       _restartDebounce();
@@ -3135,9 +3320,11 @@ class CommandDispatcher {
     _currentIndex = _batch.length - _queue.length;
     // 清空缓冲区：否则上一条命令残留的提示符会让本条瞬间"完成"
     _buffer = '';
+    // 先起超时再写出：若注入的 write 同步抛异常，队列仍有超时兜底，
+    // 不会永久卡在"忙"状态（spec 要求超时必须强制放行下一条）。
+    _restartTimeout();
     write('$cmd$lineEnding');
     _events.add(CommandSent(cmd, _currentIndex, _batch.length));
-    _restartTimeout();
   }
 
   void _restartDebounce() {
@@ -3164,6 +3351,10 @@ class CommandDispatcher {
 
   void _checkPrompt() {
     if (_current == null) return;
+    // 翻页提示不能当成提示符。`<--- More --->` 以 `>` 结尾，本来就能匹配
+    // 默认提示符正则；若在此判定完成，下一条命令会被发进仍在翻页的设备，
+    // 被它当作翻页按键吃掉 —— 命令看似已下发，实际从未执行。
+    if (morePager.matchesTail(_buffer)) return;
     if (!promptDetector.matches(_buffer)) {
       // 没有提示符就继续等，由超时计时器兜底
       return;
@@ -3208,7 +3399,7 @@ class CommandDispatcher {
 flutter test test/command/command_dispatcher_test.dart
 ```
 
-Expected：PASS，23 个测试全绿。
+Expected：PASS，25 个测试全绿。
 
 其中 `'内容行以 ] 结尾时会误判 —— 记录已知限制'` 断言的是**误判确实会发生**，这不是 bug 而是 spec §5.2 明确接受的残留风险（静默去抖只能排除"数据仍在流动"的那部分误判）。它的姊妹测试 `'内容行以 ] 结尾但随后仍有数据时不会误判'` 则证明去抖在数据连续流动时确实起作用。两条一起看，才算把这道边界钉住。
 
