@@ -1109,9 +1109,11 @@ Foo copyWith({Object? bar = _unset}) => Foo(
 1. **`_classify` 里每一支的 `cause:` 都是死参数 —— 但只在一条路径上看得出来。**
 
    `classifyConnectionFailure` 先算 `final inner = _classify(error);`，再用
-   `cause: error` 重建（hop 分支同样）。于是 `_classify` 九处 `cause:` 传入的值
-   **无一被观察**。行为上不算错：最终 `cause` 恒为最外层异常，与文档「原始异常
-   对象」一致（用户拿到的"原始"就是 `connect()` 真正抛出的那个）。
+   `cause: error` 重建（hop 分支同样）。于是 `_classify` 里每一处 `cause:`
+   传入的值**无一被观察**（写这段时是 9 处；Task 3 的修复轮又加了两支，
+   现为 11 处 —— 计数变了，结论没变）。行为上不算错：最终 `cause` 恒为最外层
+   异常，与文档「原始异常对象」一致（用户拿到的"原始"就是 `connect()` 真正
+   抛出的那个）。
 
    实测（2026-09-24，本机）：把该行改成 `cause: inner.cause`，**14 个用例全绿**。
    原因是绝大多数分支里 `inner.cause` 与 `error` **本就是同一个对象**，改与不改
@@ -1233,6 +1235,31 @@ Foo copyWith({Object? bar = _unset}) => Foo(
      `jumpHostFailed` 三类的文案**零覆盖**（整段换成 `'null'` 也全绿）。
      已改成覆盖七个 kind，并用 `ConnectionFailureKind.values` 断言"一个都不能少"，
      这样将来加成员时该用例会自己红，而不是悄悄落后。
+
+9. **`fromPem` 的失败有五种形态，分类器一种都认不出 —— 洞在调用点，已指派
+   给 Task 4（评审提出，待修）。** §13.19-7 补上的是 `SSHKeyDecodeError` 那一支，
+   但真正会抛出来的东西比它多。在 dartssh2 4.1.0 上实测（2026-09-24）：
+
+   | 用户的真实操作 | 抛出 | 现分类 | 用户看到 |
+   |---|---|---|---|
+   | 选了一个公钥文件 | `UnsupportedError` | `unknown` | `连接失败：Unsupported operation: Unsupported key type: PUBLIC KEY` |
+   | 选了一个 PKCS#8 加密私钥 | `UnsupportedError` | `unknown` | 同上，只是尾部是 `ENCRYPTED PRIVATE KEY` |
+   | 选了非 PEM 文件 / `ssh-rsa AAAA… user@host` 一行式 / base64 损坏 | `FormatException` | `unknown` | `连接失败：FormatException: PEM header must start with -----BEGIN `（base64 损坏还会把多行 caret 块倒进输出区） |
+   | 截断或损坏的 OPENSSH 私钥 | `SSHPacketError` | `protocolError` | `协议错误：SSHPacketError(Malformed packet: …)` ← **方向指错** |
+   | **私钥路径写错 / 文件不可读** | `FileSystemException`（来自 `File(path).readAsStringSync()`，**不是** `fromPem`） | `unknown` | `连接失败：FileSystemException: Cannot open file, path = …` |
+
+   最后一行是最可能发生的输入（路径打错），而第 4 行正是 §13.19-2 要防的那种误导：
+   用户会去查算法，实际是他的密钥文件坏了。
+
+   **修法不在分类器里。** 分类器只拿到一个裸 `Object`，无从知道这个
+   `FormatException` / `UnsupportedError` / `SSHPacketError` 来自"读私钥" ——
+   在分类器里按这些类型做全局映射，会冤枉其它同样抛它们的来源。上下文在
+   **调用点**：`SshSession._identities()` 知道自己在加载私钥，就该在那里把
+   **全部**异常翻译成一个带中文说明的 `ConnectionFailure` 再抛。
+
+   为此分类器新增了幂等分支（`if (error is ConnectionFailure) return error;`），
+   否则那个对象会被再包一层，变成「连接失败：ConnectionFailure(authFailed): …」。
+   **Task 4 的 fence 与用例必须覆盖这一点**，尤其是"路径写错"那条最可能的输入。
 
 ### 13.20 断开原因到不了界面（计划 2 执行期发现，Task 6 之前必须修）
 

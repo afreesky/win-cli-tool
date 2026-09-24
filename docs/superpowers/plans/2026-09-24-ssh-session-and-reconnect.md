@@ -1006,9 +1006,9 @@ void main() {
       expect(f.kind, ConnectionFailureKind.authFailed);
     });
 
-    test('私钥读不出来 → 指向私钥本身，不要说成协议错误', () {
-      // 带口令的私钥就走这条：V1 的 `SSHKeyPair.fromPem` 不带 passphrase。
-      // 少了这个分支，它会掉进 `is SSHError` 兜底，变成
+    test('带口令的私钥 → 指向"去掉口令"，不要说成协议错误', () {
+      // V1 的 `SSHKeyPair.fromPem` 不带 passphrase，所以**任何**设了口令的
+      // 私钥都必然失败。少了这个分支，它会掉进 `is SSHError` 兜底，变成
       // 「协议错误：SSHKeyDecryptError(Private key is encrypted, null)」
       // —— 一个英文类名加一个字面 null，方向还指到了协议上。
       final f = classifyConnectionFailure(
@@ -1017,7 +1017,25 @@ void main() {
 
       expect(f.kind, ConnectionFailureKind.authFailed);
       expect(f.message, contains('私钥'));
+      expect(f.message, contains('口令'));
       expect(f.message, isNot(contains('协议错误')));
+      expect(f.message, isNot(contains('null')));
+    });
+
+    test('读不出私钥但不是口令问题 → 不能提口令', () {
+      // 实测输入：`-----BEGIN RSA PRIVATE KEY-----\n\n-----END RSA PRIVATE KEY-----`
+      // 抛 `SSHKeyDecodeError('Failed to decode private key')`。
+      // **两种私钥错误必须分开。** 合成一支的话，一个私钥文件损坏的用户会被
+      // 叫去"去掉口令"，而他的私钥根本没有口令 —— 与 §13.15 同一个
+      // "把人指向错误方向"的坑，只是轻一些。`SSHKeyDecryptError` 是
+      // `SSHKeyDecodeError` 的子类，所以顺序上必须先判子类。
+      final f = classifyConnectionFailure(
+        SSHKeyDecodeError('Failed to decode private key'),
+      );
+
+      expect(f.kind, ConnectionFailureKind.authFailed);
+      expect(f.message, contains('私钥'));
+      expect(f.message, isNot(contains('口令')));
       expect(f.message, isNot(contains('null')));
     });
 
@@ -1122,10 +1140,15 @@ void main() {
   });
 
   group('message 必须是可读中文，且带原始信息', () {
-    test('每种 kind 都有非空的中文说明，且不漏出 null', () {
+    test('每个 kind 的 message 都非空、且不含字面 null', () {
       // **必须覆盖全部七个 kind。** 这条此前只喂了 4 个输入，于是
       // hostKey / protocolError / jumpHostFailed 三类的文案零覆盖 ——
       // 把它们的 message 整个换成 'null' 也照样全绿。
+      //
+      // 注意这条**不能**叫"都是可读中文"：`unknown` 那一格按设计就是
+      // 原始异常的 `$error`（英文、带 Dart 类名），因为对一个没预料到的
+      // 异常，编不出中文来 —— 那正是 §13.19-1"永远不吞掉异常"的要求。
+      // 所以这里钉的是"非空、不漏 null"，不是"每条都通顺"。
       final cases = <String, ConnectionFailure>{
         'timeout（Socket.connect 到点）': classifyConnectionFailure(
           const SocketException(
@@ -1244,6 +1267,48 @@ void main() {
       expect(f.kind, ConnectionFailureKind.protocolError);
     });
   });
+
+  group('幂等：调用点可以先分好类再抛', () {
+    // `SshSession` 读私钥文件时比分类器更清楚上下文 —— 它知道失败发生在
+    // "加载私钥"，而分类器只拿到一个裸的 `FileSystemException`，无从判断。
+    // 所以允许调用点直接构造 ConnectionFailure 抛出，分类器原样返回。
+    test('已经是 ConnectionFailure 的原样返回，不再包一层', () {
+      // 少了这一支，那个对象会掉进 unknown，变成
+      // 「连接失败：ConnectionFailure(authFailed): 无法读取私钥…」——
+      // 用户看到两层面具，而且第一层是英文。
+      const original = ConnectionFailure(
+        ConnectionFailureKind.authFailed,
+        '无法读取私钥文件：路径不存在',
+      );
+
+      final f = classifyConnectionFailure(original);
+
+      expect(f, same(original));
+      expect(f.kind, ConnectionFailureKind.authFailed);
+      expect(f.message, '无法读取私钥文件：路径不存在');
+    });
+
+    test('带 hop 时仍然加"第几跳"前缀（FR-J-05 优先于内层原因）', () {
+      const original = ConnectionFailure(
+        ConnectionFailureKind.authFailed,
+        '无法读取私钥文件：路径不存在',
+      );
+
+      final f = classifyConnectionFailure(
+        original,
+        hop: const JumpHop(index: 2, name: '堡垒机-B'),
+      );
+
+      expect(f.kind, ConnectionFailureKind.jumpHostFailed);
+      expect(f.message, contains('第 2 跳'));
+      expect(f.message, contains('堡垒机-B'));
+      expect(f.message, contains('无法读取私钥文件'));
+      // 这一条才是真正钉住幂等的断言：没有幂等分支时，内层会先被
+      // 包成「连接失败：ConnectionFailure(authFailed): …」，再套上跳板机
+      // 前缀 —— 上面三条断言**全都照样通过**（实测过），只有这一条会红。
+      expect(f.message, isNot(contains('连接失败：')));
+    });
+  });
 }
 ```
 
@@ -1338,6 +1403,23 @@ const int _etimedoutWindows = 10060;
 /// 主机密钥被拒与算法协商失败抛出的异常类型与 toString 完全相同
 /// （spec §13.15），只有 reason 不同。
 ConnectionFailure classifyConnectionFailure(Object error, {JumpHop? hop}) {
+  // **幂等。** 调用点可能比分类器更清楚上下文（例如 `SshSession` 读私钥
+  // 文件时，它知道失败发生在"加载私钥"，而分类器只拿到一个裸
+  // `FileSystemException`，无从判断）。那就允许它直接构造好
+  // [ConnectionFailure] 再抛出来，这里原样返回 —— 不再包一层。
+  // 少了这一支，那个对象会掉进 `unknown`，变成
+  // 「连接失败：ConnectionFailure(authFailed): 无法读取私钥…」，
+  // 用户看到两层面具，而且第一层是英文。
+  if (error is ConnectionFailure) {
+    if (hop == null) return error;
+    // 跳板机的失败发生在哪一跳，仍然优先于内层原因（FR-J-05）。
+    return ConnectionFailure(
+      ConnectionFailureKind.jumpHostFailed,
+      '第 ${hop.index} 跳 ${hop.name} 失败：${error.message}',
+      cause: error,
+    );
+  }
+
   final inner = _classify(error);
 
   // 跳板机上下文优先：无论内层是什么原因，只要失败发生在某一跳上，
@@ -1454,15 +1536,27 @@ ConnectionFailure _classify(Object error) {
     );
   }
 
-  if (error is SSHKeyDecodeError) {
-    // 私钥读不出来。**必须排在 `is SSHError` 之前** —— 排到后面会被它吞掉，
-    // 报成"协议错误"并附上 `SSHKeyDecryptError(Private key is encrypted,
-    // null)`：一个英文类名、一个字面 null，还把方向指到了协议上。
-    // 带口令的私钥就走这里：V1 的 `SSHKeyPair.fromPem` 不带 passphrase。
+  if (error is SSHKeyDecryptError) {
+    // 私钥带口令。**必须排在 `is SSHError` 之前**，也必须排在下面的
+    // `SSHKeyDecodeError` 之前 —— 它是后者的子类，排到后面就到不了这里。
+    // 单独一支的价值在于：只有这一支能给出**确定且可操作**的方向
+    // （去掉口令即可），另一支只能说他文件读不出来。
     return ConnectionFailure(
       ConnectionFailureKind.authFailed,
-      '无法读取私钥：${error.message}。'
-      '若私钥设了口令，本版本暂不支持带口令的私钥。',
+      '私钥已加密，本版本暂不支持带口令的私钥。'
+      '请改用不带口令的私钥，或等待后续版本支持。',
+      cause: error,
+    );
+  }
+
+  if (error is SSHKeyDecodeError) {
+    // 读不出私钥，但**不是**口令问题（内容损坏、格式不认识等）。
+    // 文案不能假定口令：对一个文件损坏的用户说"若私钥设了口令…"，
+    // 就是让他去翻一个根本不存在的口令 —— 与 §13.15 同一个坑，
+    // 只是轻一些（原文仍然附在后面）。
+    return ConnectionFailure(
+      ConnectionFailureKind.authFailed,
+      '无法读取私钥：${error.message}',
       cause: error,
     );
   }
@@ -1486,7 +1580,7 @@ ConnectionFailure _classify(Object error) {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `flutter test test/connection/connection_failure_test.dart`
-Expected: 22 个用例全部 PASS
+Expected: 25 个用例全部 PASS
 
 - [ ] **Step 5: 反证测试的非空性（本计划的强制步骤）**
 
@@ -1506,6 +1600,10 @@ Expected: 22 个用例全部 PASS
 | 9 | 把 `error.osError?.message ?? error.message` 改成 `error.message` | 「不可达的文案保留操作系统给的原文」 |
 | 10 | 把 `authFailed` 那条消息整段换成主机密钥那一句 | 「认证失败的文案指向口令/密钥，不指向指纹」 |
 | 11 | 把「每种 kind 都有非空的中文说明」清单里的 `hostKey` 一项删掉 | 同一条（`ConnectionFailureKind.values` 那条断言必须挡住） |
+| 12 | 删掉 `classifyConnectionFailure` 开头 `if (error is ConnectionFailure)` **整块** | 「已经是 ConnectionFailure 的原样返回…」与「带 hop 时仍然加"第几跳"前缀…」 |
+| 13 | 删掉 `if (error is SSHKeyDecryptError)` **整支** | 「带口令的私钥 → 指向"去掉口令"，不要说成协议错误」（它证明子类必须排在 `SSHKeyDecodeError` 之前） |
+| 14 | 删掉 `if (error is SSHKeyDecodeError)` **整支** | 「读不出私钥但不是口令问题 → 不能提口令」 |
+| 15 | 把带口令那条消息**两行都**换成 `'无法读取私钥。'` | 「带口令的私钥 → 指向"去掉口令"，不要说成协议错误」 |
 
 第 2、8 条要删**整支**：只删 `if (...) {` 一行会留下语法破损的残块，编译不过 ——
 那不是有效的变异，会让人误以为"变红了"。第 8 条尤其要注意：把 `is SSHKeyDecodeError`
@@ -1517,6 +1615,16 @@ Expected: 22 个用例全部 PASS
 **自带尾逗号**，而主机密钥那一句在源码里是多行拼接、末行同样以 `',` 结尾。整块照抄过去
 就会写出 `。',` 紧跟着原来的 `,`，变成双逗号 —— 编译失败，而输出**照样**是
 `Some tests failed`。替换时只换引号里的内容，尾逗号保留一个。
+
+**第 15 条要整条消息一起换。** 只换第一行是**无效变异**：第二行
+「请改用不带口令的私钥…」仍然含"口令"，而用例断言的正是 `contains('口令')`，
+于是照样全绿（实测过）。那不是测试弱，是变异没把被测属性移除干净 ——
+**看到全绿时，先怀疑变异，再怀疑测试。**
+
+**第 12 条会暴露一条弱断言。** 只删那一块时，「带 hop」那条用例的**前三条断言
+全都照样通过**（内层先被包成「连接失败：ConnectionFailure(authFailed): …」，
+再套上跳板机前缀，三个 `contains` 依然成立），只有 `isNot(contains('连接失败：'))`
+会红（实测过）。少了最后这一条，该用例在变异 12 下是绿的。
 
 **识别假红的通用办法：**看 `[E]` 那一行点名的是什么。点的是**用例名**才是断言失败；
 点的是**文件路径**（`loading /…/connection_failure.dart [E]`）就是加载/编译失败，
@@ -1551,11 +1659,17 @@ git commit -m "feat: FR-C-06 失败原因分类，区分主机密钥与算法协
 - Create: `lib/connection/ssh_session.dart`
 - Test: `test/connection/ssh_session_test.dart`
 
-**三个必须照做的点（写错任何一个都会静默出错）：**
+**四个必须照做的点（写错任何一个都会静默出错）：**
 
 1. `_closed` 必须在关 `client` **之前**置位 —— 否则 `client.close()` 完成的 `session.done` 会被当成一次意外断线，导致退出应用时每台设备触发一次自动重连（§13.14-5）。
 2. `onVerifyHostKey` 必须**始终**显式传，即便校验被全局关闭（§13.14-1）。
 3. `stdout` 必须 `.cast<List<int>>()` 后才能 `.transform(Utf8Decoder())`（协变陷阱）。
+4. 加载私钥的失败必须**在 `_identities()` 里翻译成中文的 `ConnectionFailure`** ——
+   见 spec §13.19-9：`fromPem` 的失败有五种形态（公钥文件、PKCS#8 加密、非 PEM、
+   损坏的 OPENSSH、以及 `File(...).readAsStringSync()` 的 `FileSystemException`），
+   分类器**一种都认不出**，会把英文类名漏给用户，其中 `SSHPacketError` 那一种
+   还会报成"协议错误"把方向指错。分类器对 `ConnectionFailure` 是幂等的，
+   所以这里直接构造它抛出去即可。用例必须覆盖"路径写错"这条最可能的输入。
 
 - [ ] **Step 1: 写失败测试**
 
