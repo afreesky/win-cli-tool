@@ -4400,6 +4400,49 @@ void main() {
     });
   });
 
+  test('SessionLost 必须带上断开原因（§13.20）—— 事件发了不等于原因到了', () {
+    fakeAsync((async) {
+      final sessions = <_FakeSession>[];
+      final mgr = ConnectionManager(
+        profile: _profile(),
+        factory: _FakeFactory(sessions),
+      );
+
+      mgr.connect();
+      async.flushMicrotasks();
+
+      final lost = <SessionLost>[];
+      mgr.events.listen((e) {
+        if (e is SessionLost) lost.add(e);
+      });
+
+      // 刻意用**非 const** 调用：`const _ConnectFailed()` 会被规范化，
+      // 两个字面量是同一个对象，`same()` 就恒真、什么也钉不住。
+      final reason = _ConnectFailed();
+      sessions[0].drop(reason);
+      async.flushMicrotasks();
+
+      expect(lost, hasLength(1));
+      // §13.20 的缺陷形状：`session.done` 完成时读不到原因，于是 `SessionLost`
+      // 带着 `null` 出去 —— 事件照发、界面拿到"原因不明"。只断言 `isNotEmpty`
+      // 看不出来这件事，上一条用例正是这样。
+      expect(lost.single.failure, isNotNull, reason: 'SessionLost 必须带上原因');
+      expect(
+        lost.single.failure!.cause,
+        same(reason),
+        reason: '原因必须就是会话报上来的那个对象',
+      );
+      expect(
+        lost.single.failure!.message,
+        contains('connect failed'),
+        reason: '原因要能被翻译成给用户看的中文',
+      );
+
+      mgr.dispose();
+      async.flushMicrotasks();
+    });
+  });
+
   test('用户主动断开不触发重连（FR-C-05 / §5.4）', () {
     fakeAsync((async) {
       final sessions = <_FakeSession>[];
@@ -4959,9 +5002,9 @@ class ConnectionManager {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `flutter test test/connection/connection_manager_test.dart`
-Expected: 12 个用例全部 PASS
+Expected: 13 个用例全部 PASS
 
-- [ ] **Step 5: 反证九个承载行为的非空性（逐个做，每个都要看到红）**
+- [ ] **Step 5: 反证十个承载行为的非空性（逐个做，每个都要看到红）**
 
 计划 1 的教训是"全绿"不等于"被约束"。下表每一条都是把缺陷**放回去**，确认对应测试确实变红；不变红就说明那条测试是空的。每改一条立刻恢复，最后 `git diff` 确认工作区干净再提交。
 
@@ -4976,12 +5019,22 @@ Expected: 12 个用例全部 PASS
 | M7 | `_attemptConnect` 的 catch 里去掉 `if (_disposed \|\| _userClosed) return;`，并把 `_scheduleRetry` 的 `_userClosed` 早退合并回「置 failed」 | 建连途中用户主动断开：不得报失败，也不得转红 |
 | M8 | `_onSessionDone` 里再补一句 `_events.add(SessionLost(null));` | 一次断线只发一个 SessionLost |
 | M9 | `_scheduleRetry` 里删掉 `if (!autoReconnect) { _setState(failed); return; }` | 关闭自动重连时，建连失败置为 failed（红） |
+| M10 | `_onSessionDone` 里把 `session.lastError` 换成恒 `null`（原因到不了界面） | SessionLost 必须带上断开原因（§13.20） |
 
-已实测：M1–M9 全部变红。
+已实测：M1–M10 全部变红。
 
 **M7（代码评审查出来的真缺陷）**：catch 分支原来只认 `_disposed`，成功分支却认 `_disposed || _userClosed` —— 这个不对称就是漏洞。用户在 `session.connect()` 还没返回时点"断开"，`disconnect()` 会关掉 socket 让在途的 connect 抛错，于是走进 catch：既发了一个**假告警**（这次失败是我们自己造成的），又经 `_scheduleRetry()` 把状态刷成 `failed` —— 按钮从灰变红。spec §5.4 写得很清楚：用户主动断开，**按钮变灰**。修法是 catch 与 `_scheduleRetry` 都认 `_userClosed`，并且把 `!autoReconnect`（真正该变红的唯一情形）与 `_userClosed` 分开处理。
 
 **M9 为什么必须有**：把 `failed` 收窄到 `!autoReconnect` 之后，这条路径就成了 `failed` 的**唯一**来源，而它当时一条测试都没有 —— 实测把整个 `if (!autoReconnect) {...}` 删掉，11 个用例**全绿**。一个"改了行为却没有测试压住"的路径，等于没改。补上用例后 M9 变红（`Expected: failed, Actual: reconnecting`）。
+
+**M10 为什么必须有**：`SessionLost.failure` 是**可空**的（对端正常结束时本来就是
+`null`），所以"把原因丢掉"这件事**编译得过，而且原有 12 条用例全绿** —— 上面那条
+`SessionLost` 用例只断言了 `isNotEmpty`（事件发了），从没读过 payload。这正是 §13.20
+那个缺陷的形状：事件照发，界面拿到"原因不明"，用户看到的是"设备已断开（原因未知）"，
+而这恰恰是 §13.20 当初修掉的东西 —— 只是修在了 `Session.lastError` 上，**出口这一端
+当时没人钉**。M10 把 `session.lastError` 换成恒 `null`，必须让新用例的 `isNotNull`
+断言变红。**这条用例断言的是"原因到了界面手上"，不是"原因被算出来了"** —— 两者是
+两件事，§13.20 缺的正是后者到前者的那一段。
 
 **关于 M8 附近的一条被证伪的推断，记录在案**：代码评审曾判断 `_attemptConnect` 里那个 `_dispatcherSub` 转发订阅会导致**一次断线发两个 `SessionLost`**（一次来自 `_onSessionDone`，一次来自 `QueueDropped` 的转发）。实测**不成立** —— 在 M7 修复后的代码上把那两行原样放回去，`一次断线只发一个 SessionLost` 仍然全绿。原因是 `CommandDispatcher._events` 是**异步**广播 controller（`command_dispatcher.dart:100`，没有 `sync: true`），`onDisconnected()` 投递的 `QueueDropped` 要等一个 microtask 才到，而 `_teardownSession()` 在**同一个同步块**里就把 `_dispatcherSub` 取消了 —— 转发监听器永远收不到那条事件。也就是说那段转发是**永不触发的死代码**，不是重复发送。
 
