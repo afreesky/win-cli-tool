@@ -1111,7 +1111,7 @@ Foo copyWith({Object? bar = _unset}) => Foo(
    `classifyConnectionFailure` 先算 `final inner = _classify(error);`，再用
    `cause: error` 重建（hop 分支同样）。于是 `_classify` 里每一处 `cause:`
    传入的值**无一被观察**（写这段时是 9 处；Task 3 的修复轮又加了两支，
-   现为 11 处 —— 计数变了，结论没变）。行为上不算错：最终 `cause` 恒为最外层
+   现为 12 处，全文件 15 处 —— 计数变了，结论没变）。行为上不算错：最终 `cause` 恒为最外层
    异常，与文档「原始异常对象」一致（用户拿到的"原始"就是 `connect()` 真正
    抛出的那个）。
 
@@ -1127,7 +1127,7 @@ Foo copyWith({Object? bar = _unset}) => Foo(
    "详细信息"，先确认这里给的是不是界面要的东西。
 
    **给将来动手的人：** 若因为第 1 条去"清理"这两个 `cause:` 行，必须**同时**
-   补一条钉住拆包路径 `cause` 的用例，否则这次改动对九条路径里的八条是静默的。
+  否则这次改动对十二条路径里的十一条是静默的。
 
 2. **`SSHInternalError` 的文案不得断言成因（已修正）。**
 
@@ -1213,9 +1213,9 @@ Foo copyWith({Object? bar = _unset}) => Foo(
      本身没量过"。凡是要写进计划的「某库在某场景会抛 X」，都要先用一段最小
      程序验一次 —— 这也正是 §13.15 当初被发现的同一种方法。
 
-7. **带口令的私钥会漏出 `null` 和英文类名（评审提出，已修）。** V1 的
-   `SSHKeyPair.fromPem(pem)` 不带 passphrase，所以**任何**设了口令的私钥都会
-   失败并落到 `is SSHError` 兜底，产出：
+7. **带口令的 OPENSSH 私钥会漏出 `null` 和英文类名（评审提出，已修）。**
+   `SSHKeyPair.fromPem(pem)` 不带 passphrase，所以带口令的私钥都会失败，
+   落到 `is SSHError` 兜底，产出：
    `协议错误：SSHKeyDecryptError(Private key is encrypted, null)` ——
    一个英文类名、一个字面 `null`，以及一个错误的方向（说成协议问题，用户会去
    翻算法配置）。修法：在 `is SSHError` **之前**插一支 `is SSHKeyDecodeError`，
@@ -1223,6 +1223,11 @@ Foo copyWith({Object? bar = _unset}) => Foo(
    一支覆盖两者。
    **顺序是这个修法的全部要点** —— 排到 `is SSHError` 之后就等于没写：
    编译器不报错，测试也不会红。
+   **订正（复审时补测）。** 这条原先写的是「**任何**设了口令的私钥都会失败并
+   落到兜底」—— 错的。实测里只有带口令的 **OPENSSH** 私钥抛 `SSHKeyDecryptError`；
+   带口令的 **PKCS#1** 抛 `ArgumentError`，本分类器没有哪一支接得住它，最终落在
+   `unknown`（见第 9 条形态表）。一条注释把"我测过的那一种"写成了"全部"，
+   而第 9 条存在的理由正是这个。
 
 8. **两条"守文案"的纪律此前只被单向覆盖（评审提出，已修）。**
 
@@ -1236,20 +1241,35 @@ Foo copyWith({Object? bar = _unset}) => Foo(
      已改成覆盖七个 kind，并用 `ConnectionFailureKind.values` 断言"一个都不能少"，
      这样将来加成员时该用例会自己红，而不是悄悄落后。
 
-9. **`fromPem` 的失败有五种形态，分类器一种都认不出 —— 洞在调用点，已指派
+9. **`fromPem` 的失败有七种形态，分类器一种都认不出 —— 洞在调用点，已指派
    给 Task 4（评审提出，待修）。** §13.19-7 补上的是 `SSHKeyDecodeError` 那一支，
    但真正会抛出来的东西比它多。在 dartssh2 4.1.0 上实测（2026-09-24）：
 
    | 用户的真实操作 | 抛出 | 现分类 | 用户看到 |
    |---|---|---|---|
-   | 选了一个公钥文件 | `UnsupportedError` | `unknown` | `连接失败：Unsupported operation: Unsupported key type: PUBLIC KEY` |
-   | 选了一个 PKCS#8 加密私钥 | `UnsupportedError` | `unknown` | 同上，只是尾部是 `ENCRYPTED PRIVATE KEY` |
+   | 选了一个公钥文件 | `UnsupportedError`（`Unsupported key type: PUBLIC KEY`） | `unknown` | `连接失败：Unsupported operation: …` |
+   | 选了一个 PKCS#8 加密私钥 | `UnsupportedError`（尾部 `ENCRYPTED PRIVATE KEY`） | `unknown` | 同上 |
+   | **选了明文 PKCS#8 私钥**（`-----BEGIN PRIVATE KEY-----`，`openssl genpkey` 的默认输出） | `UnsupportedError('Unsupported key type: PRIVATE KEY')` | `unknown` | 同上 |
    | 选了非 PEM 文件 / `ssh-rsa AAAA… user@host` 一行式 / base64 损坏 | `FormatException` | `unknown` | `连接失败：FormatException: PEM header must start with -----BEGIN `（base64 损坏还会把多行 caret 块倒进输出区） |
    | 截断或损坏的 OPENSSH 私钥 | `SSHPacketError` | `protocolError` | `协议错误：SSHPacketError(Malformed packet: …)` ← **方向指错** |
-   | **私钥路径写错 / 文件不可读** | `FileSystemException`（来自 `File(path).readAsStringSync()`，**不是** `fromPem`） | `unknown` | `连接失败：FileSystemException: Cannot open file, path = …` |
+   | 带口令的 **PKCS#1** 私钥（`Proc-Type: 4,ENCRYPTED`） | `ArgumentError('passphrase is required for encrypted key')` | `unknown` | `连接失败：Invalid argument(s): passphrase is required for encrypted key` |
+   | **私钥路径写错 / 文件不可读** | `PathNotFoundException`（`FileSystemException` 的子类，来自 `File(path).readAsStringSync()`，**不是** `fromPem`） | `unknown` | `连接失败：PathNotFoundException: Cannot open file, path = …` |
 
-   最后一行是最可能发生的输入（路径打错），而第 4 行正是 §13.19-2 要防的那种误导：
+   「路径写错」那一行是最可能发生的输入，而「截断或损坏的 OPENSSH 私钥」那一行
+   正是 §13.19-2 要防的那种误导：
    用户会去查算法，实际是他的密钥文件坏了。
+
+   **订正（复审时逐条补测）。** 这张表最初只有五行，且第五行写的是
+   `FileSystemException` —— 用户实际看到的是它的**子类** `PathNotFoundException`。
+   补上的两行里，**明文 PKCS#8 那一行最要紧**：`openssl genpkey` / `req -newkey`
+   的默认输出正是这个格式，也就是**一个完全正确、无口令的私钥同样会失败**，
+   而它的失败原因与"格式本版本不支持"挤在同一个 `UnsupportedError` 里。
+   所以 Task 4 的文案不能只说"私钥格式不支持"，要能分开
+   「你选的是公钥」「这个格式本版本不支持」。
+
+   **这张表未必穷尽。** 它是照着实测输入列的，不是照着 `fromPem` 的分支列的；
+   每多测一种输入就可能多一行。别把它当封闭集合用 —— 判据是"调用点要把
+   **全部**异常翻译掉"，不是"覆盖表里这七种"。
 
    **修法不在分类器里。** 分类器只拿到一个裸 `Object`，无从知道这个
    `FormatException` / `UnsupportedError` / `SSHPacketError` 来自"读私钥" ——
@@ -1260,6 +1280,21 @@ Foo copyWith({Object? bar = _unset}) => Foo(
    为此分类器新增了幂等分支（`if (error is ConnectionFailure) return error;`），
    否则那个对象会被再包一层，变成「连接失败：ConnectionFailure(authFailed): …」。
    **Task 4 的 fence 与用例必须覆盖这一点**，尤其是"路径写错"那条最可能的输入。
+
+10. **幂等分支漏了递归入口（复审提出，已修）。** 幂等只在
+    `classifyConnectionFailure` 顶部判，而 `_classify` 里 `is SSHSocketError`
+    那一支会**递归**回 `_classify(error.error)` —— 那次递归不经过顶部。于是
+    `classifyConnectionFailure(SSHSocketError(ConnectionFailure(authFailed, …)))`
+    得到 `unknown`，消息是
+    `连接失败：ConnectionFailure(authFailed): …`：正是幂等分支要防的双层面具，
+    只不过这次是分类器自己造的。修法是在 `_classify` 顶部自己再判一次。
+
+    实测（2026-09-24）：删掉 `_classify` 顶部那一行，**只有**新补的那条用例红
+    （1 红、0 假红，且红的是用例名而非文件名）；而删掉
+    `classifyConnectionFailure` 顶部那一整块（第 12 条变异）时，同一组里的
+    递归用例**照样红** —— 所以第 12 条的红色**不构成**对 `_classify` 那一行的
+    覆盖，两处必须各有一条用例。教训：**任何"回到自己"的分支都要自己重新判一次
+    前置条件**，这类洞不写用例就永远发现不了。
 
 ### 13.20 断开原因到不了界面（计划 2 执行期发现，Task 6 之前必须修）
 

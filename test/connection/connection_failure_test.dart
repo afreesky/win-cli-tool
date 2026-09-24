@@ -73,8 +73,13 @@ void main() {
     });
 
     test('带口令的私钥 → 指向"去掉口令"，不要说成协议错误', () {
-      // V1 的 `SSHKeyPair.fromPem` 不带 passphrase，所以**任何**设了口令的
-      // 私钥都必然失败。少了这个分支，它会掉进 `is SSHError` 兜底，变成
+      // **这条只覆盖带口令的 OPENSSH 私钥**（`-----BEGIN OPENSSH PRIVATE
+      // KEY-----`），实测里唯一抛 `SSHKeyDecryptError` 的形态。这里原先写的是
+      // "任何设了口令的私钥都必然失败" —— 错的：带口令的 **PKCS#1**
+      // （`Proc-Type: 4,ENCRYPTED`）抛的是 `ArgumentError`，本文件里没有
+      // 哪一支接得住它，最终落在 `unknown`（见 spec §13.19-9）。
+      //
+      // 少了这个分支，它会掉进 `is SSHError` 兜底，变成
       // 「协议错误：SSHKeyDecryptError(Private key is encrypted, null)」
       // —— 一个英文类名加一个字面 null，方向还指到了协议上。
       final f = classifyConnectionFailure(
@@ -203,18 +208,42 @@ void main() {
         ConnectionFailureKind.timeout,
       );
     });
+
+    test('内层已经是 ConnectionFailure 时，不再被包成 unknown', () {
+      // 这一次递归不经过 `classifyConnectionFailure` 顶部的幂等判断，所以
+      // `_classify` 顶部必须**自己再判一次**。少了那一行，内层会掉进
+      // `unknown`，用户看到的是
+      // 「连接失败：ConnectionFailure(authFailed): 无法读取私钥文件：路径不存在」
+      // —— 双层面具，第一层还是英文。
+      //
+      // 这个形状今天在 `DirectConnector` 里够不到（它只抛
+      // `SocketException`），但计划 3 的隧道/跳板机连接器完全可能产出它。
+      const inner = ConnectionFailure(
+        ConnectionFailureKind.authFailed,
+        '无法读取私钥文件：路径不存在',
+      );
+
+      final f = classifyConnectionFailure(SSHSocketError(inner));
+
+      // 注意不能断言 `same(inner)`：`classifyConnectionFailure` 末尾会按
+      // `inner.kind` / `inner.message` 重造一个，好把 **SSHSocketError 本身**
+      // 记进 `cause`。要对的是面具有没有被摘掉。
+      expect(f.kind, ConnectionFailureKind.authFailed);
+      expect(f.message, '无法读取私钥文件：路径不存在');
+      expect(f.message, isNot(contains('连接失败：')));
+    });
   });
 
-  group('message 必须是可读中文，且带原始信息', () {
+  group('message 必须非空、不漏 null，且带原始信息', () {
     test('每个 kind 的 message 都非空、且不含字面 null', () {
       // **必须覆盖全部七个 kind。** 这条此前只喂了 4 个输入，于是
       // hostKey / protocolError / jumpHostFailed 三类的文案零覆盖 ——
       // 把它们的 message 整个换成 'null' 也照样全绿。
       //
       // 注意这条**不能**叫"都是可读中文"：`unknown` 那一格按设计就是
-      // 原始异常的 `$error`（英文、带 Dart 类名），因为对一个没预料到的
-      // 异常，编不出中文来 —— 那正是 §13.19-1"永远不吞掉异常"的要求。
-      // 所以这里钉的是"非空、不漏 null"，不是"每条都通顺"。
+      // 原始异常的 `$error`（英文、带 Dart 类名）。对一个没预料到的异常，
+      // 细节编不出来，套一句中文也仍然要附原文，所以钉的是
+      // "非空、不漏 null"，不是"每条都通顺" —— 见 `message` 的文档。
       final cases = <String, ConnectionFailure>{
         'timeout（Socket.connect 到点）': classifyConnectionFailure(
           const SocketException(

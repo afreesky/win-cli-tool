@@ -56,6 +56,10 @@ class ConnectionFailure implements Exception {
   final ConnectionFailureKind kind;
 
   /// 可直接展示给用户的中文说明。
+  ///
+  /// **例外：[ConnectionFailureKind.unknown]。** 那一种按设计就是原始异常的
+  /// `$error`（英文、带 Dart 类名）：对一个没预料到的异常，细节编不出来，
+  /// 而 §13.19-1 要求"永远不吞掉异常"。原文同时也留在 [cause] 里。
   final String message;
 
   /// 原始异常对象。用于日志与排查，不展示给用户。
@@ -113,12 +117,26 @@ ConnectionFailure classifyConnectionFailure(Object error, {JumpHop? hop}) {
 }
 
 ConnectionFailure _classify(Object error) {
+  // **幂等要在这里再判一次。** 下面 `is SSHSocketError` 那一支会**递归**回
+  // 本函数（`_classify(error.error)`），那次递归不经过
+  // [classifyConnectionFailure] 顶部的幂等判断。少了这一处，
+  // `SSHSocketError(ConnectionFailure(authFailed, …))` 会重新掉进 `unknown`，
+  // 得到「连接失败：ConnectionFailure(authFailed): …」—— 正是幂等分支要
+  // 避免的双层面具。今天 `DirectConnector` 只抛 `SocketException`，所以还
+  // 够不到；但计划 3 的隧道/跳板机连接器就会产出这个形状（实测过）。
+  if (error is ConnectionFailure) return error;
+
   if (error is TimeoutException) {
-    // 这一支眼下是**防御性**的：dartssh2 自己在握手/认证超时时并不抛这个
-    // 类型，它抛 `SSHHandshakeError('Handshake timed out')` 与
-    // `SSHAuthAbortError('Authentication timed out')`（后者是它唯一一处
-    // reason 为 null 的产出）。真正撑起 FR-C-13 的是下面 `SocketException`
-    // 那一支的 errno 判定 —— 别把这条用例的绿色读成"超时路径已验证"。
+    // 这一支眼下是**防御性**的：dartssh2 在握手/认证超时时并不抛这个类型，
+    // 它抛 `SSHHandshakeError('Handshake timed out')` 与
+    // `SSHAuthAbortError('Authentication timed out')`（ssh_client.dart:1126）。
+    // 真正撑起 FR-C-13 的是下面 `SocketException` 那一支的 errno 判定 ——
+    // 别把这条用例的绿色读成"超时路径已验证"。
+    //
+    // 顺带订正一条曾经写错的断言：`reason` 为 null 的来源**不是**只有
+    // :1126 那一处。:964 配 :321 的 `_handleTransportClosed(null)` 也会产出
+    // `SSHAuthAbortError(msg, null)` —— 认证前对端干净地关掉 TCP，实测里
+    // 比认证超时更常见。两者都落到下面"认不出的 reason"那条兜底。
     return ConnectionFailure(
       ConnectionFailureKind.timeout,
       '连接超时：目标设备在超时时间内没有响应',
@@ -128,9 +146,9 @@ ConnectionFailure _classify(Object error) {
 
   // 两条顺序纪律都在这个函数里，两条都是"排错了不报错、只静默失效"：
   //   1. 若将来要加 `is SSHAuthError`，它必须排在下面
-  //      `is SSHAuthAbortError` **之后** —— SSHAuthAbortError 与
-  //      SSHAuthFailError 都 implements SSHAuthError（ssh_errors.dart:40/49），
-  //      排在前面会一次吞掉两者。
+  //      `is SSHAuthAbortError` **之后** —— SSHAuthFailError 与
+  //      SSHAuthAbortError 都 implements SSHAuthError（前者 ssh_errors.dart:40，
+  //      后者 :49；别按 40/49 的顺序记，40 是 Fail）。排在前面会一次吞掉两者。
   //   2. `is SSHError` 是**兜底**，必须始终排在最后。任何新的
   //      `is <某个 SSHError>` 分支排到它后面就是死代码：编译器不报错，
   //      测试也不会红。下面的 `SSHKeyDecodeError` 分支正是为此特意插在
@@ -149,7 +167,7 @@ ConnectionFailure _classify(Object error) {
     }
     if (reason is SSHInternalError) {
       // 文案不能断言成因。dartssh2 对这个类的自述是"不该发生的错误，多半是
-      // 库自身的缺陷"（ssh_errors.dart:14-16），算法协商失败只是它承载的
+      // 库自身的缺陷"（ssh_errors.dart:14-15），算法协商失败只是它承载的
       // **其中**一种情况。若一口咬定"与该设备协商加密参数失败"，一个库缺陷
       // 就会被说成设备的算法问题 —— 用户跑去翻设备的 SSH 配置，而那正是
       // §13.15 要避免的"把人指向错误的方向"。所以两种成因并列，并始终附原文。
