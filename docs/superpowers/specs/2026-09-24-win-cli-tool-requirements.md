@@ -1422,3 +1422,89 @@ Foo copyWith({Object? bar = _unset}) => Foo(
 **为什么这条重要：** Task 6 的单测会照常通过 —— 它断言的是 `SessionLost` **事件
 发出来了**，不是它**带了什么**。所以这个缺陷不会在测试里露头，只会在产品里表现
 为"断线了，但不知道为什么"。
+
+### 13.21 `SshSession` 的四条残留（计划 2 Task 4 执行期，2026-09-25）
+
+Task 4 经两轮评审后通过。以下四条是评审查出、但**故意没有在 Task 4 修掉**的项 ——
+写在这里是为了让它们带着证据和结论继续走，而不是在交接时蒸发。
+
+#### 1. 连接超时只管拨号，拨通之后没有上限（**Task 6 之前必须定**）
+
+`SshSession.connect()` 把 `connectTimeout` 只交给了拨号：
+
+- `connector.open(..., timeout: connectTimeout)`（`ssh_session.dart:185`）
+- 之后 `await client.authenticated`（`:206`）与 `await client.shell(...)`（`:215`）
+  **没有任何超时**。
+
+`handshakeTimeout` / `authTimeout` 在 dartssh2 里默认都是 `null`，而 `lib/` 下没有
+任何一处设过它们（Task 3 的注释已记录，见 §13.19 与 `connection_failure.dart` 里
+`TimeoutException` 那一支的说明）。
+
+**后果：** 一台**接受了 TCP 却不说话**的设备（老设备卡在 KEX、或中间有只做 TCP
+代理的黑洞设备）会让 `await client.authenticated` 永远挂着 —— 按钮一直黄，既没有
+`ConnectionFailed`、也不重连。FR-C-13 承诺的是「连接超时默认 15 秒」，用户看到的
+却是无限等待。**这不是「慢」，是没有任何出口。**
+
+**为什么当时没修：** 计划明写「**FR-C-13 的 15s 超时走的是这里，不是
+`TimeoutException`**」（计划 1629 行），且提前警告：谁要给 `SSHClient` 设
+`handshakeTimeout`，超时会变成 `SSHHandshakeError('Handshake timed out')` → 落进
+`is SSHHandshakeError` 那一支 → 报成 `protocolError`，**把方向指到算法上去**
+（计划 1546—1549 行）。也就是说「拨号之外也设超时」必须先给 Task 3 那个**已冻结、
+字节校验过**的分类器补一支 —— 修它会解冻 Task 3 并要重跑它那张 24 行的变异表。
+这个代价不该在 Task 4 的收尾里顺手付掉。
+
+**推荐的修法（便宜且不动 Task 3）：** 在 `SshSession` 这一层给拨号之后的阶段包一个
+`.timeout(connectTimeout)`，让超时以 `TimeoutException` 抛出 —— 而
+`TimeoutException` → `timeout` 这一支在 Task 3 里**早就写好、也测过了**
+（`_timeoutMessage`）。顺带说明：Task 3 那条注释把 `TimeoutException` 这一支称作
+「防御性的、今天不可达」—— 一旦这样修，它就有了第一个真实调用方，**那条注释要
+一起订正**（注释改动不影响任何用例，但按「实现一改就重跑整表」的规矩仍应重跑一遍
+确认）。
+
+**替代方案（不推荐）：** 设 dartssh2 的 `handshakeTimeout`。它会把超时错误塞进
+`protocolError` 方向，且同样要动 Task 3。
+
+#### 2. `TelnetSession.connect()` 没有入口守卫（与 `SshSession` 行为不一致）
+
+`SshSession` 现在有一个**拨号之前**的入口守卫（`if (_closed) return;`），所以
+「已经 close 过的会话再去 connect」不会碰网络（Task 4 有对应用例，断言
+`connector.openCount == 0`）。
+
+`TelnetSession.connect()`（`telnet_session.dart:41`）**先拨号，再判 `_closed`**：
+守卫在 `connector.open(...)` **之后**。同一个情形下 Telnet 会真的去连设备，拿到
+连接再关掉。两种会话对同一件事有两种行为，而这条差异没有用例钉住。
+
+**修法：** 给 `TelnetSession` 补上同样的入口守卫（把 `if (_closed) return;` 提到
+`connector.open` 之前），并补一条与 `SshSession` 对称的用例。属于计划 3 或计划 5
+的顺手项。
+
+#### 3. 主机密钥回调体：已直接覆盖；`HostKeyPolicy` 抽取仍可选
+
+Task 4 收尾时把回调体（find → 比对 → 询问 → 落库）用五条用例直接钉住了，接线也由
+两条直接断言守着（构造点 + `connect()` 自己的传参路径），所以**「这个安全控制没有
+任何见证」这个洞已经堵上**：把 `onVerifyHostKey` 改成 `null` 现在会让 7 条用例变红，
+而在修之前，同样的改动**整套用例全绿**。
+
+评审建议的进一步抽取（把回调体提成独立的 `HostKeyPolicy`，`_buildHostKeyCallback`
+退化成两行适配）**没有做**：现在没有哪条性质因为没抽取而失去约束。它的价值在可读性
+与「让 `SshSession` 少两个 `@visibleForTesting` 成员」。**V1.1 候选**，不阻塞任何任务。
+
+#### 4. `Session` 契约没有写「`connect()` 抛了之后仍需 `close()`」（文档缺口）
+
+`session.dart` 的 `close()` 文档只说了「关闭会话」。但 `connect()` 中途失败
+（例如 `client.shell()` 抛）会留下一个**还活着的**传输层与 socket，它们只被会话对象
+引用着；这些资源之所以最终会被释放，**只是**因为 Task 6 的 `_teardownSession`
+无条件调用 `session.close()`。
+
+**这是一条隐性的依赖，不是设计。** 修法两选一：在 `Session.close()` 的文档里写明
+这个义务，或者让 `connect()` 在自己的失败路径里就地清理。建议前者（改动最小，且对
+Telnet 同样成立）。属于计划 3 或计划 5 的顺手项。
+
+#### 已经如实披露、不打算在 Task 4 关闭的一条
+
+`SshSession` 的输出流订阅（`.listen(..., onError: _onError, ...)`）**没有任何用例钉住
+接线本身**：把 `onError: _onError` 整个从 `.listen` 上去掉，Task 4 的 24 条用例
+**全绿**（实测）。用例覆盖的是 `_onError` 的**函数体**（经 `debugReportOutputError`
+那个缝），不是「它被接上了」。关闭它需要一个能真正报错的 stdout 流，而那要先握手成功
+—— 即 Task 7 的真 `sshd`，本 Task 明令禁止造假服务端。计划 Task 4 的「覆盖不到的
+部分」一节已按实测如实写明，**别把「已披露」读成「已覆盖」**。
