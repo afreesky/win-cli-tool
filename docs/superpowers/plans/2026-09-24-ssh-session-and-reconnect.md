@@ -57,23 +57,34 @@
 
 理由：设备的会话对象在重连时会被整个替换，而 `ConnectionManager` 是唯一知道「什么时候换了」的角色。若界面直接持有 `Session.output`，重连的语义就必须由每个订阅点各自重新实现一遍。
 
+**落到类型上**：`SessionReady` 携带的是本次会话的 `CommandDispatcher`，**不是** `Session`。每次重连都会新建一个 dispatcher，界面正是在收到 `SessionReady` 时重新订阅 `dispatcher.events`（命令输出与 `QueueDropped` 都从那里来）—— 把交付点与"该重新订阅了"这件事绑在一起，界面就没有任何理由去碰 `Session`。若这里给的是 `Session`，界面很自然会写出 `event.session.output.listen(...)`，正好落进本节要避免的那个坑；而且它真正需要的 dispatcher 只能从 `mgr.dispatcher` 这个拆除后就变 `null` 的 getter 上取，等于把一条没说出口的时序约定藏起来。
+
+输出（`ConnectionManager.output`）与状态（`state`）在构造时拿到，全程只订阅一次；`events` 与每个会话的 `dispatcher.events` 是仅有的两处订阅。
+
 - [ ] **Step 1: 创建 `lib/connection/connection_manager.dart`，只放状态枚举与事件类型**
 
 ```dart
+import '../command/command_dispatcher.dart';
 import 'connection_failure.dart';
-import 'session.dart';
 
 /// 一台设备的连接状态。与 spec §5.4 的按钮颜色一一对应。
 ///
 /// 颜色映射（供计划 5 使用）：disconnected→灰、connecting→黄、
 /// connected→绿、reconnecting→黄、failed→红。
 enum DeviceConnectionState {
+  /// 未连接。与 [connecting]/[reconnecting] 同为"没有连接"，
+  /// 但颜色不同：这两个是黄，本状态是灰。
   disconnected,
   connecting,
   connected,
+
+  /// 重连中。与 [connecting] **颜色相同**（都是黄），区别只在输出区文案。
   reconnecting,
 
-  /// 连接失败且不再自动重试（用户主动断开，或重连被关闭）。
+  /// 连接失败且**不再自动重试**（`autoReconnect` 为 false 时）。
+  ///
+  /// 注意：用户主动断开**不是**这个状态 —— §5.4 要求那种情况按钮变灰，
+  /// 也就是 [disconnected]。
   failed;
 
   /// 该状态下设备按钮是否应显示为"有连接"。重连中算"没有连接"——
@@ -81,26 +92,38 @@ enum DeviceConnectionState {
   bool get isLive => this == DeviceConnectionState.connected;
 }
 
+/// [ConnectionManager] 对外发出的事件。每台设备一个 manager，各自一条流。
+///
+/// 声明为 `sealed`：界面（计划 5）对它的 switch 会被编译器要求穷尽，
+/// 将来新增一种事件会成为**编译错误**，而不是某个分支悄悄不渲染。
 sealed class ConnectionEvent {
   const ConnectionEvent();
 }
 
 /// 状态迁移。界面据此更新按钮颜色与输出区提示。
-class ConnectionStateChanged extends ConnectionEvent {
+final class ConnectionStateChanged extends ConnectionEvent {
   const ConnectionStateChanged(this.state);
 
   final DeviceConnectionState state;
 }
 
 /// 会话已就绪（首次连接或重连成功），可以下发命令了。
-class SessionReady extends ConnectionEvent {
-  const SessionReady(this.session);
+///
+/// 携带的是本次会话的 [CommandDispatcher]：每次重连都会**新建**一个，
+/// 所以界面必须在这里重新订阅 `dispatcher.events`（命令输出与
+/// [QueueDropped] 都从那里来）。
+///
+/// **界面不得订阅 `Session.output`** —— 会话对象在重连时会被整个替换，
+/// 直接订阅它会让输出区在第一次断线后永久静止而按钮是绿的。
+/// 输出请订阅 `ConnectionManager.output`。
+final class SessionReady extends ConnectionEvent {
+  const SessionReady(this.dispatcher);
 
-  final Session session;
+  final CommandDispatcher dispatcher;
 }
 
 /// 即将在 [delay] 之后发起第 [attempt] 次重连（从 1 开始）。
-class ReconnectScheduled extends ConnectionEvent {
+final class ReconnectScheduled extends ConnectionEvent {
   const ReconnectScheduled(this.attempt, this.delay);
 
   final int attempt;
@@ -108,32 +131,54 @@ class ReconnectScheduled extends ConnectionEvent {
 }
 
 /// 重连成功。FR-C-09 要求输出区插入醒目分隔标记，[downtime] 即断线时长。
-class Reconnected extends ConnectionEvent {
+final class Reconnected extends ConnectionEvent {
   const Reconnected(this.downtime, this.attempt);
 
+  /// 从断开到重连成功经过的时长（FR-C-09 的标记要显示它）。
   final Duration downtime;
+
+  /// 是第几次重连尝试成功的（从 1 开始）。
+  ///
+  /// 计数在**连接成功**时归零，所以它只统计本次断线期间的重试次数。
+  /// 首次就连接成功不发本事件（attempt 恒 > 0）。
   final int attempt;
 }
 
 /// 连接失败。[failure] 携带可读原因（FR-C-06）。
-class ConnectionFailed extends ConnectionEvent {
+final class ConnectionFailed extends ConnectionEvent {
   const ConnectionFailed(this.failure);
 
   final ConnectionFailure failure;
 }
 
-/// 会话断开。未发出的命令已被丢弃（FR-C-10）。
-class SessionLost extends ConnectionEvent {
+/// 会话断开。
+///
+/// 被丢弃的命令数**不在**这里 —— 它在 [CommandDispatcher] 的 [QueueDropped]
+/// 上（那是计划 1 已有的契约，界面直接订阅 `dispatcher.events` 取用）。
+/// 一次断线只发**一个**本事件。
+final class SessionLost extends ConnectionEvent {
   const SessionLost(this.failure);
-    
+
+  /// null 表示对端正常结束，或本次断开没有可分类的错误 ——
+  /// 界面需要自备兜底文案。
   final ConnectionFailure? failure;
 }
+
 ```
 
 - [ ] **Step 2: 运行分析器确认无错**
 
 Run: `dart analyze lib/connection/connection_manager.dart`
-Expected: 只有 `connection_failure.dart` 尚不存在导致的 import 错误 —— 这是预期的，Task 3 会创建它。若报其他错误（尤其是"未使用的 import"）则修正。
+Expected: **3 条**错误，全部来自 `connection_failure.dart` 尚未创建（Task 3 才建它）：
+`uri_does_not_exist` 一条，加上 `ConnectionFailure` 的两处 `undefined_class`（`ConnectionFailed` 与 `SessionLost` 的字段类型）。
+
+```
+error - connection_manager.dart:2:8 - Target of URI doesn't exist: 'connection_failure.dart'. - uri_does_not_exist
+error - connection_manager.dart:85:9 - Undefined class 'ConnectionFailure'. - undefined_class
+error - connection_manager.dart:98:9 - Undefined class 'ConnectionFailure'. - undefined_class
+```
+
+**不得出现 `unused_import`** —— 若出现，说明 `command_dispatcher.dart` 没被用到（`SessionReady` 的载荷就是它）。
 
 - [ ] **Step 3: 提交**
 
@@ -1434,11 +1479,12 @@ git commit -m "feat: SessionFactory —— 按协议构造会话，唯一的协�
 
 **拆除（teardown）相关断言一律用真实 `async`，不要用 `fakeAsync`：** `fake_async` 推不动完整的拆除链 —— `cancel()` / `close()` 的 future 在 fake zone 下不会完成，`await` 停在里面，`session.close()` 根本执行不到，断言于是**假失败**（实测：同一段代码真实 async 下 `closed == true`，fakeAsync 下恒为 `false`，且 `pendingTimers` 与 `microtaskCount` 都是 0，无处可推）。拆除本身不涉及计时，真实 async 更直接也更强。`fakeAsync` 只用在**需要控制时间**的用例上（退避序列、封顶、`downtime`）。
 
-**本类的三个所有权/健壮性要点（都是预演中改出来的，不要改回去）：**
+**本类的四个所有权/健壮性要点（都是预演中改出来的，不要改回去）：**
 
-1. **`_dispatcherSub` 必须被保存并取消。** 订阅别人的广播流却不接住返回的订阅对象，等于把生命周期交给运气。
+1. **失败分支也必须认 `_userClosed`。** `_attemptConnect` 的 catch 与 `_scheduleRetry` 都要在 `_userClosed` 时早退：用户在 `session.connect()` 返回前点"断开"，`disconnect()` 关掉 socket 会让在途的 connect 抛错，走进 catch。不早退就会发出一个**假告警**（这次失败是我们自己造成的），并把状态刷成 `failed` —— 按钮从灰变红，而 spec §5.4 要求用户主动断开后是**灰**的。真正该变红的只有 `!autoReconnect` 一种情形，两者不要合并判断。
 2. **`_teardownSession()` 在任何 `await` 之前先把所有字段取走并置空。** 否则慢的那次拆除会在 `await` 之后把**新会话**的 `_outputSub` / `_dispatcher` 置空 —— 重连与拆除交叠时必然发生。
-3. **`_teardownSession()` 不 `await dispatcher.dispose()`。** 它是广播 `StreamController`，`close()` 的 future 要等订阅者全部摘干净才完成，而订阅者不止我们（界面会直接订阅 `dispatcher.events`）。把 `session.close()` 挂在它后面，就等于让 FR-C-12 依赖一个我们控制不了的 future。`dispose()` 的同步部分（`_disposed = true`、清空队列）立即生效，所以 fire-and-forget 不会再发出任何命令。同理，建连失败分支里也是 `unawaited(_teardownSession())` —— 拆除是清理，不能挡住重连排程。
+3. **不要给 `dispatcher.events` 挂转发订阅。** 曾经有过一个：收到 `QueueDropped` 就 `_events.add(SessionLost(null))`。它**永不触发** —— `CommandDispatcher._events` 是异步广播 controller，`QueueDropped` 要等一个 microtask，而 `_teardownSession()` 在同一个同步块里就把它取消了（实测：原样放回去测试仍然全绿）。而且它想达成的效果本来就重复：丢弃数由 `QueueDropped` 承载，界面直接订阅 `dispatcher.events` 取用（spec §13.12-2）。所以本类**不订阅** dispatcher 的任何事件，`_dispatcher` 只用来调 `onOutput` / `onDisconnected` / `dispose`。
+4. **`_teardownSession()` 不 `await dispatcher.dispose()`。** 它是广播 `StreamController`，`close()` 的 future 要等订阅者全部摘干净才完成，而订阅者不止我们（界面会直接订阅 `dispatcher.events`）。把 `session.close()` 挂在它后面，就等于让 FR-C-12 依赖一个我们控制不了的 future。`dispose()` 的同步部分（`_disposed = true`、清空队列）立即生效，所以 fire-and-forget 不会再发出任何命令。同理，建连失败分支里也是 `unawaited(_teardownSession())` —— 拆除是清理，不能挡住重连排程。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -1448,6 +1494,7 @@ import 'dart:async';
 import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:win_cli_tool/command/command_dispatcher.dart';
+import 'package:win_cli_tool/connection/connection_failure.dart';
 import 'package:win_cli_tool/connection/connection_manager.dart';
 import 'package:win_cli_tool/connection/known_host.dart';
 import 'package:win_cli_tool/connection/session.dart';
@@ -1464,10 +1511,15 @@ class _ConnectFailed implements Exception {
 
 /// 可控的假会话。
 class _FakeSession implements Session {
-  _FakeSession(this.profile, {this.failConnect = false});
+  _FakeSession(this.profile, {this.failConnect = false, this.gate = false});
 
   final DeviceProfile profile;
   final bool failConnect;
+
+  /// 为 true 时 connect() 会挂在握手中途，直到 close() 把它打断 ——
+  /// 用来复现"建连尚未返回时用户就点了断开"。
+  final bool gate;
+  Completer<void>? _gate;
   final _output = StreamController<String>.broadcast();
   final _done = Completer<void>();
   final written = <String>[];
@@ -1483,6 +1535,10 @@ class _FakeSession implements Session {
   @override
   Future<void> connect() async {
     connectCalls++;
+    if (gate) {
+      _gate = Completer<void>();
+      await _gate!.future;
+    }
     if (failConnect) throw const _ConnectFailed();
   }
 
@@ -1493,6 +1549,8 @@ class _FakeSession implements Session {
   Future<void> close() async {
     if (closed) return;
     closed = true;
+    // 真实会话里 socket 在握手途中被关掉，connect() 必然抛错 —— 复现它。
+    if (!(_gate?.isCompleted ?? true)) _gate!.complete();
     unawaited(_output.close());
   }
 
@@ -1507,19 +1565,22 @@ class _FakeSession implements Session {
 }
 
 class _FakeFactory implements SessionFactory {
-  _FakeFactory(this.sessions, {this.failConnect = false});
+  _FakeFactory(this.sessions, {this.failConnect = false, this.gate = false});
 
   final List<_FakeSession> sessions;
 
   /// 可中途翻转：测试"先失败若干次、再连上"的场景。
   bool failConnect;
 
+  /// 透传给每个 _FakeSession。
+  final bool gate;
+
   var created = 0;
 
   @override
   Session create(DeviceProfile profile) {
     created++;
-    final s = _FakeSession(profile, failConnect: failConnect);
+    final s = _FakeSession(profile, failConnect: failConnect, gate: gate);
     sessions.add(s);
     return s;
   }
@@ -1807,6 +1868,73 @@ void main() {
     });
   });
 
+  test('建连途中用户主动断开：不得报失败，也不得转红（FR-C-05 / §5.4）', () async {
+    // 真实 async：这条要等 close() 把在途的 connect() 打回来才会走完。
+    final sessions = <_FakeSession>[];
+    final mgr = ConnectionManager(
+      profile: _profile(),
+      factory: _FakeFactory(sessions, failConnect: true, gate: true),
+    );
+
+    final failures = <ConnectionFailure>[];
+    mgr.events.listen((e) {
+      if (e is ConnectionFailed) failures.add(e.failure);
+    });
+
+    final connecting = mgr.connect(); // 挂在握手中途，还没返回
+    await Future<void>.delayed(Duration.zero);
+    expect(mgr.state, DeviceConnectionState.connecting);
+
+    // 用户此刻点了"断开"。拆除会关掉 socket，于是在途的 connect() 抛错。
+    await mgr.disconnect();
+    await connecting;
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+
+    // §5.4：用户主动断开 → 停止重连，按钮变灰。不是红。
+    expect(mgr.state, DeviceConnectionState.disconnected,
+        reason: '§5.4：主动断开后按钮变灰，而不是红');
+    // 这次失败是我们自己关 socket 造成的，报给用户就是假告警。
+    expect(failures, isEmpty,
+        reason: '自己造成的失败不得报给用户');
+    expect(sessions.length, 1, reason: '不得因这次失败再重连');
+  });
+
+  test('一次断线只发一个 SessionLost，丢弃数由 QueueDropped 承载（FR-C-10）', () {
+    fakeAsync((async) {
+      final sessions = <_FakeSession>[];
+      final mgr = ConnectionManager(
+        profile: _profile(),
+        factory: _FakeFactory(sessions),
+      );
+
+      mgr.connect();
+      async.flushMicrotasks();
+
+      final lost = <SessionLost>[];
+      mgr.events.listen((e) {
+        if (e is SessionLost) lost.add(e);
+      });
+      final dropped = <int>[];
+      mgr.dispatcher!.events.listen((e) {
+        if (e is QueueDropped) dropped.add(e.count);
+      });
+
+      // 'enable' 已写出、在途；这条排在它后面等着。
+      mgr.dispatcher!.enqueue(['show version']);
+
+      sessions[0].drop();
+      async.flushMicrotasks();
+
+      // 界面按 SessionLost 在输出区插标记，发两次就是两个标记。
+      expect(lost.length, 1, reason: '一次断线只应发一个 SessionLost');
+      // 丢弃数以 QueueDropped 为准（1 条排队 + 1 条在途）。
+      expect(dropped, [2], reason: '丢弃数由 QueueDropped 承载');
+
+      mgr.dispose();
+      async.flushMicrotasks();
+    });
+  });
+
   test('dispose() 关闭会话，且不向设备发送任何命令（FR-C-12）', () async {
     // 这条**不用 fakeAsync**：fake_async 推不动完整的拆除链
     // （cancel/close 的 future 在 fake zone 下不会完成），断言会假失败。
@@ -1861,12 +1989,19 @@ import 'session_factory.dart';
 /// 颜色映射（供计划 5 使用）：disconnected→灰、connecting→黄、
 /// connected→绿、reconnecting→黄、failed→红。
 enum DeviceConnectionState {
+  /// 未连接。与 [connecting]/[reconnecting] 同为"没有连接"，
+  /// 但颜色不同：这两个是黄，本状态是灰。
   disconnected,
   connecting,
   connected,
+
+  /// 重连中。与 [connecting] **颜色相同**（都是黄），区别只在输出区文案。
   reconnecting,
 
-  /// 连接失败且不再自动重试（用户主动断开，或重连被关闭）。
+  /// 连接失败且**不再自动重试**（`autoReconnect` 为 false 时）。
+  ///
+  /// 注意：用户主动断开**不是**这个状态 —— §5.4 要求那种情况按钮变灰，
+  /// 也就是 [disconnected]。
   failed;
 
   /// 该状态下设备按钮是否应显示为"有连接"。重连中算"没有连接"——
@@ -1874,26 +2009,38 @@ enum DeviceConnectionState {
   bool get isLive => this == DeviceConnectionState.connected;
 }
 
+/// [ConnectionManager] 对外发出的事件。每台设备一个 manager，各自一条流。
+///
+/// 声明为 `sealed`：界面（计划 5）对它的 switch 会被编译器要求穷尽，
+/// 将来新增一种事件会成为**编译错误**，而不是某个分支悄悄不渲染。
 sealed class ConnectionEvent {
   const ConnectionEvent();
 }
 
 /// 状态迁移。界面据此更新按钮颜色与输出区提示。
-class ConnectionStateChanged extends ConnectionEvent {
+final class ConnectionStateChanged extends ConnectionEvent {
   const ConnectionStateChanged(this.state);
 
   final DeviceConnectionState state;
 }
 
 /// 会话已就绪（首次连接或重连成功），可以下发命令了。
-class SessionReady extends ConnectionEvent {
-  const SessionReady(this.session);
+///
+/// 携带的是本次会话的 [CommandDispatcher]：每次重连都会**新建**一个，
+/// 所以界面必须在这里重新订阅 `dispatcher.events`（命令输出与
+/// [QueueDropped] 都从那里来）。
+///
+/// **界面不得订阅 `Session.output`** —— 会话对象在重连时会被整个替换，
+/// 直接订阅它会让输出区在第一次断线后永久静止而按钮是绿的。
+/// 输出请订阅 `ConnectionManager.output`。
+final class SessionReady extends ConnectionEvent {
+  const SessionReady(this.dispatcher);
 
-  final Session session;
+  final CommandDispatcher dispatcher;
 }
 
 /// 即将在 [delay] 之后发起第 [attempt] 次重连（从 1 开始）。
-class ReconnectScheduled extends ConnectionEvent {
+final class ReconnectScheduled extends ConnectionEvent {
   const ReconnectScheduled(this.attempt, this.delay);
 
   final int attempt;
@@ -1901,24 +2048,36 @@ class ReconnectScheduled extends ConnectionEvent {
 }
 
 /// 重连成功。FR-C-09 要求输出区插入醒目分隔标记，[downtime] 即断线时长。
-class Reconnected extends ConnectionEvent {
+final class Reconnected extends ConnectionEvent {
   const Reconnected(this.downtime, this.attempt);
 
+  /// 从断开到重连成功经过的时长（FR-C-09 的标记要显示它）。
   final Duration downtime;
+
+  /// 是第几次重连尝试成功的（从 1 开始）。
+  ///
+  /// 计数在**连接成功**时归零，所以它只统计本次断线期间的重试次数。
+  /// 首次就连接成功不发本事件（attempt 恒 > 0）。
   final int attempt;
 }
 
 /// 连接失败。[failure] 携带可读原因（FR-C-06）。
-class ConnectionFailed extends ConnectionEvent {
+final class ConnectionFailed extends ConnectionEvent {
   const ConnectionFailed(this.failure);
 
   final ConnectionFailure failure;
 }
 
-/// 会话断开。未发出的命令已被丢弃（FR-C-10）。
-class SessionLost extends ConnectionEvent {
+/// 会话断开。
+///
+/// 被丢弃的命令数**不在**这里 —— 它在 [CommandDispatcher] 的 [QueueDropped]
+/// 上（那是计划 1 已有的契约，界面直接订阅 `dispatcher.events` 取用）。
+/// 一次断线只发**一个**本事件。
+final class SessionLost extends ConnectionEvent {
   const SessionLost(this.failure);
-    
+
+  /// null 表示对端正常结束，或本次断开没有可分类的错误 ——
+  /// 界面需要自备兜底文案。
   final ConnectionFailure? failure;
 }
 
@@ -1961,7 +2120,6 @@ class ConnectionManager {
   Session? _session;
   CommandDispatcher? _dispatcher;
   StreamSubscription<String>? _outputSub;
-  StreamSubscription<DispatchEvent>? _dispatcherSub;
   Timer? _retryTimer;
   var _state = DeviceConnectionState.disconnected;
   var _attempt = 0;
@@ -2010,6 +2168,9 @@ class ConnectionManager {
       // await 之前同步清空 _session/_outputSub 等状态，所以 fire-and-forget
       // 不会与随后的重连串到一起去。
       unawaited(_teardownSession());
+      // 用户已断开或应用已退出：这次失败是我们自己关掉 socket 造成的。
+      // 报给用户就是假告警，改状态则会让按钮从灰变红（§5.4 要求是灰的）。
+      if (_disposed || _userClosed) return;
       if (!_events.isClosed) {
         _events.add(ConnectionFailed(classifyConnectionFailure(e)));
       }
@@ -2037,14 +2198,6 @@ class ConnectionManager {
       morePager: morePager ?? MorePager(),
       lineEnding: profile.lineEnding,
     );
-    _dispatcherSub = _dispatcher!.events.listen((e) {
-      // 命令队列的事件由界面直接消费 dispatcher.events；
-      // 这里只订阅以便队列在断线时被正确清空。
-      if (e is QueueDropped && !_events.isClosed) {
-        _events.add(SessionLost(null));
-      }
-    });
-
     session.done.then((_) => _onSessionDone(), onError: (Object e, StackTrace _) {
       _onSessionDone(e);
     });
@@ -2056,7 +2209,7 @@ class ConnectionManager {
       final downtime = clock.now().difference(_disconnectedAt);
       if (!_events.isClosed) _events.add(Reconnected(downtime, _attempt));
     }
-    if (!_events.isClosed) _events.add(SessionReady(session));
+    if (!_events.isClosed) _events.add(SessionReady(_dispatcher!));
 
     // 退避计数在**连接成功**时归零：FR-C-07 的 1→2→4→… 描述的是
     // "一直连不上时等多久"，不是"这台设备历史上断过几次"。一台能连上、
@@ -2087,7 +2240,11 @@ class ConnectionManager {
   }
 
   void _scheduleRetry() {
-    if (_disposed || _userClosed || !autoReconnect) {
+    // 用户主动断开或应用退出：状态已由 disconnect()/dispose() 定好，
+    // 这里再改一次就会把按钮从灰刷成红（§5.4 要求灰色）。
+    if (_disposed || _userClosed) return;
+
+    if (!autoReconnect) {
       _setState(DeviceConnectionState.failed);
       return;
     }
@@ -2141,15 +2298,11 @@ class ConnectionManager {
   Future<void> _teardownSession() async {
     final session = _session;
     final outputSub = _outputSub;
-    final dispatcherSub = _dispatcherSub;
     final dispatcher = _dispatcher;
     _session = null;
     _outputSub = null;
-    _dispatcherSub = null;
     _dispatcher = null;
 
-    // 我们自己挂的订阅，先摘掉。
-    unawaited(dispatcherSub?.cancel() ?? Future<void>.value());
     await outputSub?.cancel();
 
     // 不 await dispatcher.dispose()：它是广播 StreamController，close() 的
@@ -2172,9 +2325,9 @@ class ConnectionManager {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `flutter test test/connection/connection_manager_test.dart`
-Expected: 9 个用例全部 PASS
+Expected: 11 个用例全部 PASS
 
-- [ ] **Step 5: 反证六个承载行为的非空性（逐个做，每个都要看到红）**
+- [ ] **Step 5: 反证八个承载行为的非空性（逐个做，每个都要看到红）**
 
 计划 1 的教训是"全绿"不等于"被约束"。下表每一条都是把缺陷**放回去**，确认对应测试确实变红；不变红就说明那条测试是空的。每改一条立刻恢复，最后 `git diff` 确认工作区干净再提交。
 
@@ -2186,8 +2339,14 @@ Expected: 9 个用例全部 PASS
 | M4 | `_teardownSession` 里删掉 `await session.close();` | dispose() 关闭会话（FR-C-12） |
 | M5 | `_onSessionDone` 里删掉 `_dispatcher?.onDisconnected();` | 断线时未发出的命令被丢弃（FR-C-10） |
 | M6 | `onDisconnected` 里 `_queue.length + (_current != null ? 1 : 0)` 改成只算 `_queue.length` | 同上（丢弃数漏算在途的那条） |
+| M7 | `_attemptConnect` 的 catch 里去掉 `if (_disposed \|\| _userClosed) return;`，并把 `_scheduleRetry` 的 `_userClosed` 早退合并回「置 failed」 | 建连途中用户主动断开：不得报失败，也不得转红 |
+| M8 | `_onSessionDone` 里再补一句 `_events.add(SessionLost(null));` | 一次断线只发一个 SessionLost |
 
-已实测：M1–M6 全部变红。
+已实测：M1–M8 全部变红。
+
+**M7（代码评审查出来的真缺陷）**：catch 分支原来只认 `_disposed`，成功分支却认 `_disposed || _userClosed` —— 这个不对称就是漏洞。用户在 `session.connect()` 还没返回时点"断开"，`disconnect()` 会关掉 socket 让在途的 connect 抛错，于是走进 catch：既发了一个**假告警**（这次失败是我们自己造成的），又经 `_scheduleRetry()` 把状态刷成 `failed` —— 按钮从灰变红。spec §5.4 写得很清楚：用户主动断开，**按钮变灰**。修法是 catch 与 `_scheduleRetry` 都认 `_userClosed`，并且把 `!autoReconnect`（真正该变红的唯一情形）与 `_userClosed` 分开处理。
+
+**关于 M8 附近的一条被证伪的推断，记录在案**：代码评审曾判断 `_attemptConnect` 里那个 `_dispatcherSub` 转发订阅会导致**一次断线发两个 `SessionLost`**（一次来自 `_onSessionDone`，一次来自 `QueueDropped` 的转发）。实测**不成立** —— 把那段代码原样放回去（M7 形态），`一次断线只发一个 SessionLost` 仍然全绿。原因是 `CommandDispatcher._events` 是**异步**广播 controller（`command_dispatcher.dart:100`，没有 `sync: true`），`onDisconnected()` 投递的 `QueueDropped` 要等一个 microtask 才到，而 `_teardownSession()` 在**同一个同步块**里就把 `_dispatcherSub` 取消了 —— 转发监听器永远收不到那条事件。也就是说那段转发是**永不触发的死代码**，不是重复发送。结论仍然是删掉它，理由换成了"它达不到注释宣称的效果"，与"丢弃数由 `QueueDropped` 承载（界面直接订阅 `dispatcher.events`）"一致。**不要**再据"广播 close/取消的顺序"去推断类似问题，先测。
 
 **M5/M6 值得特别说明**：只断言"重连后没有重放"是**假测试** —— 重连会新建一个 `CommandDispatcher`，旧队列在结构上就不可能被重放，去掉 `onDisconnected()` 它照样绿。FR-C-10 真正可观测的是**告警**（"输出区给出告警"），所以测试断言的是 `QueueDropped` 事件的**条数**：3 条排队的 + 1 条在途的 = 4。
 

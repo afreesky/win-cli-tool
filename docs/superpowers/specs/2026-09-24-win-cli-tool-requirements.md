@@ -957,3 +957,27 @@ Foo copyWith({Object? bar = _unset}) => Foo(
    `fake_async` 推进的是 `clock`；`DateTime.now()` 走真实时间。用后者的话，测试里 `elapse(1s)` 之后算出来的时长恒为 0 秒，FR-C-09 的「断线时长」永远断言不了（实测：`fakeAsync` 里 `elapse(7s)` 后 `clock.now()` 恰好前进 7s）。
 
    `clock` 通常已在传递依赖里，但**必须**在 `pubspec.yaml` 里显式声明为直接依赖才能 `import`。
+
+### 13.17 `ConnectionManager` 的两处实测结论（计划 2 执行期）
+
+1. **用户主动断开时，状态必须是 `disconnected`（灰），不是 `failed`（红）—— 而 `_userClosed` 必须同时守住失败分支。**
+
+   §5.4 的表格写的是「用户主动断开 → 停止重连，按钮变灰」。但只把 `disconnect()` 里的状态设对是不够的：用户在 `session.connect()` **还没返回**时点"断开"，`disconnect()` 会关掉 socket，于是那个在途的 connect **抛错**并走进 `_attemptConnect` 的 catch 分支。
+
+   若 catch 只判断 `_disposed`（而成功分支判断的是 `_disposed || _userClosed` —— 这个不对称就是漏洞本身），后果有两层：
+   - 发出一条**假告警**：这次失败是我们自己关 socket 造成的，设备没有任何问题；
+   - 经 `_scheduleRetry()` 把状态刷成 `failed`，按钮**从灰变红**。
+
+   实测证据（修复前）：`Expected: DeviceConnectionState.disconnected, Actual: DeviceConnectionState.failed`。
+
+   **约束：`_attemptConnect` 的 catch 与 `_scheduleRetry` 都要在 `_userClosed` 时早退；`failed` 只留给 `!autoReconnect` 这一种情形，两者不可合并判断。**
+
+2. **`CommandDispatcher.events` 是异步广播流，因此「转发订阅」是死代码 —— 一个看似成立的重复发送推断被证伪。**
+
+   代码评审曾判断 `ConnectionManager` 里那个 `_dispatcherSub` 转发订阅（收到 `QueueDropped` 就 `_events.add(SessionLost(null))`）会导致**一次断线发出两个 `SessionLost`**：一个来自 `_onSessionDone`，一个来自转发。**实测不成立** —— 把那段代码原样放回去，断言 `lost.length == 1` 的测试**仍然全绿**。
+
+   原因：`CommandDispatcher._events` 是 `StreamController.broadcast()`（**没有** `sync: true`，见 `command_dispatcher.dart:100`），`onDisconnected()` 投递的 `QueueDropped` 要等一个 microtask 才送达；而 `_onSessionDone` 在下一行就调用 `_teardownSession()`，后者在**同一个同步块**内取消 `_dispatcherSub`。转发监听器永远等不到那条事件。
+
+   所以那段转发**从未触发过**，是死代码，而不是重复发送。删除它的理由因此是"它达不到注释宣称的效果"，不是"它会重复发送"。
+
+   **约束：丢弃数（FR-C-10 的告警）由 `QueueDropped` 承载，界面直接订阅 `dispatcher.events` 取用（§13.12-2），`ConnectionManager` 不转发命令队列的任何事件。** 另：**不要**再依据"广播流的 close/取消顺序"推断同类问题 —— 先测。这一节的第 2 条与 §13.16 的第 2 条是同一类教训。
