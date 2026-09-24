@@ -1596,7 +1596,7 @@ Expected: 25 个用例全部 PASS
 | 5 | 把算法那条消息整段换成上面同一句 | 「算法协商失败的文案指向算法，同样不指向口令」 |
 | 6 | 删掉 `SocketException` 分支里的 errno 判定整块 | 「Socket.connect 到点（errno 110）→ timeout，不是 unreachable」与「Windows 的 WSAETIMEDOUT（10060）同样归 timeout」 |
 | 7 | 把 errno 判定改成只认 `_etimedoutPosix` | 「Windows 的 WSAETIMEDOUT（10060）同样归 timeout」 |
-| 8 | 删掉 `if (error is SSHKeyDecodeError)` **整支** | 「私钥读不出来 → 指向私钥本身，不要说成协议错误」 |
+| 8 | 把 `if (error is SSHKeyDecryptError)` 那一支**挪到** `if (error is SSHKeyDecodeError)` **之后**（子类排到父类后面） | 「带口令的私钥 → 指向"去掉口令"，不要说成协议错误」 |
 | 9 | 把 `error.osError?.message ?? error.message` 改成 `error.message` | 「不可达的文案保留操作系统给的原文」 |
 | 10 | 把 `authFailed` 那条消息整段换成主机密钥那一句 | 「认证失败的文案指向口令/密钥，不指向指纹」 |
 | 11 | 把「每种 kind 都有非空的中文说明」清单里的 `hostKey` 一项删掉 | 同一条（`ConnectionFailureKind.values` 那条断言必须挡住） |

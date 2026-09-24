@@ -81,6 +81,23 @@ const int _etimedoutWindows = 10060;
 /// 主机密钥被拒与算法协商失败抛出的异常类型与 toString 完全相同
 /// （spec §13.15），只有 reason 不同。
 ConnectionFailure classifyConnectionFailure(Object error, {JumpHop? hop}) {
+  // **幂等。** 调用点可能比分类器更清楚上下文（例如 `SshSession` 读私钥
+  // 文件时，它知道失败发生在"加载私钥"，而分类器只拿到一个裸
+  // `FileSystemException`，无从判断）。那就允许它直接构造好
+  // [ConnectionFailure] 再抛出来，这里原样返回 —— 不再包一层。
+  // 少了这一支，那个对象会掉进 `unknown`，变成
+  // 「连接失败：ConnectionFailure(authFailed): 无法读取私钥…」，
+  // 用户看到两层面具，而且第一层是英文。
+  if (error is ConnectionFailure) {
+    if (hop == null) return error;
+    // 跳板机的失败发生在哪一跳，仍然优先于内层原因（FR-J-05）。
+    return ConnectionFailure(
+      ConnectionFailureKind.jumpHostFailed,
+      '第 ${hop.index} 跳 ${hop.name} 失败：${error.message}',
+      cause: error,
+    );
+  }
+
   final inner = _classify(error);
 
   // 跳板机上下文优先：无论内层是什么原因，只要失败发生在某一跳上，
@@ -197,15 +214,27 @@ ConnectionFailure _classify(Object error) {
     );
   }
 
-  if (error is SSHKeyDecodeError) {
-    // 私钥读不出来。**必须排在 `is SSHError` 之前** —— 排到后面会被它吞掉，
-    // 报成"协议错误"并附上 `SSHKeyDecryptError(Private key is encrypted,
-    // null)`：一个英文类名、一个字面 null，还把方向指到了协议上。
-    // 带口令的私钥就走这里：V1 的 `SSHKeyPair.fromPem` 不带 passphrase。
+  if (error is SSHKeyDecryptError) {
+    // 私钥带口令。**必须排在 `is SSHError` 之前**，也必须排在下面的
+    // `SSHKeyDecodeError` 之前 —— 它是后者的子类，排到后面就到不了这里。
+    // 单独一支的价值在于：只有这一支能给出**确定且可操作**的方向
+    // （去掉口令即可），另一支只能说他文件读不出来。
     return ConnectionFailure(
       ConnectionFailureKind.authFailed,
-      '无法读取私钥：${error.message}。'
-      '若私钥设了口令，本版本暂不支持带口令的私钥。',
+      '私钥已加密，本版本暂不支持带口令的私钥。'
+      '请改用不带口令的私钥，或等待后续版本支持。',
+      cause: error,
+    );
+  }
+
+  if (error is SSHKeyDecodeError) {
+    // 读不出私钥，但**不是**口令问题（内容损坏、格式不认识等）。
+    // 文案不能假定口令：对一个文件损坏的用户说"若私钥设了口令…"，
+    // 就是让他去翻一个根本不存在的口令 —— 与 §13.15 同一个坑，
+    // 只是轻一些（原文仍然附在后面）。
+    return ConnectionFailure(
+      ConnectionFailureKind.authFailed,
+      '无法读取私钥：${error.message}',
       cause: error,
     );
   }

@@ -72,9 +72,9 @@ void main() {
       expect(f.kind, ConnectionFailureKind.authFailed);
     });
 
-    test('私钥读不出来 → 指向私钥本身，不要说成协议错误', () {
-      // 带口令的私钥就走这条：V1 的 `SSHKeyPair.fromPem` 不带 passphrase。
-      // 少了这个分支，它会掉进 `is SSHError` 兜底，变成
+    test('带口令的私钥 → 指向"去掉口令"，不要说成协议错误', () {
+      // V1 的 `SSHKeyPair.fromPem` 不带 passphrase，所以**任何**设了口令的
+      // 私钥都必然失败。少了这个分支，它会掉进 `is SSHError` 兜底，变成
       // 「协议错误：SSHKeyDecryptError(Private key is encrypted, null)」
       // —— 一个英文类名加一个字面 null，方向还指到了协议上。
       final f = classifyConnectionFailure(
@@ -83,7 +83,25 @@ void main() {
 
       expect(f.kind, ConnectionFailureKind.authFailed);
       expect(f.message, contains('私钥'));
+      expect(f.message, contains('口令'));
       expect(f.message, isNot(contains('协议错误')));
+      expect(f.message, isNot(contains('null')));
+    });
+
+    test('读不出私钥但不是口令问题 → 不能提口令', () {
+      // 实测输入：`-----BEGIN RSA PRIVATE KEY-----\n\n-----END RSA PRIVATE KEY-----`
+      // 抛 `SSHKeyDecodeError('Failed to decode private key')`。
+      // **两种私钥错误必须分开。** 合成一支的话，一个私钥文件损坏的用户会被
+      // 叫去"去掉口令"，而他的私钥根本没有口令 —— 与 §13.15 同一个
+      // "把人指向错误方向"的坑，只是轻一些。`SSHKeyDecryptError` 是
+      // `SSHKeyDecodeError` 的子类，所以顺序上必须先判子类。
+      final f = classifyConnectionFailure(
+        SSHKeyDecodeError('Failed to decode private key'),
+      );
+
+      expect(f.kind, ConnectionFailureKind.authFailed);
+      expect(f.message, contains('私钥'));
+      expect(f.message, isNot(contains('口令')));
       expect(f.message, isNot(contains('null')));
     });
 
@@ -188,10 +206,15 @@ void main() {
   });
 
   group('message 必须是可读中文，且带原始信息', () {
-    test('每种 kind 都有非空的中文说明，且不漏出 null', () {
+    test('每个 kind 的 message 都非空、且不含字面 null', () {
       // **必须覆盖全部七个 kind。** 这条此前只喂了 4 个输入，于是
       // hostKey / protocolError / jumpHostFailed 三类的文案零覆盖 ——
       // 把它们的 message 整个换成 'null' 也照样全绿。
+      //
+      // 注意这条**不能**叫"都是可读中文"：`unknown` 那一格按设计就是
+      // 原始异常的 `$error`（英文、带 Dart 类名），因为对一个没预料到的
+      // 异常，编不出中文来 —— 那正是 §13.19-1"永远不吞掉异常"的要求。
+      // 所以这里钉的是"非空、不漏 null"，不是"每条都通顺"。
       final cases = <String, ConnectionFailure>{
         'timeout（Socket.connect 到点）': classifyConnectionFailure(
           const SocketException(
@@ -308,6 +331,48 @@ void main() {
       final f = classifyConnectionFailure(SSHStateError('SSH connection closed'));
 
       expect(f.kind, ConnectionFailureKind.protocolError);
+    });
+  });
+
+  group('幂等：调用点可以先分好类再抛', () {
+    // `SshSession` 读私钥文件时比分类器更清楚上下文 —— 它知道失败发生在
+    // "加载私钥"，而分类器只拿到一个裸的 `FileSystemException`，无从判断。
+    // 所以允许调用点直接构造 ConnectionFailure 抛出，分类器原样返回。
+    test('已经是 ConnectionFailure 的原样返回，不再包一层', () {
+      // 少了这一支，那个对象会掉进 unknown，变成
+      // 「连接失败：ConnectionFailure(authFailed): 无法读取私钥…」——
+      // 用户看到两层面具，而且第一层是英文。
+      const original = ConnectionFailure(
+        ConnectionFailureKind.authFailed,
+        '无法读取私钥文件：路径不存在',
+      );
+
+      final f = classifyConnectionFailure(original);
+
+      expect(f, same(original));
+      expect(f.kind, ConnectionFailureKind.authFailed);
+      expect(f.message, '无法读取私钥文件：路径不存在');
+    });
+
+    test('带 hop 时仍然加"第几跳"前缀（FR-J-05 优先于内层原因）', () {
+      const original = ConnectionFailure(
+        ConnectionFailureKind.authFailed,
+        '无法读取私钥文件：路径不存在',
+      );
+
+      final f = classifyConnectionFailure(
+        original,
+        hop: const JumpHop(index: 2, name: '堡垒机-B'),
+      );
+
+      expect(f.kind, ConnectionFailureKind.jumpHostFailed);
+      expect(f.message, contains('第 2 跳'));
+      expect(f.message, contains('堡垒机-B'));
+      expect(f.message, contains('无法读取私钥文件'));
+      // 这一条才是真正钉住幂等的断言：没有幂等分支时，内层会先被
+      // 包成「连接失败：ConnectionFailure(authFailed): …」，再套上跳板机
+      // 前缀 —— 上面三条断言**全都照样通过**（实测过），只有这一条会红。
+      expect(f.message, isNot(contains('连接失败：')));
     });
   });
 }
