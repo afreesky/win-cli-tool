@@ -281,7 +281,6 @@ void main() {
 
       expect(q.password, 'pw');
       expect(q.promptRegex, r'[>#]\s*$');
-      expect(q.privateKeyPath, isNull);
     });
 
     test('copyWith 能把可空字段显式清回 null', () {
@@ -311,6 +310,25 @@ void main() {
       expect(q.host, '10.0.0.1');
       expect(q.port, 22);
       expect(q.id, 'd1');
+    });
+
+    test('copyWith 能把可空字段从 null 设为新值', () {
+      // 哨兵机制有三个分支：保留、清空、设新值。前两个由上面两个用例覆盖，
+      // 这个覆盖第三个 —— 若只在保留/清空上正确而设新值有 bug，用户改的密码
+      // 会被静默丢弃，且因为每次保存都丢掉，用户再编辑也救不回来。
+      const p = DeviceProfile(
+        id: 'd1',
+        name: 'A',
+        protocol: DeviceProtocol.ssh,
+        host: '10.0.0.1',
+        port: 22,
+        username: 'admin',
+      );
+
+      final q = p.copyWith(password: 'new-pw', promptRegex: r'>>>\s*$');
+
+      expect(q.password, 'new-pw');
+      expect(q.promptRegex, r'>>>\s*$');
     });
 
     test('JSON 只有必填字段时，可选项回落到默认值（v1 配置迁移形状）', () {
@@ -379,6 +397,11 @@ void main() {
       expect(cleared.password, isNull);
       expect(cleared.privateKeyPath, isNull);
       expect(cleared.username, 'ops');
+
+      // 设新值
+      final updated = j.copyWith(password: 'new-pw');
+      expect(updated.password, 'new-pw');
+      expect(updated.privateKeyPath, '/home/ops/.ssh/id_ed25519');
     });
   });
 
@@ -506,6 +529,12 @@ void main() {
 
       // 显式传 null → 清空，回到「用应用数据目录下的 logs/」
       expect(s.copyWith(logDir: null).logDir, isNull);
+
+      // null → 设新值：用户第一次指定日志目录
+      expect(
+        const AppSettings().copyWith(logDir: '/var/log').logDir,
+        '/var/log',
+      );
     });
   });
 }
@@ -541,9 +570,11 @@ enum DeviceProtocol {
 
 /// 「调用方没传这个参数」的哨兵，用来区分它与「调用方显式传了 null」。
 ///
-/// 见 Task 2 开头对 [DeviceProfile.password]、[DeviceProfile.privateKeyPath]、
-/// [DeviceProfile.promptRegex] 的说明：这几个字段的 null 是有语义的值，不能被
-/// `?? this.x` 吞掉。
+/// [DeviceProfile.password]、[DeviceProfile.privateKeyPath] 与
+/// [DeviceProfile.promptRegex] 的 null 都是有语义的值（不启用密码认证 /
+/// 不启用密钥认证 / 用全局默认提示符正则），不能被 `?? this.x` 吞掉：
+/// 否则用户清空密码改用密钥认证后，旧密码仍留在明文配置里，且界面上
+/// 再没有任何地方能看到它。
 const Object _unset = Object();
 
 /// 一条可复用的命令片段，归属于单台设备。
@@ -895,7 +926,7 @@ class AppSettings {
 flutter test test/models/
 ```
 
-Expected：PASS，`All tests passed!`（两份测试文件合计 18 个用例全绿：`device_profile_test.dart` 11 个 + `app_settings_test.dart` 7 个）。
+Expected：PASS，`All tests passed!`（两份测试文件合计 19 个用例全绿：`device_profile_test.dart` 12 个 + `app_settings_test.dart` 7 个）。
 
 - [ ] **Step 6: 顺手清掉已被真实文件取代的 .gitkeep**
 
@@ -1078,8 +1109,14 @@ class _SocketConnection implements Connection {
   final Socket _socket;
   var _closed = false;
 
+  // 显式 cast 不能省：Socket 实际是 Stream<Uint8List>，而本接口承诺的是
+  // Stream<List<int>>。两者在静态类型上兼容（Uint8List 是 List<int> 的子类型），
+  // 但 Stream.transform 会按**运行时**类型去校验 transformer —— 不 cast 的话
+  // 消费方写 .transform(utf8.decoder) 能通过编译却在运行时抛
+  // "type 'Utf8Decoder' is not a subtype of type 'StreamTransformer<Uint8List, String>'"。
+  // cast 之后声明类型与运行时类型一致，抽象才是可信的。
   @override
-  Stream<List<int>> get input => _socket;
+  Stream<List<int>> get input => _socket.cast<List<int>>();
 
   @override
   void write(List<int> data) {
@@ -1156,6 +1193,7 @@ void main() {
       addTearDown(socket.destroy);
 
       final received = await socket
+          .cast<List<int>>()
           .transform(const Utf8Decoder(allowMalformed: true))
           .firstWhere((s) => s.contains('[CoreSW]'));
 
@@ -1175,7 +1213,7 @@ void main() {
 
       final chunks = <String>[];
       final done = Completer<void>();
-      socket.transform(const Utf8Decoder(allowMalformed: true)).listen((s) {
+      socket.cast<List<int>>().transform(const Utf8Decoder(allowMalformed: true)).listen((s) {
         chunks.add(s);
         // 横幅里也有提示符，所以等到第二次出现提示符才算命令执行完
         if (chunks.join().split('[CoreSW]').length > 2 && !done.isCompleted) {
@@ -1226,7 +1264,7 @@ void main() {
       addTearDown(socket.destroy);
 
       var text = '';
-      socket.transform(const Utf8Decoder(allowMalformed: true)).listen((s) {
+      socket.cast<List<int>>().transform(const Utf8Decoder(allowMalformed: true)).listen((s) {
         text += s;
       });
 
@@ -1252,7 +1290,7 @@ void main() {
       addTearDown(socket.destroy);
 
       var text = '';
-      final sub = socket.transform(const Utf8Decoder(allowMalformed: true)).listen(
+      final sub = socket.cast<List<int>>().transform(const Utf8Decoder(allowMalformed: true)).listen(
         (s) {
           text += s;
         },
@@ -1858,11 +1896,9 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 ```dart
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:win_cli_tool/connection/session.dart';
 import 'package:win_cli_tool/connection/telnet_session.dart';
 import 'package:win_cli_tool/models/device_profile.dart';
 
@@ -2041,14 +2077,16 @@ import 'telnet_protocol.dart';
 class TelnetSession implements Session {
   TelnetSession({
     required this.profile,
-    Connector connector = const DirectConnector(),
-    Duration connectTimeout = const Duration(seconds: 15),
-  })  : _connector = connector,
-        _connectTimeout = connectTimeout;
+    this.connector = const DirectConnector(),
+    this.connectTimeout = const Duration(seconds: 15),
+  });
 
   final DeviceProfile profile;
-  final Connector _connector;
-  final Duration _connectTimeout;
+
+  /// 建连方式。默认直连；计划 2 会注入带跳板机的实现。
+  final Connector connector;
+
+  final Duration connectTimeout;
 
   final _protocol = TelnetProtocol();
   final _output = StreamController<String>.broadcast();
@@ -2069,7 +2107,7 @@ class TelnetSession implements Session {
   @override
   Future<void> connect() async {
     final conn =
-        await _connector.open(profile.host, profile.port, timeout: _connectTimeout);
+        await connector.open(profile.host, profile.port, timeout: connectTimeout);
     _conn = conn;
 
     // 用流式解码器而非逐片 utf8.decode：多字节字符可能跨分片边界，
@@ -2452,8 +2490,6 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 创建 `test/command/command_dispatcher_test.dart`：
 
 ```dart
-import 'dart:async';
-
 import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:win_cli_tool/command/command_dispatcher.dart';
@@ -2935,20 +2971,23 @@ class QueueDropped extends DispatchEvent {
 /// —— 连着灌命令会让回显与命令错位。
 class CommandDispatcher {
   CommandDispatcher({
-    required void Function(String data) write,
-    required PromptDetector promptDetector,
-    required MorePager morePager,
+    required this.write,
+    required this.promptDetector,
+    required this.morePager,
     this.lineEnding = '\n',
     this.promptDebounce = const Duration(milliseconds: 120),
     this.commandTimeout = const Duration(seconds: 10),
     this.bufferLimit = 8192,
-  })  : _write = write,
-        _promptDetector = promptDetector,
-        _morePager = morePager;
+  });
 
-  final void Function(String data) _write;
-  final PromptDetector _promptDetector;
-  final MorePager _morePager;
+  /// 把一条命令写出去（不含行尾符，由本类补）。
+  final void Function(String data) write;
+
+  /// 提示符判定器。
+  final PromptDetector promptDetector;
+
+  /// 翻页判定器。
+  final MorePager morePager;
 
   /// 命令行尾符。
   final String lineEnding;
@@ -3024,14 +3063,14 @@ class CommandDispatcher {
       _buffer = _buffer.substring(_buffer.length - bufferLimit);
     }
 
-    if (_morePager.matchesTail(_buffer)) {
+    if (morePager.matchesTail(_buffer)) {
       // 翻页（spec §5.3）：立即回送一个空格继续。翻页动作不计入命令队列，
       // 不产生队列进度变化，也**不重置命令超时** —— 一条命令翻十页仍然
       // 只受一个 10s 超时约束。
       //
       // 去抖计时照常重置：翻页提示本身就是"新数据到达"，此时缓冲区末尾
       // 是 `---- More ----`，本来也匹配不上提示符正则。
-      _write(MorePager.continueKey);
+      write(MorePager.continueKey);
       _events.add(const PagerContinued());
       _restartDebounce();
       return;
@@ -3096,7 +3135,7 @@ class CommandDispatcher {
     _currentIndex = _batch.length - _queue.length;
     // 清空缓冲区：否则上一条命令残留的提示符会让本条瞬间"完成"
     _buffer = '';
-    _write('$cmd$lineEnding');
+    write('$cmd$lineEnding');
     _events.add(CommandSent(cmd, _currentIndex, _batch.length));
     _restartTimeout();
   }
@@ -3125,7 +3164,7 @@ class CommandDispatcher {
 
   void _checkPrompt() {
     if (_current == null) return;
-    if (!_promptDetector.matches(_buffer)) {
+    if (!promptDetector.matches(_buffer)) {
       // 没有提示符就继续等，由超时计时器兜底
       return;
     }

@@ -750,3 +750,25 @@ FR-C-11 / FR-J-06 要求首次连接确认后**保存**指纹。计划 2 早于�
 **13.7 模型没有 `==` / `hashCode`**
 
 目前一律按引用比较，这也是目前往返测试要逐字段写十几行 `expect` 的原因。计划 5 的 Riverpod 状态 diff、列表去重可能会需要值相等；若要补，优先补字段最少、最可能被 keyed 的 `Snippet`。
+
+**13.8 `copyWith` 对「null 是有语义的值」的字段必须用哨兵**
+
+这条约束适用于**任何**后续新增的模型类（计划 2 的 `KnownHost`、计划 4 的草稿模型等），不只是已经改好的那四个字段。
+
+若某个可空字段的 `null` 表示一个**有定义的语义**（而不是「没有这个值」），它的 `copyWith` 参数就**不能**写成 `String? x` + `x ?? this.x` —— 那样「调用方没传」与「调用方显式传 null」不可区分，用户「清空」的操作会被静默变成「保持原值」，且返回一个完全合法的对象、不报任何错。
+
+正确写法是哨兵，给出三种状态（不传→保留、显式 `null`→清空、传值→覆盖）：
+
+```dart
+const Object _unset = Object();   // 每个库一份，私有名不会跨库冲突
+
+Foo copyWith({Object? bar = _unset}) => Foo(
+      bar: identical(bar, _unset) ? this.bar : bar as String?,
+    );
+```
+
+已按此改的字段：`DeviceProfile.password` / `.privateKeyPath` / `.promptRegex`、`JumpHost.password` / `.privateKeyPath`、`AppSettings.logDir`。
+
+注意 `Object?` 参数会让**静态类型检查在这几个参数上失效**（传错类型能通过编译，运行时才抛 `TypeError`）—— 这是该惯用法的既定代价，换来的是三态语义正确。代价是「失败得更晚但仍然响亮」，不是「静默失败」。
+
+判据是：**这个字段的 null 有没有语义**。列表字段（`jumpHostIds` 等）不该用哨兵，因为它们的「清空」是 `[]`，是个值不是 null。
