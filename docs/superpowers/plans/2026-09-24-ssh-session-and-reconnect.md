@@ -1382,8 +1382,11 @@ void main() {
 
   test('配置了主机密钥校验时，verify 回调必须被显式传入', () {
     // §13.14-1：onVerifyHostKey 为 null 时 dartssh2 直接放行任意主机密钥。
-    // 这里断言 SshSession 不会把 null 传下去 —— 用"校验关闭"的场景来测，
-    // 因为那是最容易被写成"干脆不传"的路径。
+    // 用"校验关闭"的场景来测，因为那是最容易被写成"干脆不传"的路径。
+    //
+    // 这是一条**代理断言**：它只证明 _buildHostKeyCallback() 不返回 null，
+    // **不**证明 connect() 真的把它的返回值传了下去 —— 后者要真 sshd 才看得见
+    // （Task 7）。别把它读成"接线已验证"。
     final session = SshSession(
       profile: _profile(),
       connector: _FailingConnector(Exception('boom')),
@@ -1475,7 +1478,13 @@ class SshSession implements Session {
   StreamSubscription<String>? _decodeSub;
   var _closed = false;
 
-  /// 供测试断言"回调确实被传下去了"。见 Task 4 的测试说明。
+  /// 供测试断言"校验关闭时也没有把 null 传下去"。
+  ///
+  /// **这是一条代理断言，别读成"接线已验证"**：它读的是
+  /// [_buildHostKeyCallback] 的返回值，而不是真正交给 `SSHClient` 的那个值 ——
+  /// 把 [connect] 里的 `onVerifyHostKey:` 改成 null，它依然为真。真正锁住
+  /// 接线的是 Task 7 的真 sshd 用例：回调为 null 时 dartssh2 接受任意主机
+  /// 密钥（§13.14-1），于是"用户拒绝指纹则连不上"那条会失败。
   bool get debugHostKeyCallbackIsNull => _buildHostKeyCallback() == null;
 
   /// 最近一次断开的原始错误。正常断开为 null。
