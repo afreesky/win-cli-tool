@@ -26,7 +26,8 @@ void main() {
   });
 
   test('toJson 的键名是持久化格式，不得随手改名', () {
-    // 计划 4 会把这些键写进磁盘。改名不会报错，只会让已存的文件读不出来 ——
+    // 计划 4 会把这些键写进磁盘。改名**在运行时不报错**（红的是本测试，
+    // 这是刻意设计的），但已存的文件会读不出来 ——
     // 于是每台设备都被当成"首次连接"，FR-C-11 的确认形同虚设，而且**已经
     // 变过密钥的主机也会被重新 TOFU 接受**。所以钉死键名，而不只是钉住往返。
     expect(_k().toJson(), {
@@ -38,12 +39,20 @@ void main() {
   });
 
   test('identity 由 host/port/keyType 三者共同决定', () {
-    final a = _k(host: 'h', keyType: 'ssh-ed25519', fingerprint: 'SHA256:x');
-    final b = _k(host: 'h', keyType: 'ssh-rsa', fingerprint: 'SHA256:y');
-
-    // 同一主机、不同算法 → 身份证不同，因此互不覆盖，
-    // 也不会把算法变更误报成"密钥变了"。
-    expect(a.identity, isNot(b.identity));
+    // **三个轴必须逐个断言。** 只比 keyType 的话，测试名宣称覆盖了三者，
+    // 而 host / port 两轴其实毫无保护：把 host 从 identity 里删掉，本测试
+    // 照样绿，只有仓库那几条用例会红；而仓库的注释又写着"必须与
+    // KnownHost.identity 逐字一致"，于是最自然的修法是把 _key 也照改 ——
+    // 两边一起错，12 条全绿，仓库开始把两台设备混成一条记录。
+    // 实测后果：存过 10.0.0.2 之后再连 10.0.0.1，会拿到 10.0.0.2 的指纹，
+    // 比对失败 → 一台从未换过密钥的设备被报成"主机密钥变更"。
+    // 断言的是**结构**（三个轴各自可区分），不是格式字符串。
+    expect(_k(host: 'h1').identity, isNot(_k(host: 'h2').identity));
+    expect(_k(port: 22).identity, isNot(_k(port: 2222).identity));
+    expect(
+      _k(keyType: 'ssh-ed25519').identity,
+      isNot(_k(keyType: 'ssh-rsa').identity),
+    );
   });
 
   test('同一主机同一算法重新保存会覆盖（identity 相同）', () {
@@ -53,10 +62,26 @@ void main() {
     expect(a.identity, b.identity);
   });
 
-  test('指纹为 null 以外的空串是非法值，构造时拒绝', () {
-    // 空指纹会让"指纹不匹配"永远为真，从而把每一次连接都判成
-    // 主机密钥变更 —— 必须在这里挡住，而不是让它在比较时才发作。
+  test('指纹为空串时拒绝构造', () {
+    // 空指纹会让"指纹不匹配"永远为真，从而把对该主机 + 算法的每一次连接
+    // 都判成主机密钥变更 —— 必须在这里挡住，而不是让它在比较时才发作。
     expect(() => _k(fingerprint: ''), throwsArgumentError);
+  });
+
+  test('从 JSON 进来也走同一道校验（spec §13.3 的 catch 宽度就建立在这上面）', () {
+    // 计划 4 逐条目 try/catch 的宽度，来自这条实测结论：手改出来的空指纹
+    // 抛的是 ArgumentError，而不是 §13.3 正文点名的 TypeError。若哪天校验
+    // 搬了家或换了异常类型，§13.3 给计划 4 定的契约会**悄悄**失效 ——
+    // 一个字都不会报错，只是某天一条坏记录掀掉整个文件。所以钉在这里。
+    expect(
+      () => KnownHost.fromJson({
+        'host': '10.0.0.1',
+        'port': 22,
+        'keyType': 'ssh-ed25519',
+        'fingerprint': '',
+      }),
+      throwsArgumentError,
+    );
   });
 
   test('空仓库里 find 返回 null', () async {
@@ -92,7 +117,7 @@ void main() {
   });
 
   test('同一主机不同算法各自成条，互不覆盖', () async {
-    // 这正是本 Task 按 keyType 分别存储的理由：只按 host:port 存的话，
+    // 这正是按 keyType 分别存储的理由（见 spec §13.5）：只按 host:port 存的话，
     // 设备换一种算法协商就会被判成"主机密钥变了" ——
     // 一个正常的算法协商被报成疑似中间人攻击。
     final store = InMemoryHostKeyStore();

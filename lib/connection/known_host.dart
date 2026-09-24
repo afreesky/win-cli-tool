@@ -29,7 +29,12 @@ class KnownHost {
 
   /// 记录的唯一标识。**必须包含 keyType** —— 同一主机同时提供多种算法时，
   /// 每把密钥的指纹都不同，只按 host:port 存会把正常的算法协商误报成
-  /// 主机密钥变更（见本 Task 开头的说明）。
+  /// 主机密钥变更（见 spec §13.5）。
+  ///
+  /// 前提：`keyType` 不含冒号。dartssh2 的算法名（`ssh-ed25519`、
+  /// `rsa-sha2-256` 等七个）都不含，所以这个拼法无歧义 —— IPv6 字面量主机
+  /// （`::1`）也安全，因为 `port` 一定是纯数字段。若将来真有带冒号的
+  /// keyType，这个键就会撞。
   String get identity => '$host:$port:$keyType';
 
   factory KnownHost.fromJson(Map<String, Object?> json) => KnownHost(
