@@ -800,3 +800,19 @@ Foo copyWith({Object? bar = _unset}) => Foo(
 3. 超时时不回送、只告警，并在给出提示前持续回送空格把剩余分页翻完。
 
 倾向 2：厂商退出键行为尚未在真机上验证（§8.4 已列为待验证项），在没验证前让程序猜按键，风险高于让用户看见。
+
+**13.11 `close()` 不得 await 单订阅 `StreamController` 的 `close()`**
+
+`Session` 的实现内部用单订阅 `StreamController` 把「原始字节 → 解码后的文本」接起来。**单订阅 controller 的 `close()` 返回的 Future，要等到有监听者订阅、把 done 事件取走才会完成。** 没有监听者时它永远不完成：
+
+```
+未连接会话的 close()          → 永久挂起
+无监听者的 controller.close() → 永久挂起
+有监听者的 controller.close() → 正常完成
+```
+
+`TelnetSession` 里 `_decodeSub` 是在 `connector.open(...)` **成功之后**才挂上去的，因此有两类会话永远没有监听者：**从未连接过的**，以及 **connect 抛过异常的**（端口写错、拒绝连接、超时）。这两类会话上调 `await close()` 会永久挂起 —— 而「连不上之后清理」「切换设备」「关窗口」走的正是这条路。FR-C-12 要求退出时关闭所有会话，挂在这里就是应用退不掉。
+
+**约束：`close()` 里只 await 真正的资源（订阅、socket），内存 controller 的 `close()` 用 `unawaited`。** 已连接的会话 `close()` 本来正常，别为此改成 broadcast —— 那会改变 `Session.output` 的语义（多个监听者、错过早期输出）。
+
+计划 2 的 `SshSession` 会照搬这个结构，必须一并遵守。
