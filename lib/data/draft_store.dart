@@ -77,16 +77,11 @@ class DraftStore {
   }
 
   Future<void> write(String deviceId, String text) async {
-    final file = _fileFor(deviceId);
-    await file.parent.create(recursive: true);
-    // 与 writeJsonObject 同一套原子写：先写临时文件、收紧权限、再改名。
+    // 与 writeJsonObject 共用同一套原子写（写临时文件 → 收紧权限 → 改名），
+    // **包括失败时清掉临时文件那段** —— 见 writeFileAtomically 的注释。
     // 草稿不是关键数据，但"关掉程序时正好写了一半"会让下次启动读到一个
     // 截断的草稿 —— 而用户的第一反应是"这软件把我的配置弄丢了"。
-    final tmp = File('${file.path}.tmp');
-    await tmp.writeAsString(text, flush: true);
-    await restrictToOwner(tmp);
-    await tmp.rename(file.path);
-    await restrictToOwner(file);
+    await writeFileAtomically(_fileFor(deviceId), text);
   }
 
   /// 删除某台设备的草稿（FR-D-06：删除设备时一并删除其草稿）。

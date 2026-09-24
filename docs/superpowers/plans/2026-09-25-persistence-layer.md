@@ -153,6 +153,22 @@ void main() {
       expect(await readJsonObject(f('o.json')), {'n': 2});
     });
 
+    test('写盘失败时不留 .tmp（否则那是 umask 权限的明文凭据文件）', () async {
+      // 让 rename 必然失败：目标路径是一个**目录**。这样写序会走到
+      // "内容已落盘、chmod 也许还没跑"的那一步，正是残留出现的时刻。
+      await Directory('${root.path}/t.json').create();
+      await expectLater(
+        writeJsonObject(f('t.json'), {'password': 'PLAINTEXT-SECRET'}),
+        throwsA(isA<FileSystemException>()),
+      );
+      expect(
+        f('t.json.tmp').existsSync(),
+        isFalse,
+        reason: '失败路径必须删掉临时文件 —— 它带着完整内容，'
+            '权限还是 umask 默认值（本仓库 0664），正是 NFR-S-04 要防的形状',
+      );
+    });
+
     test('输出是带缩进的 UTF-8，中文不被转义', () async {
       await writeJsonObject(f('cn.json'), {'name': '核心交换机'});
       final raw = await f('cn.json').readAsString();
@@ -267,18 +283,44 @@ Future<Map<String, Object?>?> readJsonObject(File file) async {
 /// 会留下一个被截断的文件，下次启动读到的就是"损坏的配置"—— 于是
 /// NFR-R-03 的恢复路径被自己的写入方式反复触发，用户看到的是"配置又坏了"，
 /// 而真正的原因在写的那一侧。同目录 rename 是原子的（同文件系统内）。
-Future<void> writeJsonObject(File file, Map<String, Object?> json) async {
+Future<void> writeJsonObject(File file, Map<String, Object?> json) =>
+    writeFileAtomically(
+      file,
+      const JsonEncoder.withIndent('  ').convert(json),
+    );
+
+/// 原子写一个文本文件：写同目录 `.tmp` → 收紧权限 → rename 覆盖。
+///
+/// **失败时必须自己删掉 `.tmp`。** 写序是「内容先落盘 → chmod → rename」，
+/// 而 chmod 与 rename **都会**失败（`chmod` 起不来、目标是个目录、磁盘满），
+/// 那一瞬间 `.tmp` 已经带着**完整内容**躺在盘上了，权限还是 umask 默认值。
+/// 对 `devices.json` 而言那就是一份 **0664、含明文凭据**的文件（实测：chmod
+/// 失败时留下 `devices.json.tmp mode=0664`，内容里有 `"password": "…"`），
+/// 而用户只看到"保存失败"。**为 NFR-S-04 写的那段代码自己造出这么一个文件**，
+/// 正是它要防的形状。所以清理放在 `catch` 里，然后**原样重抛**。
+///
+/// 清理本身**不许抛**：它在错误路径上跑，清理失败再抛会把真正的原因
+/// （chmod/rename 为什么失败）盖掉，用户看到的就成了"临时文件删不掉"
+/// 这种无从下手的东西。
+Future<void> writeFileAtomically(File file, String content) async {
   await file.parent.create(recursive: true);
   final tmp = File('${file.path}.tmp');
-  await tmp.writeAsString(
-    const JsonEncoder.withIndent('  ').convert(json),
-    flush: true,
-  );
-  await restrictToOwner(tmp);
-  await tmp.rename(file.path);
-  // rename 一般保留 inode 的权限位；但目标已存在时某些实现会先删后建，
-  // 于是这里对最终路径再设一次。多一次 chmod 是廉价的。
-  await restrictToOwner(file);
+  try {
+    await tmp.writeAsString(content, flush: true);
+    await restrictToOwner(tmp);
+    await tmp.rename(file.path);
+    // rename 一般保留 inode 的权限位；但目标已存在时某些实现会先删后建，
+    // 于是这里对最终路径再设一次。多一次 chmod 是廉价的。
+    await restrictToOwner(file);
+  } catch (_) {
+    // rename 成功之后再失败（最后那次 chmod）时 `tmp` 已经不在了，
+    // `exists()` 为 false —— 那时**不能**删：内容已经在最终路径上，
+    // 只是补设权限失败了，删掉就是丢数据。
+    try {
+      if (await tmp.exists()) await tmp.delete();
+    } catch (_) {}
+    rethrow;
+  }
 }
 
 /// 把文件权限收紧到 0600（仅属主可读写）。对应 NFR-S-04。
@@ -313,7 +355,7 @@ Future<File?> quarantine(File file, {required DateTime now}) async {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `flutter test test/data/json_file_test.dart`
-Expected: `All tests passed!`（16 条）
+Expected: `All tests passed!`（17 条）
 
 - [ ] **Step 5: Commit**
 
@@ -2291,16 +2333,11 @@ class DraftStore {
   }
 
   Future<void> write(String deviceId, String text) async {
-    final file = _fileFor(deviceId);
-    await file.parent.create(recursive: true);
-    // 与 writeJsonObject 同一套原子写：先写临时文件、收紧权限、再改名。
+    // 与 writeJsonObject 共用同一套原子写（写临时文件 → 收紧权限 → 改名），
+    // **包括失败时清掉临时文件那段** —— 见 writeFileAtomically 的注释。
     // 草稿不是关键数据，但"关掉程序时正好写了一半"会让下次启动读到一个
     // 截断的草稿 —— 而用户的第一反应是"这软件把我的配置弄丢了"。
-    final tmp = File('${file.path}.tmp');
-    await tmp.writeAsString(text, flush: true);
-    await restrictToOwner(tmp);
-    await tmp.rename(file.path);
-    await restrictToOwner(file);
+    await writeFileAtomically(_fileFor(deviceId), text);
   }
 
   /// 删除某台设备的草稿（FR-D-06：删除设备时一并删除其草稿）。
@@ -2314,7 +2351,7 @@ class DraftStore {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `flutter test test/data/draft_store_test.dart`
-Expected: `All tests passed!`（12 条）
+Expected: `All tests passed!`（13 条）
 
 - [ ] **Step 5: Commit**
 
@@ -3333,8 +3370,12 @@ class AnsiSpan {
 /// 1. **不含 ESC 时 `stripAnsi` 不删 `\r`**（它的 `\r` 清理在提前返回之后），
 ///    这里一律删。现实输入会撞上，所以日志/输出区都走这里才干净。
 /// 2. **退化输入里"删掉一条序列后新拼出一条"**：`stripAnsi` 是三次全串
-///    `replaceAll`，删完 CSI 后孤立 ESC 可能与后面的 `\` 新拼成两字节序列；
-///    逐字符扫描看不到。只在 `\x1b\x1b[…` 这类畸形输入上出现。
+///    `replaceAll` —— 先删 CSI 会让**原本配不上的**序列事后变成可匹配的，而
+///    逐字符扫描一次到位，看不到这个先后关系。**别以为只有相邻 ESC 才算**：
+///    实测 `'[\x1b]Z?\x1b[[\x07?'` 这边得 `[Z?<BEL>?`，`stripAnsi` 得 `[?`
+///    （它先把 `\x1b[[` 当合法 CSI 删掉，剩下的 `ESC ] … BEL` 才拼成 OSC），
+///    这条输入里两个 ESC 并不相邻；反过来 `'\x1b\x1b[31mx'` 这种相邻 ESC 的
+///    **不**分叉。共同点是都属于畸形输入。
 ///
 /// 另有一个**两边共有**的缺陷：`ESC ( B`（选择字符集，三字节）都不被剥离 ——
 /// 它不属于两字节规则覆盖的范围。修它要动已冻结的 `ansi.dart`，本计划不改

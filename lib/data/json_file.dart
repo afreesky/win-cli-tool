@@ -34,18 +34,44 @@ Future<Map<String, Object?>?> readJsonObject(File file) async {
 /// 会留下一个被截断的文件，下次启动读到的就是"损坏的配置"—— 于是
 /// NFR-R-03 的恢复路径被自己的写入方式反复触发，用户看到的是"配置又坏了"，
 /// 而真正的原因在写的那一侧。同目录 rename 是原子的（同文件系统内）。
-Future<void> writeJsonObject(File file, Map<String, Object?> json) async {
+Future<void> writeJsonObject(File file, Map<String, Object?> json) =>
+    writeFileAtomically(
+      file,
+      const JsonEncoder.withIndent('  ').convert(json),
+    );
+
+/// 原子写一个文本文件：写同目录 `.tmp` → 收紧权限 → rename 覆盖。
+///
+/// **失败时必须自己删掉 `.tmp`。** 写序是「内容先落盘 → chmod → rename」，
+/// 而 chmod 与 rename **都会**失败（`chmod` 起不来、目标是个目录、磁盘满），
+/// 那一瞬间 `.tmp` 已经带着**完整内容**躺在盘上了，权限还是 umask 默认值。
+/// 对 `devices.json` 而言那就是一份 **0664、含明文凭据**的文件（实测：chmod
+/// 失败时留下 `devices.json.tmp mode=0664`，内容里有 `"password": "…"`），
+/// 而用户只看到"保存失败"。**为 NFR-S-04 写的那段代码自己造出这么一个文件**，
+/// 正是它要防的形状。所以清理放在 `catch` 里，然后**原样重抛**。
+///
+/// 清理本身**不许抛**：它在错误路径上跑，清理失败再抛会把真正的原因
+/// （chmod/rename 为什么失败）盖掉，用户看到的就成了"临时文件删不掉"
+/// 这种无从下手的东西。
+Future<void> writeFileAtomically(File file, String content) async {
   await file.parent.create(recursive: true);
   final tmp = File('${file.path}.tmp');
-  await tmp.writeAsString(
-    const JsonEncoder.withIndent('  ').convert(json),
-    flush: true,
-  );
-  await restrictToOwner(tmp);
-  await tmp.rename(file.path);
-  // rename 一般保留 inode 的权限位；但目标已存在时某些实现会先删后建，
-  // 于是这里对最终路径再设一次。多一次 chmod 是廉价的。
-  await restrictToOwner(file);
+  try {
+    await tmp.writeAsString(content, flush: true);
+    await restrictToOwner(tmp);
+    await tmp.rename(file.path);
+    // rename 一般保留 inode 的权限位；但目标已存在时某些实现会先删后建，
+    // 于是这里对最终路径再设一次。多一次 chmod 是廉价的。
+    await restrictToOwner(file);
+  } catch (_) {
+    // rename 成功之后再失败（最后那次 chmod）时 `tmp` 已经不在了，
+    // `exists()` 为 false —— 那时**不能**删：内容已经在最终路径上，
+    // 只是补设权限失败了，删掉就是丢数据。
+    try {
+      if (await tmp.exists()) await tmp.delete();
+    } catch (_) {}
+    rethrow;
+  }
 }
 
 /// 把文件权限收紧到 0600（仅属主可读写）。对应 NFR-S-04。

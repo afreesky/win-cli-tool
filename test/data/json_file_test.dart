@@ -70,6 +70,22 @@ void main() {
       expect(await readJsonObject(f('o.json')), {'n': 2});
     });
 
+    test('写盘失败时不留 .tmp（否则那是 umask 权限的明文凭据文件）', () async {
+      // 让 rename 必然失败：目标路径是一个**目录**。这样写序会走到
+      // "内容已落盘、chmod 也许还没跑"的那一步，正是残留出现的时刻。
+      await Directory('${root.path}/t.json').create();
+      await expectLater(
+        writeJsonObject(f('t.json'), {'password': 'PLAINTEXT-SECRET'}),
+        throwsA(isA<FileSystemException>()),
+      );
+      expect(
+        f('t.json.tmp').existsSync(),
+        isFalse,
+        reason: '失败路径必须删掉临时文件 —— 它带着完整内容，'
+            '权限还是 umask 默认值（本仓库 0664），正是 NFR-S-04 要防的形状',
+      );
+    });
+
     test('输出是带缩进的 UTF-8，中文不被转义', () async {
       await writeJsonObject(f('cn.json'), {'name': '核心交换机'});
       final raw = await f('cn.json').readAsString();
