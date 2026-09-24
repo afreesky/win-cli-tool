@@ -468,7 +468,13 @@ abstract class CredentialStore {
 
 /// V1 实现：明文，就写在记录自己的 `password` 字段上（spec §8.6 / NFR-S-01）。
 ///
-/// **这个类是 V1 里唯一知道凭据字段叫什么名字的地方。** 别的代码要拿密码，
+/// **字段名 `password` 不是本类的私事，而是与模型共享的契约**：`DeviceProfile`
+/// 的 `toJson` 写出这个键、`fromJson` 也从它读回来。所以 [strip] 必须删掉的
+/// 正是**模型写出的那个键** —— 别把这里改成一个"不那么显眼"的名字。在明文
+/// 实现下改它只是让往返测试变红；在密钥库实现下，[strip] 就删不掉模型的
+/// `password`，明文**照旧落进 devices.json**，而那正是 NFR-S-01 要防的泄露。
+///
+/// 本类唯一决定的是**凭据落在哪里**（就地写进 record）。别的代码要拿密码，
 /// 走 [read]；要写密码，走 [write]。
 class PlaintextCredentialStore implements CredentialStore {
   const PlaintextCredentialStore();
