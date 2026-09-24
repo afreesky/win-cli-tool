@@ -6360,19 +6360,24 @@ FR-C-06 要求「连接失败时，设备按钮变红」，但本计划的 `Conn
 
 **这一项在 Task 6 实现前必须定下来。** 已同步记入 spec §13.17-3。
 
-## 本计划**不**包含（属于计划 3）
+## 本计划**不**包含（原属计划 3 —— **该计划已取消，2026-09-25**）
 
-> **2026-09-24 范围收缩：** 计划 3 的跳板机功能**只做单跳**。下面第一行的
-> `JumpHostPool`（FR-J-07 的前缀复用 + 引用计数）与「多跳组合」中的 **N 跳链**
-> （FR-J-03）**已推迟到 V1.1**，计划 3 不实现。第二、三行（`forwardLocal` /
-> `direct-tcpip` 通道、跳板机断线导致的批量断线通知）**仍在计划 3 内** ——
-> 单跳也要走 `direct-tcpip`，单跳跳板机断线同样要让经由它的设备断线。
-> 见 spec §10.2。
+> **2026-09-25 决定：跳板机支持整体放弃，计划 3 不再编写。**
+> 2026-09-24 曾把计划 3 收缩为「只做单跳」；2026-09-25 用户进一步决定
+> **放弃支持跳板机**，于是单跳那一半也一并放弃 —— 下面几行**没有一行**会在
+> V1 里实现，整体转为 V1.1 候选。见 spec §4.2.1 / §10.2 / §12。
+>
+> 后续计划**不重新编号**：spec 里的「计划 4（持久化层）」「计划 5（状态层与界面）」
+> 仍叫这两个名字；计划 3 这个编号**空置**（不再有对应文件）。
 
-- ~~`JumpHostPool`~~、`SshTunnelConnector`、`connection_socket.dart` 之外的多跳组合
-  （**V1.1**：`JumpHostPool` 与 N 跳链）
-- `forwardLocal` / `direct-tcpip` 通道与 `SSHForwardChannel.destroy()`
-- 跳板机断线导致的批量断线通知（FR-J-05 的跨设备部分）
+- `SshTunnelConnector`（跳板机隧道）—— **不建**
+- `forwardLocal` / `direct-tcpip` 通道与 `SSHForwardChannel.destroy()` —— 一并搁置
+- 跳板机断线导致的批量断线通知（FR-J-05 的跨设备部分）—— 一并搁置
+- `JumpHostPool`（FR-J-07 的前缀复用 + 引用计数）与 N 跳链（FR-J-03）—— 2026-09-24 已推迟，现随整体放弃
+
+**保留但不使用的惰性代码**（不改、不删，理由见 spec §10.2）：`JumpHost` 模型、
+`DeviceProfile.jumpHostIds`、`ConnectionFailureKind.jumpHostFailed`、`JumpHop`、
+`classifyConnectionFailure` 的 `hop:` 形参，以及它们各自的测试。
 
 计划 2 已经为这些留好了位置：`ConnectorResolver` 是注入点，`ConnectionSocket` 是可复用的适配器，`SshSession` 不需要任何改动。
 
