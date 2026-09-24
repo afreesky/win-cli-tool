@@ -853,9 +853,29 @@ Foo copyWith({Object? bar = _unset}) => Foo(
 
 版本 4.1.0 已确认可在本项目的 Dart 3.12 上解析（8 个传递依赖，无冲突），与 §8.1 的选型一致。以下每一条都会让「照着直觉写」的代码出错：
 
-1. **没有 `connect()`，且主机密钥校验默认是关的。**
+1. **没有 `connect()`，且「信任校验」默认是关的 —— 但别和「签名校验」混为一谈。**
    API 是 socket 优先：自己建好 `SSHSocket`，交给 `SSHClient(socket, username: ...)`，再 `await client.authenticated`。
-   **NFR-S-03 要求默认开启校验，而库的默认是不校验** —— 也就是说「什么都不传」等于**静默关闭了**需求要求默认开启的安全属性。必须显式传 `onVerifyHostKey: (String type, Uint8List fingerprint)`，其中 `fingerprint` 已经是可直接显示给用户的 UTF-8 字符串（形如 `SHA256:<base64>`），不需要自己再算哈希。
+
+   这里有两个**不同**的开关，混淆它们会写出看起来安全、实际不安全的代码：
+
+   | 构造函数参数 | 默认值 | 管什么 | 默认是否生效 |
+   |---|---|---|---|
+   | `disableHostkeyVerification` | `false` | **签名校验**：证明对端确实持有它出示的那把私钥 | ✅ 默认开启 |
+   | `onVerifyHostKey` | `null` | **信任校验**：这把密钥是不是我们**期望**的那把（TOFU/已知主机） | ❌ **默认形同关闭** |
+
+   源码 `ssh_transport.dart:1919` 写得很直白：
+
+   ```dart
+   final userVerified = onVerifyHostKey != null
+       ? await Future.value(onVerifyHostKey!(_hostkeyType!.name, fingerprint))
+       : true;        // 回调为 null ⇒ 直接当成"已验证" ⇒ 接受任意主机密钥
+   ```
+
+   也就是说：默认配置下握手本身的密码学是健全的，但**对端是谁完全没有被检查** —— 任何持有有效密钥的中间人都能冒充目标设备。这正是 NFR-S-03 要求默认开启的那一项，而「什么都不传」等于静默关掉了它。
+
+   **约束：`SshSession` 必须始终显式传 `onVerifyHostKey`。** 即便全局设置关闭了校验（FR-C-11 允许），也应传一个显式 `(t, f) => true` 的回调，而不是留 `null` —— 让「校验被关掉」这件事在代码里**可见、可 grep、可评审**，而不是藏在构造函数默认值里。
+
+   `fingerprint` 参数已经是可直接显示给用户的 UTF-8 字节（形如 `SHA256:<base64>`），`utf8.decode` 之后即可展示，不需要自己再算哈希。
 
 2. **主机密钥被拒绝，抛出的是 `SSHAuthAbortError` 且 `.reason` 为 `SSHHostkeyError`。**
    FR-C-06 要求区分「认证失败」与「协议错误」，因此**不能把这个异常和密码错误一起归为「认证失败」** —— 用户看到「认证失败」会去改密码，而真正要改的是接受指纹。
