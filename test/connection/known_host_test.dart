@@ -68,6 +68,17 @@ void main() {
     expect(() => _k(fingerprint: ''), throwsArgumentError);
   });
 
+  test('算法名含冒号时拒绝构造（否则两组三元组会拼出同一个键）', () {
+    // identity 是 '$host:$port:$keyType'，冒号是分隔符。算法名里再出现冒号，
+    // 分隔就失去意义：实测 {host:'h:22', port:1, keyType:'2'} 与
+    // {host:'h', port:22, keyType:'1:2'} 都拼成 'h:22:1:2'，两条记录塌成
+    // 一条，find(h:22, 1, 2) 会返回另一台设备的指纹 → 又一类
+    // "主机密钥变更"误报。dartssh2 的七个算法名都不含冒号，所以这条只在
+    // 手改/损坏的文件里触发 —— 而 fromJson 正是一条不可信输入路径，
+    // 与指纹那条守卫同一个理由。
+    expect(() => _k(keyType: 'a:b'), throwsArgumentError);
+  });
+
   test('从 JSON 进来也走同一道校验（spec §13.3 的 catch 宽度就建立在这上面）', () {
     // 计划 4 逐条目 try/catch 的宽度，来自这条实测结论：手改出来的空指纹
     // 抛的是 ArgumentError，而不是 §13.3 正文点名的 TypeError。若哪天校验
