@@ -12,13 +12,14 @@
 
 ## 执行前必读
 
-### 本计划的三条硬约束（来自 spec §13，违反即为缺陷）
+### 本计划的四条硬约束（来自 spec §13，违反即为缺陷）
 
 | 约束 | 出处 | 在本计划中的落点 |
 |---|---|---|
 | 转发 `session.done` 前必须查 `_closed` 标志 | §13.14-5 | Task 4 的 `_onDisconnected` |
 | 始终显式传 `onVerifyHostKey`，不得留 `null` | §13.14-1 | Task 4 的 `SSHClient(...)` 构造 |
 | 错误分类看 `.reason`，不看顶层类型或消息 | §13.15 | Task 3 的 `classifyConnectionFailure` |
+| `ConnectionSocket` 的 `_sink` 必须 `sync: true` | §13.18-1 | Task 1；Task 4 的 `SshSession.close()` 依赖它 |
 
 ### 已由探针实测确认的 API 事实（不要凭记忆改写）
 
@@ -213,6 +214,16 @@ Expected: `Changed 7 dependencies!` —— 新增 `asn1lib` / `convert` / `darts
 
 （`clock` 本来就在传递依赖里，这里只是提升为直接依赖 —— 但**必须**显式声明才能 `import 'package:clock/clock.dart'`。`collection` 与 `meta` 已在锁文件里，不会出现在新增列表里。）
 
+随后给 `clock` 补一条注释。它在计划 2 里要等到 Task 6 才被 import，在那之前它是这个依赖块里**唯一没有本地证据支撑**的一项（`dartssh2` 有 `connection_socket.dart` 直接 import 它），最容易被 IDE 的"未使用依赖"提示或一次顺手清理删掉 —— 而后果要到 Task 6 才以编译错误的形式冒出来，离原因隔了四个 Task。`pubspec.yaml` 里补成：
+
+```yaml
+  dartssh2: ^4.1.0
+  # 可被 fake_async 接管的时间源：ConnectionManager 用它计算 FR-C-09 的
+  # 断线时长。用 DateTime.now() 的话，测试里 fakeAsync.elapse() 推进的是
+  # 假时钟，而 DateTime.now() 是真实时间，断线时长恒为 0，无法断言。
+  clock: ^1.1.1
+```
+
 - [ ] **Step 2: 写失败测试**
 
 ```dart
@@ -228,7 +239,13 @@ import 'package:win_cli_tool/connection/connector.dart';
 class _FakeConnection implements Connection {
   final _input = StreamController<List<int>>();
   final written = <int>[];
+
+  /// `close()` 之后仍被写入的字节。真实的 `_SocketConnection` 会在这一步
+  /// **静默丢弃**，所以必须记下来 —— 否则"写出去后立刻 close()"的丢包
+  /// 是断言不到的（写丢了一个字节都不报错，正是它危险的地方）。
+  final writeAfterClose = <int>[];
   var closed = false;
+  var flushCalls = 0;
 
   @override
   Stream<List<int>> get input => _input.stream;
@@ -238,13 +255,26 @@ class _FakeConnection implements Connection {
     _input.add(bytes);
   }
 
+  void feedError(Object error) {
+    if (closed) return;
+    _input.addError(error);
+  }
+
   Future<void> feedDone() => _input.close();
 
   @override
-  void write(List<int> data) => written.addAll(data);
+  void write(List<int> data) {
+    if (closed) {
+      writeAfterClose.addAll(data);
+      return;
+    }
+    written.addAll(data);
+  }
 
   @override
-  Future<void> flush() async {}
+  Future<void> flush() async {
+    flushCalls++;
+  }
 
   @override
   Future<void> close() async {
@@ -255,7 +285,7 @@ class _FakeConnection implements Connection {
 }
 
 void main() {
-  test('对端字节从 socket.stream 出来，且是 Uint8List', () async {
+  test('对端字节按原样从 socket.stream 出来', () async {
     final conn = _FakeConnection();
     final socket = ConnectionSocket(conn);
 
@@ -265,6 +295,8 @@ void main() {
     conn.feed([1, 2, 3]);
     await Future<void>.delayed(Duration.zero);
 
+    // 只断言内容：got 是 List<int>，元素运行时类型在这里被丢掉了。
+    // 类型由下一条用例专门守着。
     expect(got, [1, 2, 3]);
   });
 
@@ -296,6 +328,31 @@ void main() {
     expect(conn.written, [65, 66]);
   });
 
+  test('写出去后立刻 close()，字节仍须先落到 Connection（丢了就是优雅关闭被掐断）', () async {
+    // 这条守的是 _sink 的同步性。若用默认的异步 controller，sink.add 要等
+    // 一个 microtask 才调用 write，而 close() 的关闭标记是**同步**置上的 ——
+    // 于是这一批字节被底层连接静默丢弃。
+    //
+    // 实测（真 sshd + 真 SSHClient，见 spec §13.18）：client.close() 在同一个
+    // 同步块里先往 sink 写 CHANNEL_EOF / CHANNEL_CLOSE 再关闭传输层，异步
+    // controller 下这两个报文全部丢失 —— 设备侧看到的是连接被粗暴掐断，
+    // 而不是优雅断开（网络设备上这会把 vty 占住到超时）。
+    final conn = _FakeConnection();
+    final socket = ConnectionSocket(conn);
+
+    socket.sink.add([65]);
+    unawaited(socket.close()); // 与上一行同一个同步块，中间不让出 microtask
+
+    await Future<void>.delayed(Duration.zero);
+
+    expect(
+      conn.writeAfterClose,
+      isEmpty,
+      reason: 'close 之后才落到的写入会被真实连接静默丢弃',
+    );
+    expect(conn.written, [65]);
+  });
+
   test('destroy() 关闭底层 Connection', () async {
     final conn = _FakeConnection();
     final socket = ConnectionSocket(conn);
@@ -304,6 +361,17 @@ void main() {
     await Future<void>.delayed(Duration.zero);
 
     expect(conn.closed, isTrue);
+  });
+
+  test('flush() 透传给底层 Connection', () async {
+    // Connection.write 不保证立即发出，flush() 才是那个保证。适配器自己
+    // 多了一层 sink，若不透传，"flush 过了"就成了一句空话。
+    final conn = _FakeConnection();
+    final socket = ConnectionSocket(conn);
+
+    await socket.flush();
+
+    expect(conn.flushCalls, 1);
   });
 
   test('对端结束传输时 socket.done 完成', () async {
@@ -330,10 +398,40 @@ void main() {
       caught = e;
     }));
 
-    conn._input.addError(const SocketException('连接被重置'));
+    conn.feedError(const SocketException('连接被重置'));
     await Future<void>.delayed(Duration.zero);
 
     expect(caught, isA<SocketException>());
+  });
+
+  test('dispose() 释放订阅：之后不再交付对端数据', () async {
+    // dispose() 存在的全部意义就是摘掉订阅。摘不掉 = 旧会话的输出会继续
+    // 流进已经换代的界面（计划 2 开头那个"输出区永久静止 / 按钮是绿的"
+    // 就是这一族的故障）。
+    final conn = _FakeConnection();
+    final socket = ConnectionSocket(conn);
+
+    final got = <int>[];
+    socket.stream.listen(got.addAll);
+
+    socket.dispose();
+    conn.feed([1, 2, 3]);
+    await Future<void>.delayed(Duration.zero);
+
+    expect(got, isEmpty);
+  });
+
+  test('dispose() 不关闭底层 Connection（关闭是 close()/destroy() 的职责）', () async {
+    // Connection 是**借来的**，生命周期归调用方。Task 4 的 SshSession.close()
+    // 正是先 client.close() 再 dispose()。若 dispose() 顺手关了连接，那个
+    // 顺序就变成"先关两次"，而顺序反过来的调用方会拿到一个已死的连接。
+    final conn = _FakeConnection();
+    final socket = ConnectionSocket(conn);
+
+    socket.dispose();
+    await Future<void>.delayed(Duration.zero);
+
+    expect(conn.closed, isFalse, reason: 'dispose() 只释放订阅，连接由调用方关闭');
   });
 }
 ```
@@ -361,6 +459,9 @@ import 'connector.dart';
 /// [Connection]。有了这层适配，SSH 就能建在**任意** [Connection] 之上 ——
 /// 直连可以，跳板机隧道也可以（计划 3 正是靠它把第 N+1 跳建在第 N 跳上，
 /// 且不必改动 SshSession）。
+///
+/// 契约上有两处需要调用方知道：`dispose()` **不**关闭底层 [Connection]；
+/// `done` 的完成依赖对端真的结束 [Connection.input]。
 class ConnectionSocket implements SSHSocket {
   ConnectionSocket(this._conn) {
     // SSHTransport 会**同时**监听 stream 与 done，而 Connection.input 是
@@ -380,14 +481,36 @@ class ConnectionSocket implements SSHSocket {
     );
     _sinkSub = _sink.stream.listen(
       _conn.write,
+      // Connection.write 是同步的 void，身上没有错误通道；写出失败的唯一
+      // 上报口是 done。所以这条 onError 目前不可达 —— 留着只为满足
+      // StreamSink 的契约形态，别指望它兜住写入失败。
       onError: (Object _) {},
+      // dartssh2 从不调用 sink.close()（只 sink.add），所以这条在计划 2 里
+      // 也不可达。dispose() 里 _sinkSub.cancel() 排在 _sink.close() 之前，
+      // 正是为了不走到这里 —— 否则 dispose() 会顺手把连接关掉。
       onDone: () => unawaited(_conn.close()),
     );
   }
 
   final Connection _conn;
   final _stream = StreamController<Uint8List>();
-  final _sink = StreamController<List<int>>();
+
+  /// `sync: true` **不能省**。默认的异步 controller 会把 `sink.add` 推迟一个
+  /// microtask 才调用 [_conn.write]，而 `Connection.close()` 的关闭标记是
+  /// **同步**置上的：同一个同步块里"写出去 + close()"的字节会被底层连接
+  /// 静默丢弃，一个错误都不报。
+  ///
+  /// 实测（真 sshd + 真 SSHClient，见 spec §13.18）：`client.close()` 先在
+  /// 同一同步块里往 sink 写 `CHANNEL_EOF` / `CHANNEL_CLOSE`，再关传输层 ——
+  /// 异步 controller 下这两个报文全部丢掉，设备侧看到的是连接被粗暴掐断
+  /// 而非优雅断开。裸 socket 不会这样，所以这层适配器把一个原本正确的
+  /// 行为改坏了。
+  ///
+  /// 代价：[_conn.write] 若同步抛错，现在会直接从 `sink.add` 里抛出来，
+  /// 而不是变成异步未捕获错误。这是刻意的 —— 快速失败好过静默。前提是
+  /// 监听回调不会回头再往 `_sink` 里写（那会让 sync controller 抛
+  /// StateError）；[_conn.write] 不碰 `_sink`，前提成立。
+  final _sink = StreamController<List<int>>(sync: true);
   final _done = Completer<void>();
   late final StreamSubscription<List<int>> _sub;
   late final StreamSubscription<void> _sinkSub;
@@ -412,7 +535,12 @@ class ConnectionSocket implements SSHSocket {
 
   /// 释放两个订阅。**不 await 两个 controller 的 close()** ——
   /// 单订阅 controller 的 close() Future 要等到有监听者取走 done 才完成，
-  /// 无人监听时永久挂起（spec §13.11）。
+  /// 无人监听时永久挂起（spec §13.11）。本方法返回 void 也正是这个缘故：
+  /// void 让"await 一个可能永不完成的 future"根本写不出来。
+  ///
+  /// **不关闭 [Connection]** —— 连接是借来的，由调用方用 `close()` /
+  /// `destroy()` 释放。计划 2 的 `SshSession.close()` 就是先 `client.close()`
+  /// 再 `dispose()`。
   void dispose() {
     unawaited(_sub.cancel());
     unawaited(_sinkSub.cancel());
@@ -425,7 +553,7 @@ class ConnectionSocket implements SSHSocket {
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `flutter test test/connection/connection_socket_test.dart`
-Expected: 6 个用例全部 PASS
+Expected: 10 个用例全部 PASS
 
 - [ ] **Step 6: 分析 + 提交**
 

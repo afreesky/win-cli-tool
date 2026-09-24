@@ -999,3 +999,66 @@ Foo copyWith({Object? bar = _unset}) => Foo(
    另：`autoReconnect` 开关本身在 spec 里**没有依据** —— FR-G-01 的设置项列表里没有「自动重连」，而 FR-C-07 又要求断线后必须自动重试。若选第 1 种读法，需要新增一个设置项来承载它（属于计划 5），否则该参数应删除。
 
    **计划 2 的 Task 6 实现之前必须定下来。** 计划文件里同一项记在「未决项」一节。
+
+### 13.18 `ConnectionSocket` 的三处实测结论（计划 2 Task 1 执行期）
+
+1. **`sink` 必须是同步 controller，否则"写出去后立刻关闭"的字节会被静默丢弃 —— SSH 的优雅关闭报文就是这样丢的。**
+
+   `SSHSocket.sink` 在本项目里由适配器自己用一个 `StreamController` 承接。**默认（异步）controller 会让 `sink.add` 推迟一个 microtask 才调用 `Connection.write`，而 `Connection.close()` 的关闭标记是同步置上的** —— 于是同一个同步块里"先写、后关"的字节，落到 `_SocketConnection.write` 时连接已标记关闭，被直接丢掉，不报任何错。
+
+   实测（真 sshd + 真 `SSHClient`，通过一个记录调用顺序的 `Connection` 包装层观察）：
+
+   | 场景 | 对端实际收到的字节 |
+   |---|---|
+   | 裸 `dart:io` Socket：`add([1,2,3])` 后同步 `close()` | `[1, 2, 3]` |
+   | 适配器（异步 sink）：同上一个同步块 | **`[]`** |
+   | 适配器：`add` 后让出一个 microtask 再 `close()` | `[1, 2, 3]` |
+
+   在 `Connection` 上看到的调用顺序是 `[close, write-DROPPED(36B), write-DROPPED(36B)]` ——
+   即 `SSHClient.close()` → `_closeChannels()` → `SSHChannelController.destroy()` →
+   `_sendEOFIfNeeded()` / `_sendCloseIfNeeded()` → `socket.sink.add(...)`，全是同步调用，
+   紧接在 `await _transport.close()` → `socket.close()` 之前。**`CHANNEL_EOF` 与
+   `CHANNEL_CLOSE` 因此从未上线**，而裸 socket 路径下它们是发出去的 —— 也就是说这层
+   适配器把一个原本正确的行为改坏了。
+
+   代价不是抽象的：设备侧看到的是连接被粗暴掐断而非优雅断开。网络设备上这会占住
+   vty 直到超时（Cisco/Huawei 都要 `clear line vty` 去清），对一个网络工程师工具是
+   真实的操作负担。
+
+   **修法**：`StreamController<List<int>>(sync: true)`。加 `sync: true` 后重测：
+   `[write(36B), write(36B), close]`，两个报文都发出去了。
+
+   **副带影响**：`Connection.write` 若同步抛错，现在会从 `sink.add` 里同步抛出，而不是
+   变成异步未捕获错误。刻意如此（快速失败好过静默）。前提是监听回调不会回头再往
+   同一个 sink 里写 —— 那会让 sync controller 抛 `StateError`。`Connection.write`
+   不碰 sink，前提成立。
+
+   **`_sink` 上那条 `onError` 是不可达的**：`Connection.write` 是同步 `void`，没有错误
+   通道；而 `onData` 里抛出的异常**不会**路由到同一个订阅的 `onError`（实测：它会变成
+   未捕获的 zone 错误）。留着它只为满足 `StreamSink` 的契约形态，别指望它兜住写入失败。
+
+2. **`dispose()` 不关闭底层 `Connection`，且刻意返回 `void`。**
+
+   `Connection` 是从调用方借来的，生命周期归调用方（计划 2 的 `SshSession.close()` 是
+   先 `client.close()` 再 `dispose()`）。`dispose()` 只释放适配器自己的两个订阅。
+
+   返回 `void` 而非 `Future<void>` 是**刻意的**：`dispose()` 里对两个 controller 的
+   `close()` 只能 `unawaited` —— 单订阅 controller 的 `close()` Future 要等有监听者
+   取走 `done` 才完成，无人监听时永久挂起（§13.11）。如果签名是 `Future<void>`，将来
+   有人"顺手"把它改成 `await _stream.close()` 就会让 `dispose()` 永不返回；`void`
+   让那个 await 根本写不出来。**不要把签名改成 `Future<void>`**，除非同时想清楚
+   §13.11 那条挂起路径怎么防。
+
+3. **给计划 3（跳板机）的两条前置条件。**
+
+   - `SSHSocket.destroy()` 在本适配器里退化成 `_conn.close()`（`Connection` 没有
+     destroy 的等价物），而 `SSHTransport.close()` 是 `await socket.close()` →
+     `await _conn.close()`。**于是任何 `close()` 可能挂起的 `Connection` 都会把拆除
+     流程挂住，`destroy()` 这条"立刻走开"的路径也一并继承。** §13.14-7 已记录
+     `SSHForwardChannel.close()` 会挂起 —— 所以计划 3 里隧道化的那个 `Connection`
+     必须让它的 `close()` 具备 `destroy()` 语义（走 `SSHForwardChannel.destroy()`），
+     否则 FR-C-12「退出时关闭所有会话」会卡死。
+   - `done` 的完成**依赖对端真的结束 `Connection.input`**。这一点对
+     `_SocketConnection` 实测成立（`close()` 与 `destroy()` 之后 `done` 都会完成），
+     但它是 `Connection` 实现方的**隐含前提**：计划 3 的隧道 Connection 关掉内层
+     channel 时必须让 `input` 结束，否则 `SshSession` 的 `done` 永远不会完成。
