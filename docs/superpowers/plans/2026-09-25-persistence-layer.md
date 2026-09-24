@@ -1870,6 +1870,23 @@ void main() {
     expect(result.issues.single.kind, LoadIssueKind.newerSchema);
   });
 
+  test('schemaVersion 不是整数：不静默读入，要上报 newerSchema', () async {
+    // `"2"` / `2.0` / `true` 都不是本程序写出来的形状（手改，或将来某个写入方
+    // 当字符串写）。**不能当没看见** —— `load_issue.dart` 自己就说"沉默地读错
+    // 比报错更糟"。判法与 DeviceStore 一致（那里也是 `version is! int ||`）。
+    for (final bad in <Object>['2', 2.0, true]) {
+      await file.writeAsString(
+        jsonEncode({'schemaVersion': bad, 'commandTimeoutMs': 7000}),
+      );
+      final result = await store().load();
+      expect(
+        result.issues.map((i) => i.kind),
+        contains(LoadIssueKind.newerSchema),
+        reason: 'schemaVersion=$bad 时必须上报，而不是静默按当前版本读入',
+      );
+    }
+  });
+
   test('翻页模式里有非字符串：留档 + 默认值（惰性视图必须被强制求值）', () async {
     await file.writeAsString(jsonEncode({
       'schemaVersion': 1,
@@ -1929,9 +1946,15 @@ class SettingsStore {
 
   final File file;
 
-  /// 读盘。**任何形式的坏都给全默认值 + 上报**，绝不半读：
+  /// 读盘。**读不出来的坏都给全默认值 + 上报**，绝不半读：
   /// 设置项之间没有依赖，用一半旧值一半默认值比全默认更让人困惑
   /// （用户会以为"我明明改过"）。
+  ///
+  /// **有一个既定的例外，别把上面那句读成没有例外**：`AppTheme.fromName` 对未知
+  /// 主题名的兜底是**设计好的降级**，不算损坏 —— 那时别的字段照常从文件读出来，
+  /// 只有 `theme` 落到"跟随系统"，而且**不上报**（测试「未知主题名降级为跟随系统，
+  /// 不算损坏」钉的就是这条，它断言 `issues` 为空）。上面那个"坏"指的是**文件或
+  /// 字段读不出来**（不是 JSON、类型不对），枚举名字不认识不在其内。
   Future<SettingsLoadResult> load() async {
     Map<String, Object?>? raw;
     try {
@@ -1959,7 +1982,11 @@ class SettingsStore {
       issues.add(
         const LoadIssue(LoadIssueKind.migrated, '设置文件没有版本号，已按当前格式读入。'),
       );
-    } else if (version is int && version > kSettingsSchemaVersion) {
+    } else if (version is! int || version > kSettingsSchemaVersion) {
+      // `is! int` 那一半是必须的：`"schemaVersion": "2"`（手改出来的，或将来某个
+      // 写入方当字符串写）否则会**静默**按当前语义读入 —— 而 load_issue.dart
+      // 自己就说"沉默地读错比报错更糟"。判法与 DeviceStore 一致（那里同样是
+      // `version is! int ||`）。
       issues.add(
         LoadIssue(
           LoadIssueKind.newerSchema,
@@ -2004,7 +2031,7 @@ class SettingsStore {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `flutter test test/data/settings_store_test.dart`
-Expected: `All tests passed!`（9 条）
+Expected: `All tests passed!`（10 条）
 
 - [ ] **Step 5: Commit**
 
