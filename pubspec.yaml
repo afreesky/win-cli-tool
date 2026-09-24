@@ -35,6 +35,9 @@ dependencies:
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
   dartssh2: ^4.1.0
+  # 可被 fake_async 接管的时间源：ConnectionManager 用它计算 FR-C-09 的
+  # 断线时长。用 DateTime.now() 的话，测试里 fakeAsync.elapse() 推进的是
+  # 假时钟，而 DateTime.now() 是真实时间，断线时长恒为 0，无法断言。
   clock: ^1.1.1
 
 dev_dependencies:
