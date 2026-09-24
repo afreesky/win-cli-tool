@@ -3,13 +3,21 @@ import 'dart:io';
 
 import 'package:dartssh2/dartssh2.dart';
 
-/// 失败原因分类。前五项对应 FR-C-06 列举的原因，[hostKey] 是 §13.15
-/// 要求单独区分出来的项。
+/// 失败原因分类。FR-C-06 列举的五种原因都在这里（连接超时 / 认证失败 /
+/// 主机不可达 / 协议错误 / 跳板机失败），[hostKey] 是 §13.15 额外要求单独
+/// 区分出来的第六种，[unknown] 是兜底。
 enum ConnectionFailureKind {
   /// 连接超时（FR-C-13，默认 15s）。
+  ///
+  /// **两个来源都要认。** `Socket.connect(timeout:)` 到点后抛的是
+  /// `SocketException`（errno ETIMEDOUT）—— 那才是 FR-C-13 在真实网络上的
+  /// 形态；`TimeoutException` 是另一个来源。只认后者的话，最常见的那条
+  /// 失败路径会被归成 [unreachable]，还会把英文原文当成中文说明交给用户。
+  /// 详见 `_classify` 里 `SocketException` 那一支。
   timeout,
 
-  /// 认证失败：口令或密钥不对。
+  /// 认证失败：口令或密钥不对，或私钥根本读不出来
+  /// （见 `_classify` 的 `SSHKeyDecodeError` 分支）。
   authFailed,
 
   /// 主机密钥未通过校验：指纹与已知记录不一致，或用户拒绝了首次确认。
@@ -57,6 +65,16 @@ class ConnectionFailure implements Exception {
   String toString() => 'ConnectionFailure(${kind.name}): $message';
 }
 
+/// `ETIMEDOUT` 的 errno。**两个都要认**：POSIX（Linux/macOS）是 110，
+/// Windows 是 10060（`WSAETIMEDOUT`）。
+///
+/// 110 是在本机连黑洞地址实测出来的（`Socket.connect(timeout:)` 到点后抛
+/// `SocketException ... errno = 110`）。10060 取自 Winsock 的文档值 ——
+/// 本机是 Linux，无法实测；但 Windows 是本程序的主要目标平台，漏掉它
+/// 恰好会让那一边的用户看不到「超时」。
+const int _etimedoutPosix = 110;
+const int _etimedoutWindows = 10060;
+
 /// 把任意异常归类成 [ConnectionFailure]。
 ///
 /// **判据是 `SSHAuthAbortError.reason`，不是顶层类型或消息文本** ——
@@ -79,6 +97,11 @@ ConnectionFailure classifyConnectionFailure(Object error, {JumpHop? hop}) {
 
 ConnectionFailure _classify(Object error) {
   if (error is TimeoutException) {
+    // 这一支眼下是**防御性**的：dartssh2 自己在握手/认证超时时并不抛这个
+    // 类型，它抛 `SSHHandshakeError('Handshake timed out')` 与
+    // `SSHAuthAbortError('Authentication timed out')`（后者是它唯一一处
+    // reason 为 null 的产出）。真正撑起 FR-C-13 的是下面 `SocketException`
+    // 那一支的 errno 判定 —— 别把这条用例的绿色读成"超时路径已验证"。
     return ConnectionFailure(
       ConnectionFailureKind.timeout,
       '连接超时：目标设备在超时时间内没有响应',
@@ -86,10 +109,15 @@ ConnectionFailure _classify(Object error) {
     );
   }
 
-  // 注意：这里**没有** `is SSHAuthError` 分支，所以眼下不存在顺序问题。
-  // 将来若加，必须排在本分支之后 —— SSHAuthAbortError 与 SSHAuthFailError
-  // 都 implements SSHAuthError（ssh_errors.dart:40/49），`is SSHAuthError`
-  // 会把两者一起吞掉。
+  // 两条顺序纪律都在这个函数里，两条都是"排错了不报错、只静默失效"：
+  //   1. 若将来要加 `is SSHAuthError`，它必须排在下面
+  //      `is SSHAuthAbortError` **之后** —— SSHAuthAbortError 与
+  //      SSHAuthFailError 都 implements SSHAuthError（ssh_errors.dart:40/49），
+  //      排在前面会一次吞掉两者。
+  //   2. `is SSHError` 是**兜底**，必须始终排在最后。任何新的
+  //      `is <某个 SSHError>` 分支排到它后面就是死代码：编译器不报错，
+  //      测试也不会红。下面的 `SSHKeyDecodeError` 分支正是为此特意插在
+  //      它前面的。
   if (error is SSHAuthAbortError) {
     final reason = error.reason;
 
@@ -148,9 +176,36 @@ ConnectionFailure _classify(Object error) {
   }
 
   if (error is SocketException) {
+    // **FR-C-13 的 15s 超时走的是这里，不是 TimeoutException。**
+    // `Socket.connect(timeout:)` 到点后抛 SocketException，errno 为
+    // ETIMEDOUT —— 实测过（连 192.0.2.1:22 与 10.255.255.1:22 两个黑洞
+    // 地址，两次都得到 `SocketException: Connection timed out ... errno = 110`，
+    // 不是 TimeoutException）。不认这个 errno 的话，最常见的失败会被归成
+    // "主机不可达"，并把英文「Connection timed out」当中文说明交给用户。
+    final int? code = error.osError?.errorCode;
+    if (code == _etimedoutPosix || code == _etimedoutWindows) {
+      return ConnectionFailure(
+        ConnectionFailureKind.timeout,
+        '连接超时：目标设备在超时时间内没有响应',
+        cause: error,
+      );
+    }
     return ConnectionFailure(
       ConnectionFailureKind.unreachable,
       '主机不可达：${error.osError?.message ?? error.message}',
+      cause: error,
+    );
+  }
+
+  if (error is SSHKeyDecodeError) {
+    // 私钥读不出来。**必须排在 `is SSHError` 之前** —— 排到后面会被它吞掉，
+    // 报成"协议错误"并附上 `SSHKeyDecryptError(Private key is encrypted,
+    // null)`：一个英文类名、一个字面 null，还把方向指到了协议上。
+    // 带口令的私钥就走这里：V1 的 `SSHKeyPair.fromPem` 不带 passphrase。
+    return ConnectionFailure(
+      ConnectionFailureKind.authFailed,
+      '无法读取私钥：${error.message}。'
+      '若私钥设了口令，本版本暂不支持带口令的私钥。',
       cause: error,
     );
   }
