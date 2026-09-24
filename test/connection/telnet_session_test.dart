@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:win_cli_tool/connection/connector.dart';
 import 'package:win_cli_tool/connection/telnet_session.dart';
 import 'package:win_cli_tool/models/device_profile.dart';
 
@@ -15,6 +17,46 @@ DeviceProfile _profile(int port, {String name = '测试设备'}) => DeviceProfil
       port: port,
       username: 'admin',
     );
+
+/// 建连时机可控的 Connector：`open` 返回调用方给的 Future。
+class _GatedConnector implements Connector {
+  _GatedConnector(this.result);
+
+  final Future<Connection> result;
+
+  @override
+  Future<Connection> open(String host, int port, {Duration? timeout}) => result;
+}
+
+/// 一条记名式的假连接：能人为喂入字节，并记录是否被关闭。
+class _FakeConnection implements Connection {
+  final _input = StreamController<List<int>>();
+  var closed = false;
+
+  @override
+  Stream<List<int>> get input => _input.stream;
+
+  /// 喂入一段来自对端的字节。已关闭的连接直接忽略。
+  void feed(List<int> bytes) {
+    if (closed) return;
+    _input.add(bytes);
+  }
+
+  @override
+  void write(List<int> data) {}
+
+  @override
+  Future<void> flush() async {}
+
+  @override
+  Future<void> close() async {
+    if (closed) return;
+    closed = true;
+    // 不 await：单订阅流在无人监听时，close() 的 Future 要等到有人订阅
+    // 才会兑现（见下面那个 close-during-connect 的用例）。
+    unawaited(_input.close());
+  }
+}
 
 void main() {
   group('TelnetSession', () {
@@ -113,6 +155,49 @@ void main() {
 
       final session = TelnetSession(profile: _profile(port));
       await expectLater(session.connect(), throwsA(isA<SocketException>()));
+    });
+
+    test('connect 等待期间被 close：连接被关闭且没有异常逃逸到 zone', () async {
+      final conn = _FakeConnection();
+      final gate = Completer<Connection>();
+      final session = TelnetSession(
+        profile: _profile(1),
+        connector: _GatedConnector(gate.future),
+      );
+
+      Object? zoneError;
+      StackTrace? zoneStack;
+
+      await runZonedGuarded(() async {
+        // 建连还挂在 open 上时用户切了设备/关了窗口
+        final connecting = session.connect();
+        // 只发起、不等待 close()：_dataBytes 是单订阅流且此时还无人监听，
+        // 它的 close() 直到有人订阅才会完成。真正要验的是 close() 的效果，
+        // 不是它的 Future 何时兑现。
+        unawaited(session.close());
+        // 先把 close() 的拆除动作放干净（此时 _conn 还是 null，它什么也拆不掉，
+        // 随后挂在 _dataBytes.close() 上），再让 connect() 醒来。
+        await Future<void>.delayed(Duration.zero);
+        await Future<void>.delayed(Duration.zero);
+        gate.complete(conn);
+        await connecting;
+
+        // 让刚建立的连接吐点字节：修复前 _dataBytes 已关闭，
+        // 这里会从 _onBytes 抛出 "Cannot add event after closing"
+        conn.feed(utf8.encode('banner'));
+        await Future<void>.delayed(Duration.zero);
+        await Future<void>.delayed(Duration.zero);
+      }, (e, s) {
+        zoneError = e;
+        zoneStack = s;
+      });
+
+      expect(
+        zoneError,
+        isNull,
+        reason: '不该有异常逃逸到 zone，实际拿到：$zoneError\n$zoneStack',
+      );
+      expect(conn.closed, isTrue, reason: '建连期间被 close，刚建好的连接必须关掉');
     });
   });
 }

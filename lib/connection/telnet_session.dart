@@ -41,6 +41,13 @@ class TelnetSession implements Session {
   Future<void> connect() async {
     final conn =
         await connector.open(profile.host, profile.port, timeout: connectTimeout);
+    // 建连期间可能已经被 close()（用户切设备、关窗口）。此时必须把刚拿到的
+    // 连接关掉并直接返回，否则 socket 泄漏，且 _dataBytes 已关闭，后续
+    // _onBytes 里的 add 会抛 "Cannot add event after closing"。
+    if (_closed) {
+      await conn.close();
+      return;
+    }
     _conn = conn;
 
     // 用流式解码器而非逐片 utf8.decode：多字节字符可能跨分片边界，

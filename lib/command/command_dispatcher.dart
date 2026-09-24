@@ -125,6 +125,11 @@ class CommandDispatcher {
   ///
   /// 完全空白的行会被跳过（spec FR-E-08）—— 避免空回车污染回显。行首尾
   /// 空白会被去掉。若清洗后为空则什么都不做。
+  ///
+  /// 批次执行中调用会**追加**到当前批次，批次总数随之变大：先前报
+  /// `3/8` 的进度事件，之后再报就是 `4/10`。因此 [CommandSent.total]
+  /// / [CommandCompleted.total] 反映的是**事件发出那一刻**的批次规模，
+  /// 不是最终规模。
   void enqueue(Iterable<String> commands) {
     if (_disposed) return;
     final cleaned = commands
@@ -164,8 +169,9 @@ class CommandDispatcher {
       // 不产生队列进度变化，也**不重置命令超时** —— 一条命令翻十页仍然
       // 只受一个 10s 超时约束。
       //
-      // 去抖计时照常重置：翻页提示本身就是"新数据到达"，此时缓冲区末尾
-      // 是 `---- More ----`，本来也匹配不上提示符正则。
+      // 去抖计时照常重置：翻页提示本身就是"新数据到达"。
+      // 此刻缓冲区末尾仍是翻页提示，_checkPrompt 必须显式排除它，
+      // 否则 `<--- More --->` 这类以 `>` 结尾的提示会被误判成命令结束。
       write(MorePager.continueKey);
       _events.add(const PagerContinued());
       _restartDebounce();
@@ -231,9 +237,11 @@ class CommandDispatcher {
     _currentIndex = _batch.length - _queue.length;
     // 清空缓冲区：否则上一条命令残留的提示符会让本条瞬间"完成"
     _buffer = '';
+    // 先起超时再写出：若注入的 write 同步抛异常，队列仍有超时兜底，
+    // 不会永久卡在"忙"状态（spec 要求超时必须强制放行下一条）。
+    _restartTimeout();
     write('$cmd$lineEnding');
     _events.add(CommandSent(cmd, _currentIndex, _batch.length));
-    _restartTimeout();
   }
 
   void _restartDebounce() {
@@ -260,6 +268,10 @@ class CommandDispatcher {
 
   void _checkPrompt() {
     if (_current == null) return;
+    // 翻页提示不能当成提示符。`<--- More --->` 以 `>` 结尾，本来就能匹配
+    // 默认提示符正则；若在此判定完成，下一条命令会被发进仍在翻页的设备，
+    // 被它当作翻页按键吃掉 —— 命令看似已下发，实际从未执行。
+    if (morePager.matchesTail(_buffer)) return;
     if (!promptDetector.matches(_buffer)) {
       // 没有提示符就继续等，由超时计时器兜底
       return;

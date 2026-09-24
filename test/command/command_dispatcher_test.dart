@@ -6,9 +6,9 @@ import 'package:win_cli_tool/command/prompt_detector.dart';
 
 /// 测试脚手架：记录写出的内容，暴露事件流。
 class _Harness {
-  _Harness({String lineEnding = '\n'}) {
+  _Harness({String lineEnding = '\n', void Function(String)? write}) {
     dispatcher = CommandDispatcher(
-      write: (data) => written.add(data),
+      write: write ?? (data) => written.add(data),
       promptDetector: PromptDetector(),
       morePager: MorePager(),
       lineEnding: lineEnding,
@@ -223,6 +223,40 @@ void main() {
       });
     });
 
+    test('write 同步抛异常时队列仍由超时兜底放行', () {
+      fakeAsync((async) {
+        final written = <String>[];
+        var firstWrite = true;
+        final h = _Harness(
+          write: (data) {
+            if (firstWrite) {
+              firstWrite = false;
+              // 模拟 StreamSink.add 落在已关闭的 controller 上这类同步抛出
+              throw StateError('模拟 write 同步抛出');
+            }
+            written.add(data);
+          },
+        );
+
+        expect(
+          () => h.dispatcher.enqueue(['hang', 'next']),
+          throwsA(isA<StateError>()),
+        );
+        async.flushMicrotasks();
+
+        // 异常照常向外传播，但队列不能就此永久卡在"忙"状态：
+        // 超时计时器必须已经起好，兜底强制放行。
+        expect(h.dispatcher.isBusy, isTrue);
+
+        async.elapse(const Duration(seconds: 11));
+
+        expect(written, ['next\n'], reason: '超时后必须继续下发下一条');
+        expect(h.completed, hasLength(1));
+        expect(h.completed.single.command, 'hang');
+        expect(h.completed.single.timedOut, isTrue);
+      });
+    });
+
     test('超时计时器在正常完成时被取消', () {
       fakeAsync((async) {
         final h = _Harness();
@@ -282,6 +316,33 @@ void main() {
 
         expect(h.completed.single.command, 'display cur');
         expect(h.written, ['display cur\n', ' ', 'next\n']);
+      });
+    });
+
+    test('以 > 结尾的翻页提示不会被误判为命令结束', () {
+      fakeAsync((async) {
+        // 对照组：`---- More ----` 不以 > 结尾，本来也匹配不上提示符正则，
+        // 所以它在修复前后都不会被误判 —— 两边一比就能看出问题只在尾巴形态。
+        final control = _Harness();
+        control.dispatcher.enqueue(['display cur', 'next']);
+        async.flushMicrotasks();
+        control.dispatcher.onOutput('line1\r\n  ---- More ----');
+        async.elapse(const Duration(milliseconds: 200));
+        expect(control.completed, isEmpty);
+        expect(control.written, ['display cur\n', ' ']);
+
+        // 缺陷组：H3C 的 `<--- More --->` 以 > 结尾，能匹配提示符正则。
+        // 去抖到点后若不显式排除翻页尾巴，命令会被判为完成，下一条命令
+        // 就会被写进仍在翻页的设备，并被当作翻页键吃掉。
+        final h = _Harness();
+        h.dispatcher.enqueue(['display cur', 'next']);
+        async.flushMicrotasks();
+        h.dispatcher.onOutput('line1\r\n  <--- More --->');
+        async.elapse(const Duration(milliseconds: 200));
+
+        expect(h.completed, isEmpty, reason: '翻页提示不是提示符，命令仍在途');
+        expect(h.written, ['display cur\n', ' '], reason: '不该下发下一条命令');
+        expect(h.dispatcher.isBusy, isTrue);
       });
     });
   });
