@@ -1184,6 +1184,56 @@ Foo copyWith({Object? bar = _unset}) => Foo(
      §13.15 的字面要求是"认不出的 `reason` 优雅降级"，所以这**不算违规**；记在
      这里是因为同一类输入在两条路径上得到不同的精度，将来读代码的人会疑惑。
 
+6. **`ConnectionFailureKind.timeout` 曾是死代码，而它的注释写着"FR-C-13"
+   （评审提出，已修）。** 这是本 Task 最严重的一个，因为出错的不是实现，
+   而是**计划的整个前提**：「`Socket.connect` 带 timeout 会抛 `TimeoutException`」
+   —— 这句话没有人量过。
+
+   - **实测：** `Socket.connect('192.0.2.1', 22, timeout: Duration(seconds: 2))`
+     抛的是 `SocketException`，`osError.errorCode == 110`（POSIX `ETIMEDOUT`），
+     消息为 `Connection timed out` —— **不是** `TimeoutException`。两个黑洞地址
+     （`192.0.2.1`、`10.255.255.1`）结果一致。
+   - **后果：** FR-C-13 的 15s 超时 —— 本程序**最常见**的失败 —— 被归成
+     `unreachable`，并把英文原文塞进 `message`，而该字段的文档写着
+     "可直接展示给用户的中文说明"。同时 `timeout` 这个 kind 成了
+     **带活注释的死代码**：文档断言"连接超时（FR-C-13，默认 15s）"，
+     却没有任何生产输入能产生它。
+   - **为什么没有测试拦住：** 名为「连接超时」的那条用例喂的是手搓的
+     `TimeoutException` —— 一个生产路径**不会抛**的形态。用例绿着，被测的
+     行为是错的。这类"绿得毫无意义"比红更难发现。
+   - **修法（已落地）：** 在 `SocketException` 分支里判 errno，同时认 POSIX
+     `110` 与 Windows `10060`（`WSAETIMEDOUT`）。放在分类器里而不是
+     `DirectConnector` 里，是因为 socket 错误也会从 dartssh2 的传输层以
+     `SSHSocketError` 形式冒出来，只在 connector 翻译会漏掉那条路径。
+     110 为本机实测；**10060 取自 Winsock 文档值，本机（Linux）无法实测** ——
+     这一点已写进代码注释，没有伪装成实测。
+   - **教训：**与第 4 条同源但更狠。第 4 条是"断言不够"，这条是"计划里的前提
+     本身没量过"。凡是要写进计划的「某库在某场景会抛 X」，都要先用一段最小
+     程序验一次 —— 这也正是 §13.15 当初被发现的同一种方法。
+
+7. **带口令的私钥会漏出 `null` 和英文类名（评审提出，已修）。** V1 的
+   `SSHKeyPair.fromPem(pem)` 不带 passphrase，所以**任何**设了口令的私钥都会
+   失败并落到 `is SSHError` 兜底，产出：
+   `协议错误：SSHKeyDecryptError(Private key is encrypted, null)` ——
+   一个英文类名、一个字面 `null`，以及一个错误的方向（说成协议问题，用户会去
+   翻算法配置）。修法：在 `is SSHError` **之前**插一支 `is SSHKeyDecodeError`，
+   归 `authFailed` 并给出中文文案。`SSHKeyDecryptError extends SSHKeyDecodeError`，
+   一支覆盖两者。
+   **顺序是这个修法的全部要点** —— 排到 `is SSHError` 之后就等于没写：
+   编译器不报错，测试也不会红。
+
+8. **两条"守文案"的纪律此前只被单向覆盖（评审提出，已修）。**
+
+   - **方向只钉了一半。** 第 4 条证明了「主机密钥的文案不能指向口令」，但**镜像
+     没测**：把 `authFailed` 的文案换成主机密钥那一句，改动前全绿（实测）。
+     同样是"把人指向错误的方向"，后果是用户去核对指纹、甚至怀疑遇到中间人。
+     已补一条对称用例。
+   - **覆盖面声明大于实际覆盖面。** 名为「每种 kind 都有非空的中文说明」的用例
+     只喂了 4 个输入，而枚举有 7 个成员 —— `hostKey` / `protocolError` /
+     `jumpHostFailed` 三类的文案**零覆盖**（整段换成 `'null'` 也全绿）。
+     已改成覆盖七个 kind，并用 `ConnectionFailureKind.values` 断言"一个都不能少"，
+     这样将来加成员时该用例会自己红，而不是悄悄落后。
+
 ### 13.20 断开原因到不了界面（计划 2 执行期发现，Task 6 之前必须修）
 
 §13.12 要求把会话断开的错误对象保留下来。计划 2 的做法是在 `SshSession` 上加了
