@@ -5387,8 +5387,12 @@ class ConnectionManager {
   /// "重连尝试在途时手动 connect()"的探针给出 `created=4`、
   /// `closed=[true,true,false,false]`，同样一个孤儿。
   ///
-  /// **修复前（`acdc10d`）的同两条探针：`created=2`、`closed=[false,false]`、
-  /// `received=[out0,out1]`。** 所以 I5 的修复**不是**这次泄漏的来源（重叠一次就漏
+  /// **修复前（`acdc10d`）的对照，每条探针各有自己的数字。** 原先这里写成
+  /// "同两条探针"，是把**不带 gate 的 P** 与上面两条 gate 探针混为一谈，实测不符：
+  /// 上面那条 gate 探针修复前是 `created=2`、`closed=[false,false]`、`received=[out1]`；
+  /// B1 修复前是 `created=3`、`closed=[false,false,false]`；而**不带 gate 的连点两下**
+  /// （P，也就是 I5a 那个形状）修复前才是 `created=2`、`closed=[false,false]`、
+  /// `received=[out0,out1]`。所以 I5 的修复**不是**这次泄漏的来源（重叠一次就漏
   /// 一条，修之前也漏），也**没有**堵上这个洞；新出现的是那个假 `ConnectionFailed`
   /// 加 `Reconnected` 横幅。
   ///
