@@ -2521,7 +2521,16 @@ void main() {
       await w.start('ssh admin@10.0.0.1:22');
       await w.write('1\n2\n3');
       expect(await w.file!.exists(), isTrue);
-      expect(await logged(w), contains('3'));
+      // **别写成 `contains('3')`。** 表头那一行的时间戳 `2026-09-24 14:30:12.001`
+      // 本身就含 `3`，所以只要表头落了盘那条断言就永远绿 —— 而"表头落了盘"恰恰
+      // **不**是本条要证明的事（要证明的是缓冲区到阈值就落盘）。实测过：在
+      // `_flush` 里加一句 `lines.removeLast()`（正是本条想抓的"丢掉最后一行"），
+      // `contains('3')` 版本照样通过，只有兄弟用例抓得到。
+      // `'] N\n'` 只有正文行能满足 —— 表头行里没有任何 `]`。
+      final text = await logged(w);
+      expect(text, contains('] 1\n'));
+      expect(text, contains('] 2\n'));
+      expect(text, contains('] 3\n'));
     });
   });
 
@@ -2552,6 +2561,31 @@ void main() {
       expect((await w.file!.stat()).mode & 0x1FF, 0x180);
     });
   });
+
+  test('权限被改松之后，下一次 flush 会收紧回来（NFR-S-04 不只在新文件上生效）', () async {
+    await withClock(Clock.fixed(t0), () async {
+      final w = writer(flushEveryLines: 1);
+      await w.start('ssh admin@10.0.0.1:22');
+      await w.write('第一行');
+      expect((await w.file!.stat()).mode & 0x1FF, 0x180);
+      // 手工造出"进程在 writeAsString 与 chmod 之间被杀掉"留下的状态：
+      // 文件在、权限是 umask 默认的 0664。
+      Process.runSync('chmod', ['664', w.file!.path]);
+      expect((await w.file!.stat()).mode & 0x1FF, 0x1B4, reason: '前提：权限确实被改松了');
+
+      await w.write('第二行');
+
+      expect(
+        (await w.file!.stat()).mode & 0x1FF,
+        0x180,
+        reason: '判据必须是"当前权限"，不能是"文件是不是这次新建的" —— '
+            '后者在这种情形下会永远跳过收紧，日志就永久停在 0644',
+      );
+    });
+  },
+      skip: Platform.isWindows
+          ? 'chmod / mode 语义只在 Linux 上成立（NFR-S-04 本身也只针对 Linux）'
+          : null);
 
   test('写盘失败：不抛、不阻塞会话，且 onError 只回调一次（FR-L-06）', () async {
     // 用一个同名**文件**占住目录位置，让 parent.create 必然失败。
@@ -2652,6 +2686,10 @@ class LogWriter {
   final String deviceName;
 
   /// 写盘失败时调用**一次**（FR-L-06 的"失败时在输出区提示一次"）。
+  ///
+  /// **实现方不要在这里抛异常。** 它在 `_flush` 的 `catch` 里被**同步**调用，
+  /// 抛出去就会从 `write()` / `end()` 冒到会话循环里 —— 那正是 FR-L-06 要避免的
+  /// "日志坏掉拖垮会话"。要弹提示就把异常的处置留在回调内部。
   final void Function(Object error)? onError;
 
   /// 攒够多少行就落盘。可注入是为了让测试不必写 32 行才能观察缓冲。
@@ -2738,17 +2776,24 @@ class LogWriter {
     final lines = List<String>.of(_buffer);
     _buffer.clear();
     try {
-      final existed = await target.exists();
+      // 判据是**"当前权限对不对"**，不是"文件是不是这次新建的"。
+      // 用后者会留下一个补不回来的窗口：进程在 `writeAsString` 与
+      // `restrictToOwner` 之间被杀掉（或文件被外部以更松的权限重建），此后每次
+      // flush 都会看到"文件已存在"而跳过收紧 —— 一个装着设备配置的日志就**永久**
+      // 停在 umask 默认的 0644 上，而 NFR-S-04 存在的理由正是这些文件。
+      // `stat()` 本来就要调（原先是拿它判存在），顺带看一眼 mode 不额外花钱；
+      // 权限已经对了就不 chmod —— 每次追加都 chmod 是每次 flush 起一个进程，
+      // 一次长时间的会话能起几万个。
+      final stat = await target.stat();
       await target.parent.create(recursive: true);
       await target.writeAsString(
         '${lines.join('\n')}\n',
         mode: FileMode.append,
         flush: true,
       );
-      // 只在文件是这次新建的时候收紧权限（NFR-S-04）。每次追加都 chmod 就是
-      // 每次 flush 起一个进程 —— 一次长时间的会话能起几万个。文件被外部删掉
-      // 再重建的边角情况由 existed 兜住。
-      if (!existed) await restrictToOwner(target);
+      final loose = stat.type == FileSystemEntityType.notFound ||
+          (stat.mode & 0x1FF) != 0x180;
+      if (loose) await restrictToOwner(target);
     } catch (e) {
       // **一次失败就停**（FR-L-06）：磁盘满 / 无权限会一直失败，每行回调一次
       // 会把输出区刷爆，而用户从第一条提示就已经知道了。停掉之后本类不再碰
@@ -2763,7 +2808,7 @@ class LogWriter {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `flutter test test/data/log_writer_test.dart`
-Expected: `All tests passed!`（17 条）
+Expected: `All tests passed!`（18 条）
 
 - [ ] **Step 5: Commit**
 
