@@ -173,9 +173,31 @@ class ConnectionManager {
   }
 
   /// 发起连接。用户点击设备按钮时调用（FR-C-03）。
+  ///
+  /// **本方法拥有它替换掉的那条会话。** 会话是在这里被换掉的，所以拆掉旧的
+  /// 也是这里的责任：直接建新会话再覆写 `_session` / `_outputSub` / `_dispatcher`，
+  /// 旧的既没人 `close()`、订阅也再没人取消 —— 泄漏的不是内存，而是**一条仍插在
+  /// 设备上的 SSH 连接**（设备侧那个 vty 一直占着，直到它自己超时）。重连那条路
+  /// 不需要这段：`_onSessionDone` 与失败分支都会在排程之前先把字段**同步**清空，
+  /// 定时器醒来时手里已经没有旧会话了。
+  ///
+  /// **仍未解决（记录在案，本轮不改）**：两次**重叠**的 [connect]（用户连点两下，
+  /// 或手动连接与重连定时器同时落下）依然不安全。拆解作用在"当下的字段"而不是
+  /// "自己那次尝试的对象"上：第二次的拆除会把第一次刚建的会话关掉，而第一次随后
+  /// 失败时，catch 里那句 `unawaited(_teardownSession())` 拆的是**第二次**的新会话。
+  /// 根治要给每次尝试配一个代号（generation），让拆除只认自己的会话。
   Future<void> connect() async {
     if (_disposed) return;
     _userClosed = false;
+    // 动手之前先摘掉待命的重连定时器：手动连接一旦成功，`_attempt` 会归零，
+    // 而那个定时器并不知道又有人连上了 —— 它到点照跑，会再造一条会话把刚连上
+    // 的这条顶掉（`_session` 被覆写，这条就再也没人关了）。
+    _retryTimer?.cancel();
+    _retryTimer = null;
+    // 已经连着（或上一次拆除还没走完）时，先把旧会话拆干净再建新的，见上面的
+    // 所有权说明。这里 `await` 是安全的：按契约 `Session.close()` **不会**触发
+    // `done`（session.dart），所以旧会话不会在拆除途中反过来走一趟 `_onSessionDone`。
+    await _teardownSession();
     await _attemptConnect();
   }
 
@@ -215,6 +237,10 @@ class ConnectionManager {
       return;
     }
 
+    // `onError` 是保险，不是通道：两个真实实现都把 output 上的错误转成了 `done`
+    // 的**完成**（`_onError` → `_onDisconnected`），output 本身不会以错误结束。
+    // 真要有错误漏到这里，它是**静默**吞掉的 —— 没有事件、没有日志、没有状态
+    // 变化，所以别指望它能报信。
     _outputSub = session.output.listen((chunk) {
       if (!_output.isClosed) _output.add(chunk);
       _dispatcher?.onOutput(chunk);
