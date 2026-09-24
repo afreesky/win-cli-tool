@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:dartssh2/dartssh2.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:win_cli_tool/connection/known_host.dart';
 import 'package:win_cli_tool/connection/ssh_session.dart';
@@ -51,7 +52,9 @@ void main() {
     await session.connect();
 
     expect(asked, isNotNull);
-    expect(asked!.fingerprint, startsWith('SHA256:'));
+    // 与**真主机密钥**的指纹比，而不是只比一个 'SHA256:' 前缀：
+    // 前缀断言放得过任何自洽但错误的指纹（截断、或串了另一把密钥）。
+    expect(asked!.fingerprint, sshd.hostFingerprint());
     expect(store.all.single.fingerprint, asked!.fingerprint);
 
     await session.close();
@@ -81,9 +84,22 @@ void main() {
 
   test('用户拒绝指纹则连不上', () async {
     final store = InMemoryHostKeyStore();
-    final session = sessionWith(store, onUnknown: (h) async => false);
+    var asked = false;
+    final session = sessionWith(store, onUnknown: (h) async {
+      asked = true;
+      return false;
+    });
 
-    await expectLater(session.connect(), throwsA(anything));
+    // 具体类型，而不是 throwsA(anything)：后者被**任何**异常满足，分不出
+    // "因用户拒绝被拒"与"因别的缘故提前失败"。实测（Task 7 复检探针）：
+    // 两条拒绝路径抛的都是 SSHAuthAbortError，其 .reason 是 SSHHostkeyError
+    // —— 不是裸的 SSHHostkeyError。
+    await expectLater(
+      session.connect(),
+      throwsA(isA<SSHAuthAbortError>()
+          .having((e) => e.reason, 'reason', isA<SSHHostkeyError>())),
+    );
+    expect(asked, isTrue, reason: '拒绝分支真的被走到过 —— 否则这条用例是空转');
     expect(store.all, isEmpty);
 
     await session.close();
@@ -105,7 +121,13 @@ void main() {
       return true;
     });
 
-    await expectLater(session.connect(), throwsA(anything));
+    // 具体类型，与上一条同一判据：抛的必须是"因主机密钥被拒"这一类，
+    // 而不是随便什么提前失败（如注入的 ConnectionFailure）。
+    await expectLater(
+      session.connect(),
+      throwsA(isA<SSHAuthAbortError>()
+          .having((e) => e.reason, 'reason', isA<SSHHostkeyError>())),
+    );
     expect(asked, isFalse, reason: '有记录时不应回退到询问用户');
 
     await session.close();
@@ -137,8 +159,10 @@ void main() {
     final out = StringBuffer();
     final sub = session.output.listen(out.write);
 
-    // 用 printf 输出多字节字符，验证流式解码器跨分片正确
-    session.write('printf "中文测试OK\\n"\n');
+    // 期望串在**输入里不连续**：PTY 会把命令行原样回显，若直接写
+    // "中文测试OK"，回显就能满足断言，命令根本没执行也照样绿。
+    // 实测回显行为：`printf '中%s\n' 文测试OK` 原样回显，其中不含连续期望串。
+    session.write("printf '中%s\\n' 文测试OK\n");
 
     final deadline = DateTime.now().add(const Duration(seconds: 10));
     while (!out.toString().contains('中文测试OK') &&
