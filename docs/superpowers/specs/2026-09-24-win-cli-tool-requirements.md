@@ -534,8 +534,9 @@ lib/
   main.dart
   app.dart
   models/
-    device_profile.dart     设备配置模型
-    snippet.dart            命令片段模型
+    device_profile.dart     设备配置模型（`Snippet` 与 `JumpHost` 也定义在此文件里）
+    （snippet.dart 计划里单列过，实际**未建**：`Snippet` 落在 device_profile.dart，
+      计划 1 已冻结。此处按实际记录，不拆文件。）
     app_settings.dart       全局设置模型
   data/
     device_store.dart       devices.json 读写与迁移
@@ -1635,15 +1636,21 @@ typedef 注释，构造路径本就不该有 IO，钉调用次数只会冻住实
 
 ### 13.24 跳板机放弃后遗留的过期注释（2026-09-25，**刻意不修**）
 
-跳板机整体放弃（§4.2.1 / §10.2）之后，`lib/` 下仍有 **4 处 doc 注释**把「计划 3」
-当作将来的实现计划来引用。它们**今天是过期的**（计划 3 不会再写）：
+跳板机整体放弃（§4.2.1 / §10.2）之后，`lib/` 下仍有 **6 处注释**把「计划 3」
+当作将来的实现计划来引用（`grep -rn '计划 3' lib/`，2026-09-25 实测）。它们**今天是
+过期的**（计划 3 不会再写）：
 
-| 位置 | 现文 |
+| 位置 | 现文（节选） |
 |---|---|
 | `lib/connection/ssh_session.dart:36` | `建连方式。默认直连；计划 3 会注入带跳板机的实现。` |
-| `lib/connection/telnet_session.dart:19` | `建连方式。默认直连；计划 2 会注入带跳板机的实现。` |
+| `lib/connection/telnet_session.dart:19` | `建连方式。默认直连；计划 2 会注入带跳板机的实现。`（**编号本来就写错了** —— 计划 2 从没打算做跳板机；一并归入本节） |
 | `lib/connection/session_factory.dart:10` | `默认直连。计划 3 的跳板机在这里注入 —— …` |
 | `lib/connection/connection_socket.dart:12` | `直连可以，跳板机隧道也可以（计划 3 正是靠它把第 N+1 跳建在第 N 跳上，…` |
+| `lib/connection/connection_failure.dart:142` | `够不到；但计划 3 的隧道/跳板机连接器就会产出这个形状（实测过）。` |
+| `lib/connection/known_host.dart:77` | `于是这台设备被**永久**拒绝连接；计划 3 的错误文案正是让用户` |
+
+**这份清单是 `grep '计划 3'` 的结果，不含「计划 4/5」的引用** —— 那些**仍然有效**
+（持久化层与状态层/界面的计划编号不变，见 §10.2 末段）。
 
 **为什么不改：** 这四处都在**已经字节冻结**的代码里，且各自有一份**逐字节一致**的
 计划围栏（计划 2 的 `lib` 围栏 + md5 校验）。改一个字就要同时改代码与围栏、
