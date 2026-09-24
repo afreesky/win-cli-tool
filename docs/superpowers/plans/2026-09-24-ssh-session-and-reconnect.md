@@ -1020,11 +1020,43 @@ void main() {
     });
 
     test('认不出的 reason 优雅降级为 protocolError 并附上原文', () {
+      // **输入必须是真正认不出的 reason。** 这里原先是
+      // `SSHInternalError(StateError('something new'))` —— 那是一个**认得出**的
+      // reason，走的是上面那条 SSHInternalError 分支，根本碰不到兜底。于是
+      // 把兜底改成 `throw` 之后这条测试照样绿（实测过），而兜底恰恰是本 Task
+      // 点名要求的那条「优雅降级」。用一个非 hostkey、非 internal 的 SSHError
+      // 才能真正走到兜底。
       final f = classifyConnectionFailure(
-        SSHAuthAbortError('boom', SSHInternalError(StateError('something new'))),
+        SSHAuthAbortError('boom', SSHAuthFailError('weird')),
       );
       expect(f.kind, ConnectionFailureKind.protocolError);
-      expect(f.message, contains('something new'));
+      expect(f.message, contains('weird'));
+    });
+
+    test('reason 为 null 时同样降级，并附上 abort 自己的消息', () {
+      final f = classifyConnectionFailure(SSHAuthAbortError('boom'));
+
+      expect(f.kind, ConnectionFailureKind.protocolError);
+      expect(f.message, contains('boom'));
+    });
+  });
+
+  group('SSHSocketError 必须拆开按内层分类', () {
+    test('拒绝连接 → unreachable，超时 → timeout（不拆开就分不出这两者）', () {
+      // 守的是 `_classify` 里 `if (error is SSHSocketError) return
+      // _classify(error.error);` 那一支。它此前零覆盖 —— 把它改成 `throw`，
+      // 12 条用例照样全绿（实测过）。而这正是那句注释所声称的作用。
+      expect(
+        classifyConnectionFailure(
+          SSHSocketError(const SocketException('Connection refused')),
+        ).kind,
+        ConnectionFailureKind.unreachable,
+      );
+      expect(
+        classifyConnectionFailure(SSHSocketError(TimeoutException('timed out')))
+            .kind,
+        ConnectionFailureKind.timeout,
+      );
     });
   });
 
@@ -1154,7 +1186,10 @@ ConnectionFailure _classify(Object error) {
     );
   }
 
-  // SSHAuthAbortError 必须在 SSHAuthError 之前判 —— 它是子类。
+  // 注意：这里**没有** `is SSHAuthError` 分支，所以眼下不存在顺序问题。
+  // 将来若加，必须排在本分支之后 —— SSHAuthAbortError 与 SSHAuthFailError
+  // 都 implements SSHAuthError（ssh_errors.dart:40/49），`is SSHAuthError`
+  // 会把两者一起吞掉。
   if (error is SSHAuthAbortError) {
     final reason = error.reason;
 
@@ -1168,12 +1203,16 @@ ConnectionFailure _classify(Object error) {
       );
     }
     if (reason is SSHInternalError) {
+      // 文案不能断言成因。dartssh2 对这个类的自述是"不该发生的错误，多半是
+      // 库自身的缺陷"（ssh_errors.dart:14-16），算法协商失败只是它承载的
+      // **其中**一种情况。若一口咬定"与该设备协商加密参数失败"，一个库缺陷
+      // 就会被说成设备的算法问题 —— 用户跑去翻设备的 SSH 配置，而那正是
+      // §13.15 要避免的"把人指向错误的方向"。所以两种成因并列，并始终附原文。
       return ConnectionFailure(
         ConnectionFailureKind.protocolError,
-        '协议错误：与该设备协商加密参数失败。'
-        '常见原因是设备只提供已被淘汰的 SSH 算法'
-        '（ssh-rsa/SHA-1、aes-cbc、hmac-md5 等），V1 暂不支持。'
-        '原始信息：${reason.error}',
+        '协议错误：SSH 协议层报错。两种常见原因：设备只提供已被淘汰的 SSH '
+        '算法（ssh-rsa/SHA-1、aes-cbc、hmac-md5 等，V1 暂不支持），'
+        '或本程序/对端实现自身的缺陷。原始信息：${reason.error}',
         cause: error,
       );
     }
@@ -1235,7 +1274,7 @@ ConnectionFailure _classify(Object error) {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `flutter test test/connection/connection_failure_test.dart`
-Expected: 12 个用例全部 PASS
+Expected: 14 个用例全部 PASS
 
 - [ ] **Step 5: 反证测试的非空性（本计划的强制步骤）**
 
@@ -1303,8 +1342,13 @@ class _FailingConnector implements Connector {
 
 void main() {
   test('从未连上的会话，close() 必须能返回（不能永久挂起）', () async {
-    // spec §13.11：单订阅 controller 的 close() 在无人监听时永不完成。
-    // 这条路径就是"连不上之后清理"，挂在这里应用就退不掉。
+    // 守的是 close() 的空路径：会话从没连上时 _client / _session / _socket /
+    // _decodeSub 全是 null，任何一处写成非空断言都会在这里抛。而"连不上
+    // 之后清理"正是退出应用必经的一步，抛在这里应用就退不掉。
+    //
+    // 注意这里**不是** spec §13.11 的挂起风险：_output 是广播 controller，
+    // 无人监听时 close() 也会立刻完成（实测 ~4ms）。§13.11 说的是单订阅
+    // controller —— 那是 ConnectionSocket 的 _stream / _sink。
     final session = SshSession(
       profile: _profile(),
       connector: _FailingConnector(Exception('boom')),
@@ -1591,7 +1635,11 @@ class SshSession implements Session {
     await _client?.close();
     _socket?.dispose();
 
-    // 不 await：单订阅 controller 无监听者时 close() 永不完成（§13.11）。
+    // 不 await：_output 是**广播** controller，close() 即使无人监听也会
+    // 立刻完成，所以这里改成 await 也不会挂 —— 留 unawaited 只是不想在
+    // 关闭路径上等一个无意义的 future。真正会永不完成的是**单订阅**
+    // controller，那是 ConnectionSocket 的 _stream / _sink（§13.11），
+    // 与本类无关（见类文档）。
     unawaited(_output.close());
   }
 }
@@ -1604,10 +1652,32 @@ Expected: 4 个用例全部 PASS
 
 - [ ] **Step 5: 反证测试的非空性**
 
-把 `close()` 里的 `_closed = true;` 挪到方法**末尾**，并临时加一个能连上的假会话跑一遍 —— 或者更直接地对 `_onDisconnected` 的守卫做变异：删掉 `if (_closed) return;` 一行。
+本 Task 的 4 条单测能守住的只有两件事。逐条变异验证，**每次改完逐字还原**：
 
-Run: `flutter test test/connection/`
-Expected: 必须先看到**新增的失败**。若仍全绿，说明守卫没有被任何测试覆盖 —— Task 7 的集成测试会补上这条（它用真 sshd，能真实走完 close 路径）。
+1. `_client?.close()` 改成 `_client!.close()`（`_decodeSub?.cancel()`、
+   `_session?.close()` 同理）：必须让前 3 条用例变红 —— 它们守的就是
+   `close()` 的空路径。
+2. 让 `_buildHostKeyCallback()` 在 `verifyHostKey == false` 时返回 null：
+   必须让 `verify 回调必须被显式传入` 变红。
+
+Run: `flutter test test/connection/ssh_session_test.dart`
+
+**本 Task 覆盖不到的部分 —— 这是量的结论，不要当作通过：**
+
+- `_onDisconnected` 里的 `if (_closed) return;` 守卫。删掉它，预期 4 条用例
+  **全部照绿**：没有任何一条会真的建起 SSHClient，`_onDisconnected` 压根
+  不会被调用。跑一遍确认是这个结果；**若你看到红，那是发现，请报告**。
+- 主机密钥回调的**函数体**（find → 比对 → save / 拒绝）。没有任何用例
+  调用过它。
+- `onVerifyHostKey:` 这个**传参点**。`debugHostKeyCallbackIsNull` 读的是
+  `_buildHostKeyCallback()` 的返回值，而不是真正交给 `SSHClient` 的那个值 ——
+  所以把 `connect()` 里改成 `onVerifyHostKey: null`，这条用例依然绿。这是个
+  代理断言，别把它当成"接线已被验证"。
+
+这三条都由 **Task 7** 用真 sshd 覆盖（首次询问 / 接受后落库 / 拒绝则连不上 /
+指纹不一致则拒绝，以及 close-done 守卫）。所以这里**不要**自己造一个"能连上的
+假会话"去补 —— 一个假 SSH 服务端是 Task 7 的活，在这里造只会得到一个
+测不出真问题的替身。变异跑完，把上述结论如实写进报告。
 
 - [ ] **Step 6: 提交**
 
