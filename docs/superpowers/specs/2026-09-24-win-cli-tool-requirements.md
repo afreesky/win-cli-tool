@@ -885,3 +885,23 @@ Foo copyWith({Object? bar = _unset}) => Foo(
 
 7. **`SSHForwardChannel.close()` 会挂起，必须用 `destroy()`。**（计划 3 的跳板机直接受影响，先记在此处。）
    通道关闭是 `close()` 还是 `destroy()` 属于**必须显式选对**的一类 API —— 选错的表现是关连接时永久挂起，与 13.11 的症状相同但根因不同。
+
+**13.15 FR-C-06 的错误分类必须看 `SSHAuthAbortError.reason`，不能看顶层类型或消息**
+
+实测（2026-09-24，回环 sshd）三种失败的异常形态：
+
+| 场景 | 抛出的异常 | `.reason` |
+|---|---|---|
+| 主机密钥被用户拒绝 | `SSHAuthAbortError(Connection closed before authentication)` | `SSHHostkeyError(Hostkey verification failed)` |
+| **设备只提供旧算法**（`ssh-rsa`/`group14-sha1`/`aes128-cbc`/`hmac-md5`） | `SSHAuthAbortError(Connection closed before authentication)` | `SSHInternalError(Bad state: No matching key exchange algorithm)` |
+| 认证失败（口令/密钥不对） | `SSHAuthFailError` | 无 `reason` 字段 |
+
+**前两行的类型与 `toString` 完全相同。** 因此：
+
+- 若分类逻辑看**顶层类型**或**消息文本**，则「主机密钥被拒」与「设备太旧、算法协商不了」会被归成同一类，而 §10.2 已决定 V1 不支持旧算法 —— 也就是说**用户会看到「认证失败」**，然后去反复检查一个根本没问题的口令。这正是 FR-C-06 要避免的「不可读的失败原因」。
+- **唯一可靠的判据是 `.reason`**：`SSHHostkeyError` → 主机密钥问题（要提示用户去确认指纹，不是去改口令）；`SSHInternalError` → 内部/协商错误，归入「协议错误」。
+- `SSHInternalError` 里的算法协商失败**只能靠消息文本**（`'No matching key exchange algorithm'`）识别。这很脆弱，因此分类器对**认不出的 `reason` 必须优雅降级**：归入「协议错误」并**附上原始消息**，而不是抛出去或吞掉。
+
+另外要注意 `dartssh2/src/ssh_errors.dart` 里 `ssh_transport.dart:1408/1482` 抛的是**裸 `StateError`**，但它**不会**逃到调用方 —— 已被包装进 `SSHInternalError` 再放进 `reason`。所以分类器的 `catch` 仍应以 `SSHError` 为主，同时保留一个兜底分支处理非 `SSHError` 的意外异常。
+
+对应用例（计划 2 必须覆盖）：三个场景各自的分类结果，其中**第一行与第二行必须分类不同** —— 这是这条约束的回归测试。
