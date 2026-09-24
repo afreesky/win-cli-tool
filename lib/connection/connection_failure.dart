@@ -86,7 +86,13 @@ const int _etimedoutWindows = 10060;
 
 /// 超时文案。**只写一份**：`TimeoutException` 与 `SocketException` 的 errno
 /// 判定两条路径都要用它，复制两份就会有一天悄悄不一致 —— 同一种失败，
-/// 用户看到两种说法（实测过：只改其中一份，26 条用例全绿）。
+/// 用户看到两种说法。
+///
+/// 实测（2026-09-24，26 条用例）：拆成两份时，**只有一边的漂移是无声的**。
+/// `SocketException` 那一边被「errno 110」那条用例的 `contains('超时')` 钉着，
+/// 改它就会红；`TimeoutException` 那一边**没有任何用例断言它的文案**，
+/// 改它 26 条全绿。所以这里提成常量不只是防重复，也是把那条**没被钉住**
+/// 的路径收进同一个值里 —— 别看到一边有覆盖就以为两边都有。
 const String _timeoutMessage = '连接超时：目标设备在超时时间内没有响应';
 
 /// 把任意异常归类成 [ConnectionFailure]。
@@ -141,8 +147,10 @@ ConnectionFailure _classify(Object error) {
     // 握手/认证超时时抛 `SSHHandshakeError('Handshake timed out')` 与
     // `SSHAuthAbortError('Authentication timed out')` —— 但那两条只在 dartssh2
     // **自己设了超时定时器**时才成立，而 `handshakeTimeout` 与 `authTimeout`
-    // 的默认值都是 null（ssh_client.dart:299-302），V1 的 `lib/` 里**没有任何
-    // 一处**设过它们（grep 零命中）。所以那两条路径今天都到不了。
+    // 的默认值都是 null（ssh_client.dart:299-302），而 V1 的 `lib/` 里**没有
+    // 任何一处**给 `SSHClient` 设过它们 —— 这两个名字在 `lib/` 下的命中
+    // **无一在代码里**，全部落在这段注释自身（`grep -rn "handshakeTimeout\|authTimeout"`
+    // `lib/`）。所以那两条路径今天都到不了。
     //
     // 真正撑起 FR-C-13 的只有下面 `SocketException` 那一支的 errno 判定 ——
     // 别把这一支的绿色读成"超时路径已验证"。
