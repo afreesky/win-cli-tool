@@ -182,10 +182,31 @@ class ConnectionManager {
   /// 定时器醒来时手里已经没有旧会话了。
   ///
   /// **仍未解决（记录在案，本轮不改）**：两次**重叠**的 [connect]（用户连点两下，
-  /// 或手动连接与重连定时器同时落下）依然不安全。拆解作用在"当下的字段"而不是
-  /// "自己那次尝试的对象"上：第二次的拆除会把第一次刚建的会话关掉，而第一次随后
-  /// 失败时，catch 里那句 `unawaited(_teardownSession())` 拆的是**第二次**的新会话。
-  /// 根治要给每次尝试配一个代号（generation），让拆除只认自己的会话。
+  /// 或手动连接与重连定时器同时落下）依然不安全。真正的机制**不是**"两次拆除互相
+  /// 拆台"（曾经这样记过，实测**是错的**），而是**漏拆**：输掉的那次尝试走进 catch
+  /// 时，字段早已被对手清空，于是它那句 `unawaited(_teardownSession())` 是**空操作**；
+  /// 它接着发 `ConnectionFailed`、调 `_scheduleRetry()` —— 在前一条会话**还活着**的
+  /// 时候武装一个重连定时器。那个定时器的回调直接调 `_attemptConnect()`，**不经任何
+  /// 拆除**，于是把 `_session` / `_outputSub` / `_dispatcher` 静默覆写，前一条会话
+  /// 从此没人关。
+  ///
+  /// 实测（真实 async，gate 型夹具，握手中途 `close()` ⇒ `connect()` 抛错，60ms 退避）：
+  /// 连点两下的探针给出 `created=3`、`closed=[true,false,false]` —— `sessions[2]` 是
+  /// 当下那条，`sessions[1]` 成了**孤儿**（一个被占住的 vty）；再从每条会话各 emit
+  /// 一次，`received=[out1,out2]`，也就是**两条**会话同时往 `mgr.output` 里灌。
+  /// 同一次还多发了一个**假告警**（`ConnectionFailed` + `ReconnectScheduled`）和一个
+  /// `Reconnected` 横幅 —— 用户其实从没掉线。
+  /// "重连尝试在途时手动 connect()"的探针给出 `created=4`、
+  /// `closed=[true,true,false,false]`，同样一个孤儿。
+  ///
+  /// **修复前（`acdc10d`）的同两条探针：`created=2`、`closed=[false,false]`、
+  /// `received=[out0,out1]`。** 所以 I5 的修复**不是**这次泄漏的来源（重叠一次就漏
+  /// 一条，修之前也漏），也**没有**堵上这个洞；新出现的是那个假 `ConnectionFailed`
+  /// 加 `Reconnected` 横幅。
+  ///
+  /// 根治要给每次尝试配一个代号（generation），让拆除只认自己的会话。本轮**只记
+  /// 注释、不实现令牌**；但它必须在**任何界面从用户手势驱动 `connect()`** 之前落地。
+  /// 今天这个类里没有任何东西阻止重叠：没有"尝试在途"的闸门，也没有代际令牌。
   Future<void> connect() async {
     if (_disposed) return;
     _userClosed = false;
@@ -194,8 +215,16 @@ class ConnectionManager {
     // 的这条顶掉（`_session` 被覆写，这条就再也没人关了）。
     _retryTimer?.cancel();
     _retryTimer = null;
-    // 已经连着（或上一次拆除还没走完）时，先把旧会话拆干净再建新的，见上面的
-    // 所有权说明。这里 `await` 是安全的：按契约 `Session.close()` **不会**触发
+    // 已经连着时，先把旧会话拆干净再建新的，见上面的所有权说明。
+    // 这个保证**只在前一次拆除没有在途时才成立**：`_teardownSession()` 在任何
+    // await 之前就把字段取走并置空，所以第二次拆除对着已被清空的字段是**空操作**，
+    // `connect()` 会径直往下建新会话。实测：让上一次 `close()` 悬在半路，`connect()`
+    // 建出第 2 条会话时第 1 条的 `closed` 仍是 false（`created=2 closed=[false,false]`）。
+    // 结局是良性的 —— 第 1 次拆除终究会关掉它自己那条会话，最终 `closed=[true,false]`，
+    // 无孤儿 —— 但"已经连着（**或上一次拆除还没走完**）时都先拆干净"是**过度承诺**，
+    // 别照着它推理。
+    //
+    // 这里 `await` 是安全的：按契约 `Session.close()` **不会**触发
     // `done`（session.dart），所以旧会话不会在拆除途中反过来走一趟 `_onSessionDone`。
     await _teardownSession();
     await _attemptConnect();

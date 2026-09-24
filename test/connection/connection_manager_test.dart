@@ -67,7 +67,21 @@ class _FakeSession implements Session {
     closed = true;
     // 真实会话里 socket 在握手途中被关掉，connect() 必然抛错 —— 复现它。
     if (!(_gate?.isCompleted ?? true)) _gate!.complete();
-    unawaited(_output.close());
+    // **刻意不关 `_output` —— 这一点与两个真实实现都不一样，是故意的。**
+    //
+    // `Session` 的契约（session.dart）**没有**承诺 `close()` 会结束 `output`。两个
+    // 真实实现恰好都这么做（`_onDisconnected` 里 `_output.close()`），但那是这两个
+    // 具体类的实现细节，不是契约。夹具照抄这个细节的代价是**一条恒真的断言**：
+    // broadcast controller 的 `isClosed` 在 `close()` 之后**同步**变成 true，于是
+    // `emit` 里那个门把 stale chunk 直接丢掉 ——「被替换掉的会话不得再往 `mgr.output`
+    // 里灌数据」（I5a 下半段）想看的"订阅有没有被摘掉"根本没被看见，它只可能作为
+    // `closed == true` 的重述而失败。实测：把 `_teardownSession()` 里那句
+    // `await outputSub?.cancel();` 删掉，**26/26 全绿**。
+    //
+    // 夹具不关 output 之后，manager 的订阅所有权（它自己那句 `await outputSub?.cancel();`）
+    // 才真的被钉住：cancel 在 ⇒ stale chunk 到不了界面；cancel 不在 ⇒ 到得了、断言变红。
+    // manager 本来就不该依赖"两个具体类的 `close()` 顺手关了 output"这件没写进契约的事。
+    // **不要"修回去"。**
   }
 
   /// 模拟对端断开。[error] 给出时先记进 [lastError] —— 与两个真实实现里
@@ -78,7 +92,11 @@ class _FakeSession implements Session {
   }
 
   void emit(String s) {
-    if (!_output.isClosed) _output.add(s);
+    // 不设 `isClosed` 门：夹具的 `_output` 从不由 `close()` 关掉（见上），门恒真，
+    // 留着只会让"有人把 `close()` 里那行 `_output.close()` 修回去"变成一次**静默的
+    // 空操作** —— 而那正是本文件当初那条断言恒真的原因。去掉门之后，同样的手笔会
+    // 让这里直接抛 `StateError`，点名用例，红得响亮。
+    _output.add(s);
   }
 }
 
@@ -120,9 +138,19 @@ class _FakeFactory implements SessionFactory {
   Future<bool> Function(KnownHost)? get onUnknownHostKey => null;
 }
 
-/// 夹具的默认值与生产默认值**刻意保持一致**（`'\n'`、单条 `['enable']`），
-/// 两个参数只在用例显式传值时才不同 —— 否则上面那批用例断言的就不再是默认
-/// 行为，而"夹具的值恰好等于实现里硬编码的那个值"正是本文件要消灭的洞。
+/// 夹具的两个默认值，与生产默认值的关系**一同一不同**，别一概而论：
+///
+/// - `lineEnding` 默认 `'\n'`，与 `DeviceProfile.lineEnding` 的生产默认值**一致**
+///   （lib/models/device_profile.dart）；
+/// - `postLogin` 默认单条 `['enable']`，而 `DeviceProfile.postLoginCommands` 的生产
+///   默认值是 **`const []`**（同一个文件），两者**刻意不同**：除 I2 那条显式传两条的
+///   用例之外，所有用例都要让"连上后自动下发"这条路径真的跑起来，用生产默认值
+///   （空列表）它们就全都断言不到 FR-C-08 了。
+///
+/// 两个参数都只在用例显式传值时才取别的值。而"夹具的值恰好等于实现里硬编码的那个
+/// 值"这个洞，由 I2 的『登录后命令是多条时全部依次下发』堵住：它显式传
+/// `['enable', 'configure terminal']`，实现里若把登录后命令写死成 `['enable']`，
+/// 那条立刻变红。
 DeviceProfile _profile({
   List<String> postLogin = const ['enable'],
   String lineEnding = '\n',
@@ -992,6 +1020,11 @@ void main() {
 
     // 旧会话的订阅也必须摘掉：它还挂着的话，那条已被替换的连接会继续往
     // 界面灌数据（两个会话的回显混在一起，且谁也停不下来）。
+    //
+    // 这条断言钉的是 manager 自己那句 `await outputSub?.cancel();`：夹具的 `close()`
+    // **不关** `_output`（见 `_FakeSession.close` 的注释），所以上面那句
+    // `closed == isTrue` 通过之后，这次 emit 依然会真的送到订阅者手上 —— 把 cancel
+    // 删掉，stale chunk 就会到达界面，这条断言随之变红。
     sessions[0].emit('stale output');
     sessions[1].emit('live output');
     await Future<void>.delayed(const Duration(milliseconds: 20));
