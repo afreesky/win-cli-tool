@@ -1,0 +1,37 @@
+# ── Flutter / Dart ────────────────────────────────────────────
+.dart_tool/
+.packages
+.pub-cache/
+.pub/
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+**/doc/api/
+
+# 符号化与混淆产物
+app.*.symbols
+app.*.map.json
+
+# ── 编辑器 / IDE ──────────────────────────────────────────────
+*.iml
+*.ipr
+*.iws
+.idea/
+# .vscode/ 下可能含共享的 launch 配置，故默认不忽略
+
+# ── 本工具的运行时数据 ────────────────────────────────────────
+# 若把应用数据目录指到项目内，日志与草稿不应入库
+logs/
+drafts/
+
+# ── brainstorming 可视化草图的临时产物 ────────────────────────
+.superpowers/
+
+# ── 杂项 ──────────────────────────────────────────────────────
+*.class
+*.log
+*.swp
+.DS_Store
+Thumbs.db
+.history
+.buildlog/
