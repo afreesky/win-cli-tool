@@ -62,6 +62,7 @@ void main() {
   });
 
   test('构造参数逐个原样转交 SshSession（工厂只做转发，转错一个就是静默降级）', () {
+    final p = _profile(DeviceProtocol.ssh);
     final store = InMemoryHostKeyStore();
     Future<bool> onUnknown(KnownHost host) async => true;
     const injected = _FakeConnector();
@@ -75,7 +76,8 @@ void main() {
       onUnknownHostKey: onUnknown,
     );
 
-    final session = factory.create(_profile(DeviceProtocol.ssh)) as SshSession;
+    final session = factory.create(p) as SshSession;
+    expect(identical(session.profile, p), isTrue);
     expect(identical(session.hostKeyStore, store), isTrue);
     expect(identical(session.connector, injected), isTrue);
     expect(session.connectTimeout, timeout);
@@ -83,7 +85,8 @@ void main() {
     expect(identical(session.onUnknownHostKey, onUnknown), isTrue);
   });
 
-  test('Telnet 也拿到同一个 connector 与超时', () {
+  test('Telnet 也拿到同一个 connector、超时与 profile', () {
+    final p = _profile(DeviceProtocol.telnet);
     const injected = _FakeConnector();
     const timeout = Duration(seconds: 7);
     final factory = SessionFactory(
@@ -92,9 +95,20 @@ void main() {
       connectTimeout: timeout,
     );
 
-    final session =
-        factory.create(_profile(DeviceProtocol.telnet)) as TelnetSession;
+    final session = factory.create(p) as TelnetSession;
+    expect(identical(session.profile, p), isTrue);
     expect(identical(session.connector, injected), isTrue);
     expect(session.connectTimeout, timeout);
+  });
+
+  test('默认值：直连、15 秒超时、profile 原样、不确定就拒绝', () {
+    final p = _profile(DeviceProtocol.ssh);
+    final factory = SessionFactory(hostKeyStore: InMemoryHostKeyStore());
+
+    final session = factory.create(p) as SshSession;
+    expect(identical(session.profile, p), isTrue);
+    expect(session.connector, isA<DirectConnector>());
+    expect(session.connectTimeout, const Duration(seconds: 15));
+    expect(session.onUnknownHostKey, isNull);
   });
 }
