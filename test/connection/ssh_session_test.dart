@@ -379,6 +379,18 @@ void main() {
     );
     // 拨号确实发生过（否则上面的"超时"可能只是 open 从来没被调用）。
     expect(connector.openCount, 1);
+
+    // 超时的收尾也要真的做完：`on TimeoutException` 那一支必须把这次
+    // `connect()` **自己**建起来的 client 关掉（以及 socket）—— 不能指着
+    // "调用方总会 close()"把它们留给对方。`isClosed` 读的是
+    // `_transport._doneCompleter.isCompleted`，只有 `client.close()` 走完
+    // 才会为真，所以它正好钉住"收尾做了、而且做完了"。
+    // 删掉那一支里的 `await client.close(); socket.dispose();`，这条就红。
+    expect(
+      session.debugLastBuiltClient?.isClosed,
+      isTrue,
+      reason: '超时后必须把这次 connect() 造出来的 client 关掉，否则连接泄漏',
+    );
   });
 
   // ---------------------------------------------------------------------

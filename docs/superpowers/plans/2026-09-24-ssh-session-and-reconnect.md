@@ -1736,18 +1736,31 @@ Expected: 26 个用例全部 PASS
 | 23 | 把主机密钥那条消息末尾的可操作指引换成一句没有指引的话 | 「主机密钥的文案指向指纹，不指向口令」 |
 | 24 | 把 `_timeoutMessage` 的值改成**不含「超时」**的一句 | 「Socket.connect 到点（errno 110）→ timeout，不是 unreachable」 |
 
-**第 1、6 条的红比原先记的多 —— 本轮整表重跑量出来的，别照抄旧数。** 第 1 条实测
-**4 红**（原先记 2）：除了「主机密钥被用户拒绝 → hostKey」与「两者必须分类不同」，
-删掉那一支还让「每个 kind 的 message 都非空、且不含字面 null」红（`hostKey` 那个样本
-掉进"认不出的 reason"兜底，成了 `protocolError`，于是集合里少了一个 kind —— 断言
-`Expected: Set:[…timeout, authFailed, unreachable, protocolError, jumpHostFailed,
-unknown]` 里 `hostKey` 不见了）与「主机密钥的文案指向指纹，不指向口令」红（文案退化成
-`协议错误：连接在认证完成前中断。原始信息：SSHHostkeyError(Hostkey verification
-failed)`，`contains('指纹')` 落空）。第 6 条实测 **3 红**（原先记 2）：多出来的是同一条
-「每个 kind 的 message 都非空、且不含字面 null」—— errno 判定整块删掉后，`timeout`
-那个样本被归成 `unreachable`，`ConnectionFailureKind.timeout` 从集合里消失。
-**这两条多出来的红不是新缺陷**：那张"每个 kind 都非空"的清点表按 kind 逐个分类样本，
-任何一条分支消失都会让它少一个 kind —— 它同时也是一张**分支存在性**的清单。
+**第 1、6 条的红数变了，可 `connection_failure_test.dart` 这一轮**一个字都没动**
+—— 所以这不是"新用例带来的新红"，是**原先记的数过期了**。** 该文件改动前后都是
+26 条、md5 `3747448fe32410fba1ec51f5410f3360`。事情是这样：这张表是 Task 3 当时
+量的，而 Task 3 自己后面的返工轮次又往测试文件里加了两条用例（「每个 kind 的
+message 都非空、且不含字面 null」与「主机密钥的文案指向指纹，不指向口令」），
+**加完之后整张表没有再跑过一遍**，于是这两行的"必须变红"清单一直停在加用例之前。
+本轮整表重跑把它纠正了：**第 1 条实测 4 红**（原先记 2）—— 除原有的「主机密钥被
+用户拒绝 → hostKey」与「两者必须分类不同」，还红「每个 kind 的 message 都非空、
+且不含字面 null」（`hostKey` 那个样本掉进"认不出的 reason"兜底，成了
+`protocolError`，于是集合里少了一个 kind）与「主机密钥的文案指向指纹，不指向口令」
+（文案退化成 `协议错误：连接在认证完成前中断。原始信息：
+SSHHostkeyError(Hostkey verification failed)`，`contains('指纹')` 落空）；
+**第 6 条实测 3 红**（原先记 2），多出来的同样是「每个 kind 的 message 都非空、
+且不含字面 null」—— errno 判定整块删掉后，`timeout` 那个样本被归成 `unreachable`，
+`ConnectionFailureKind.timeout` 从集合里消失。
+
+**这不是测量误差，是 §13.19 记下的那条失效方式：变异表的结论会随实现一起过期。**
+一条"该红却全绿"的旧记录不会自己报警，只会让后来的人以为那条用例很弱。
+**没动过的文件也会有过期的表** —— 本轮重跑的起因不是 Task 3 变了，是**实现变了**
+（`Session.lastError` 与 `SshSession.connect()` 的拨号后超时），全表重跑顺带把
+Task 3 自己的陈账翻了出来。（Task 4 那边第 1 条 6 → 7 红是**另一回事**：新用例落在
+同一个 `close()` 空路径上，文件确实变了 —— 两边别混着记。）
+
+顺带一条可复用的性质：那张"每个 kind 都非空"的清点表按 kind 逐个分类样本，
+**任何一条分支消失都会让它少一个 kind** —— 它同时也是一张**分支存在性**的清单。
 第 2、8 条要删**整支**：只删 `if (...) {` 一行会留下语法破损的残块，编译不过 ——
 那不是有效的变异，会让人误以为"变红了"。第 8 条尤其要注意：把 `is SSHKeyDecodeError`
 改成 `is Never` 之类的"半删"会让分支体里的 `error.message` 编译不过，那时的红是
@@ -2249,6 +2262,18 @@ void main() {
     );
     // 拨号确实发生过（否则上面的"超时"可能只是 open 从来没被调用）。
     expect(connector.openCount, 1);
+
+    // 超时的收尾也要真的做完：`on TimeoutException` 那一支必须把这次
+    // `connect()` **自己**建起来的 client 关掉（以及 socket）—— 不能指着
+    // "调用方总会 close()"把它们留给对方。`isClosed` 读的是
+    // `_transport._doneCompleter.isCompleted`，只有 `client.close()` 走完
+    // 才会为真，所以它正好钉住"收尾做了、而且做完了"。
+    // 删掉那一支里的 `await client.close(); socket.dispose();`，这条就红。
+    expect(
+      session.debugLastBuiltClient?.isClosed,
+      isTrue,
+      reason: '超时后必须把这次 connect() 造出来的 client 关掉，否则连接泄漏',
+    );
   });
 
   // ---------------------------------------------------------------------
@@ -3343,10 +3368,13 @@ Linux，非 root）：**实现一改，整张表就静默过期**，所以改了
 **这一轮的教训**：加了 `on SSHKeyDecodeError` 那一支（见第 25—27 条）之后，第 6 条
 的**机制变了**（红一样是 1 条，红的断言换了）—— 整表重跑不是形式主义，是它把这件事
 量出来的。
-**本轮又整表重跑了一遍**（2026-09-25，Task 6 前置的两处改动之后，27 条逐条）：
-**只有第 1 条的红数变了（6 → 7，见下），其余 26 条逐条一致**；第 2 条那个编译失败、
-第 23 条那个 0 红对照、第 23b 条退化成的 30s 超时，也都与原先记的一致。这是"实现一改、
-整张表就静默过期"的第二次实证 —— 别以为只有被改到的那些行需要重跑。
+**本轮又整表重跑了一遍**（2026-09-25，Task 6 前置的两处改动**以及**给超时用例补的
+那条收尾断言之后，27 条逐条）：**只有第 1 条（6 → 7）与第 24 条（1 → 2）的红数变了**，
+其余 25 条逐条一致；第 2 条那个编译失败、第 23 条那个 0 红对照、第 23b 条退化成的 30s
+超时，也都与原先记的一致。**两处变化来自同一条新增用例** —— 那条超时用例同时踩在
+`close()` 的空路径（第 1 条）与 `debugLastBuiltClient` 这个缝（第 24 条）上，
+所以它一落地就有两行跟着涨。这是"实现一改、整张表就静默过期"的第二次实证 ——
+别以为只有被改到的那些行需要重跑。
 
 1. `close()` 里三处 `?.` 改成 `!`（`_decodeSub?.cancel()`、`_session?.close()`、
    `_client?.close()`）：必须让 `close()` 相关用例变红。实测 **7 红** ——
@@ -3459,8 +3487,9 @@ Linux，非 root）：**实现一改，整张表就静默过期**，所以改了
     **这一行的教训**：一条红的"成色"是夹具的属性，不只是实现的属性；把红降级成
     超时不算发现，但也不该被当成"红了就行"。
 24. **（N6）`connect()` 里直接内联**一个 `SSHClient(…, onVerifyHostKey: null)`
-    （**不**经由 `_createClient()`）：实测 **1 红**
-    （「connect() 自己那条传参路径：它建出来的 client 也必须拿到非 null 回调」）。
+    （**不**经由 `_createClient()`）：实测 **2 红**
+    （「connect() 自己那条传参路径：它建出来的 client 也必须拿到非 null 回调」
+    与「拨号之后的阶段也有超时：对端接了 TCP 却不说话时不能永远挂着」）。
     **这是本轮新增里最要紧的一条**：它证明用例「connect() 自己那条传参路径…」钉的是
     `connect()` **自己的构造点**，而不是"工厂会造出什么"。此前只钉
     `debugBuildClient()` 时，这个内联写法编译得过、**整套用例照绿**（复审实测），
@@ -3468,6 +3497,10 @@ Linux，非 root）：**实现一改，整张表就静默过期**，所以改了
     **注意它红的机制**：内联绕开工厂 ⇒ `debugLastBuiltClient` 保持 null ⇒ 那条用例的
     **第一条**断言（`isNotNull`）先红。这不是"红错了"，它红的正是"connect() 没走那个
     唯一的构造点"这条不变量 —— 而 `onVerifyHostKey` 的非空保证**只**附着在那个构造点上。
+    **本轮 1 → 2 红**：超时用例末尾那条收尾断言（
+    `expect(session.debugLastBuiltClient?.isClosed, isTrue)`）读的是**同一个缝**（
+    `debugLastBuiltClient`），内联之后它也是 null，于是它也红。两处红钉的是同一条
+    不变量 —— "`connect()` 必须走那个唯一的构造点"，不是两件事。
 25. **（N7）删掉 `on SSHKeyDecodeError` 那一支**（新加的）：实测 **1 红**
     （「损坏的 RSA 私钥 → 中文 ConnectionFailure，一个英文类名都不许漏」）——
     异常落回兜底 `catch`，`原始信息：$error` 走 `SSHKeyDecodeError.toString()`
@@ -3507,11 +3540,19 @@ Run: `flutter test test/connection/ssh_session_test.dart`
   shell **成功**拿到之后，而假连接永远走不到那两步。
   （`_onDisconnected` 那一处同类守卫**已经**有反证了 —— 见第 22 条，
   它是从 `debugReportOutputError()` 这个缝进去的。）
-- **`connect()` 超时分支的收尾没有用例钉**（本轮新增的空路径）。删掉
+- `connect()` 超时分支的收尾**已经有用例钉住了**（本轮补上的断言）。删掉
   `on TimeoutException` 里的 `await client.close(); socket.dispose();`（只留
-  `rethrow`），实测 **0 红（25 条全绿）**：那条超时用例只看 `connect()` 抛什么、
-  `connector.openCount` 是多少，看不见 socket / client 有没有被收掉。要钉住它，
-  需要一条能观察到"超时后底层连接确实关了"的用例 —— 今天没有。
+  `rethrow`），实测 **1 红**，点名用例「拨号之后的阶段也有超时：对端接了 TCP 却
+  不说话时不能永远挂着」，失败信息是它自己的 reason
+  `超时后必须把这次 connect() 造出来的 client 关掉，否则连接泄漏`。
+  钉住它的那条断言是 `expect(session.debugLastBuiltClient?.isClosed, isTrue)` ——
+  `SSHClient.isClosed`（`dartssh2` 4.1.0 `ssh_client.dart:280`）读的是
+  `_transport._doneCompleter.isCompleted`，只有 `client.close()` **走完**才会为真，
+  所以它正好钉住"收尾做了、而且做完了"；`debugLastBuiltClient` 则是
+  `SshSession` 唯一的那个构造点留下的缝（第 24 条变异也读它）。
+  **注意这条断言非空的前提是"这条用例真的拨过号"** —— 它前面那条
+  `expect(connector.openCount, 1)` 就是那个前提，二者缺一，`isClosed` 都可能因为
+  "压根没建 client"而恰好为真/为 null。
   （它与上面 `close()` 的空路径是**两回事**：第 1 条变异守的是 `SshSession.close()`，
   这一条守的是 `connect()` 超时那一刻的收尾，没有别的东西覆盖。）
 - **并发**两次 `connect()`。入口守卫只挡"已关闭"这一种；同时进来两次时，第二次会
@@ -3960,7 +4001,7 @@ shell 三段**没有任何上限**：一台"接受了 TCP 却不说话"的设备
 （`_timeoutMessage`），这一改让那一支第一次有了真实调用方。
 （两个定时器仍然没设，`connection_failure.dart` 里那条 `grep` 结论依旧成立，**别删**。）
 
-### 三、本轮实跑的变异证据，以及三处"预期全绿"
+### 三、本轮实跑的变异证据，以及剩下的两处"预期全绿"
 
 - **Change 1**：删掉 `TelnetSession._onDisconnected` 里的
   `if (error != null) _lastError = error;` → **1 红**，点名用例
@@ -3971,14 +4012,24 @@ shell 三段**没有任何上限**：一台"接受了 TCP 却不说话"的设备
   `await _authenticatedShell(client, socket)`）→ **1 红**，点名用例
   「拨号之后的阶段也有超时：对端接了 TCP 却不说话时不能永远挂着」，失败信息
   `Expected: not 'connect() 一直没有返回' / Actual: 'connect() 一直没有返回'`。
-- **三条"预期全绿"的实测**（新代码里未被覆盖的部分，如实记下，**不要读成"已经覆盖"**）：
-  删掉超时分支里的收尾 `await client.close(); socket.dispose();`（只留 `rethrow`）
-  → **0 红（25 条全绿）**；删掉 `_authenticatedShell` 里认证后的 `if (_closed)`
+- **超时分支的收尾：从"空路径"变成了"有钉"**。第一轮量它的时候（超时用例还只有
+  `connect()` 抛什么、`connector.openCount` 是多少这几条断言）删掉
+  `on TimeoutException` 里的 `await client.close(); socket.dispose();`（只留
+  `rethrow`），实测 **0 红（25 条全绿）** —— 收没收拾干净，外面看不见。
+  本轮给那条用例补了一条收尾断言
+  （`expect(session.debugLastBuiltClient?.isClosed, isTrue)`）之后，同一个变异
+  变成 **1 红**，点名用例「拨号之后的阶段也有超时：对端接了 TCP 却不说话时不能永远
+  挂着」，失败信息是它自己的 reason
+  `超时后必须把这次 connect() 造出来的 client 关掉，否则连接泄漏`。
+  这条断言不是"加上去好看"：**删掉实现里的收尾，它就红**（上面那句 0 红 → 1 红
+  就是这条反证），非空性是量出来的。
+- **两条"预期全绿"的实测**（新代码里仍然未被覆盖的部分，如实记下，
+  **不要读成"已经覆盖"**）：删掉 `_authenticatedShell` 里认证后的 `if (_closed)`
   → **0 红**；删掉 shell 之后那个 `if (_closed)` → **0 红**。
-  后两条与 Task 4「覆盖不到的部分」原有结论一致，**但理由要订正**：现在**有**用例走到
+  这两条与 Task 4「覆盖不到的部分」原有结论一致，**但理由要订正**：现在**有**用例走到
   `await client.authenticated`（就是新增的超时用例，它是**失败**着走出来的），够不着
   那两处守卫是因为它们分别在认证**成功**返回后与 shell **成功**拿到后，而假连接永远
-  走不到那两步。第一处（超时分支的收尾）是**新引入**的空路径，本轮新量出来的。
+  走不到那两步。
 
 ---
 
