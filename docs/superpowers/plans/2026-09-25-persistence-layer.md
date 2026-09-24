@@ -2829,7 +2829,15 @@ git commit -m "feat(data): 日志落盘（§5.6 格式 / 缓冲 / 失败只报�
 **核心约束：日志与输出区必须给出同一份文本。** §5.6 要求「日志记录剥离控制符后
 的文本，**与输出区所见一致**」。做法是**让两者用同一个函数**：输出区要颜色所以调
 `parseAnsi`，日志只要文本所以调 `stripToPlainText`（它的实现就是 `parseAnsi` 的
-拼接）。Step 6 把 `LogWriter` 从 `stripAnsi` 切过来，一致性因此是**构造上成立**的。
+拼接）。Step 6 把 `LogWriter` 从 `stripAnsi` 切过来，两者的**规则**因此是同一套，
+不靠两边各自遵守约定。
+
+**但"一致"带着一个前提，别读成无条件的**：这两个函数**每次调用都独立**，不保留
+跨调用的解析状态。把一条控制序列从中间切开分两次喂，后一次会把前半个序列当普通
+文本留下 —— 实测 `'\x1b['` + `'31mred'`：整段一次喂得到 `red`，分两次喂得到
+`\x1b[31mred`。所以**调用方必须按同样的边界喂**：计划 5 的输出区若要缓存半个序列
+才能正确渲染，日志就得从**同一处缓冲**取文本，否则日志里会留下字面的控制序列
+—— 那正是 §5.6 要防的。这条是**计划 5 的前置条件**，不是本计划能关掉的。
 
 **为什么不继续用 `stripAnsi`（`lib/render/ansi.dart`，计划 1 已冻结）：**
 它和"逐字符扫描"的解析器在两类输入上会分叉（下面有实测数字），而 `stripAnsi`
@@ -3308,8 +3316,16 @@ class AnsiSpan {
 
 /// 把带控制序列的文本切成样式片段（FR-O-03）。
 ///
-/// **输出区用它，日志用 [stripToPlainText]**（就是它的拼接），所以 §5.6 的
-/// 「日志与输出区所见一致」是构造上成立的，不靠约定。
+/// **输出区用它，日志用 [stripToPlainText]**（就是它的拼接），所以两者的
+/// **规则**是同一套 —— §5.6 的「日志与输出区所见一致」不靠两边各自遵守约定。
+///
+/// **但"一致"有一个前提，别读成无条件的**：本函数**每次调用都是独立的**，
+/// 不保留跨调用的解析状态。把一条控制序列从中间切开分两次调用，两边就会分道
+/// 扬镳 —— 实测 `'\x1b['` + `'31mred'`：整段一次喂进去得到 `red`，分两次喂得到
+/// `\x1b[31mred`（第二次只看到裸文本，前半个序列成了普通字符）。所以**调用方
+/// 必须按同样的边界把同一段输入喂给两边**：计划 5 的输出区若要缓存半个序列才能
+/// 正确渲染，日志就必须从**同一处缓冲**取文本，否则日志里会留下字面的控制序列
+/// —— 那正是 §5.6 要防的。
 ///
 /// 与 `lib/render/ansi.dart` 的 `stripAnsi`（命令层在用）有两处**已实测、
 /// 刻意不改**的分叉，各有一条用例钉着：
@@ -3328,6 +3344,27 @@ List<AnsiSpan> parseAnsi(String input, {AnsiStyle initial = AnsiStyle.none}) {
   final buffer = StringBuffer();
   var style = initial;
 
+  // 当前**还没定型**的那一段文本，以及它的样式。样式一变（或输入走完）才
+  // 物化成 [AnsiSpan]。
+  //
+  // **别写回"每次 flush 时 `spans.last.text + text`"那个形状**：它只要"新片段
+  // 与上一个同样式"就要把已经攒起来的那一大段**整个复制**一遍，于是**二次**。
+  // 触发它的不是"有颜色"，恰恰是**样式没变**：设备每行吐一个**冗余**的
+  // `\x1b[0m`（或重述同一个 `\x1b[1m`）时，整段输出会并成一个越来越长的片段，
+  // 每次都重抄一遍。实测 256 KB：逐行冗余 `\x1b[0m` 70.3 ms → 5.5 ms（12.7×），
+  // 逐行重述 `\x1b[1m` 67.0 ms → 7.1 ms（9.4×）；旧实现 8/64/256 KB 是
+  // 0.66/8.2/70.3 ms —— 四倍数据涨十倍，形状本身就是二次的。样式**每行都换**
+  // 的输入（`\x1b[32m…\x1b[0m`）两边一样快，因为那条路上本来就不合并。
+  // [flush] 在每个输出块上都会走，这个差别到了界面上就是"卡一下"。
+  final run = StringBuffer();
+  var runStyle = initial;
+
+  void emitRun() {
+    if (run.isEmpty) return;
+    spans.add(AnsiSpan(run.toString(), runStyle));
+    run.clear();
+  }
+
   void flush() {
     if (buffer.isEmpty) return;
     final text = buffer.toString();
@@ -3335,12 +3372,9 @@ List<AnsiSpan> parseAnsi(String input, {AnsiStyle initial = AnsiStyle.none}) {
     // 相邻同样式合并。`a\x1b[0mb` 必须是一个片段：不合并的话每个 SGR 边界
     // 都会切一刀，计划 5 的 TextSpan 会碎成一地，而且"样式没变"这件事在
     // 结果里看不出来。
-    if (spans.isNotEmpty && spans.last.style == style) {
-      final last = spans.removeLast();
-      spans.add(AnsiSpan(last.text + text, style));
-    } else {
-      spans.add(AnsiSpan(text, style));
-    }
+    if (runStyle != style) emitRun();
+    runStyle = style;
+    run.write(text);
   }
 
   var i = 0;
@@ -3388,11 +3422,15 @@ List<AnsiSpan> parseAnsi(String input, {AnsiStyle initial = AnsiStyle.none}) {
   }
 
   flush();
+  emitRun();
   return spans;
 }
 
 /// 剥离控制符，只留文本。**日志用它，输出区用 [parseAnsi]** —— 两条路径共用
-/// 一套规则，§5.6 的「与输出区所见一致」因此是构造上成立的。
+/// 一套规则，§5.6 的「与输出区所见一致」因此不靠约定维持。
+///
+/// 与 [parseAnsi] 一样**每次调用独立**：跨调用被切成两半的控制序列会退化成
+/// 字面文本（见 [parseAnsi] 的说明）。要一致，就得**按同样的边界喂**。
 String stripToPlainText(String input) =>
     parseAnsi(input).map((span) => span.text).join();
 
@@ -3591,8 +3629,10 @@ import '../render/ansi_parser.dart';
     final clean = stripToPlainText(text);
 ```
 
-同时把 `write()` 上方的文档注释按事实改一句：现在剥离规则来自
-`ansi_parser.dart`，与输出区同源（原来的注释只说"§5.6 要求一致"，没说怎么保证）。
+同时把 `write()` 上方的文档注释按事实改两句：现在剥离规则来自
+`ansi_parser.dart`，与输出区同源（原来的注释只说"§5.6 要求一致"，没说怎么保证）；
+**并且要写明那个前提** —— 剥离函数每次调用独立，喂进来的**边界必须相同**，否则
+半个控制序列会以字面形式落进日志（见上面的「但"一致"带着一个前提」）。
 
 跑两个文件确认都没坏：
 
