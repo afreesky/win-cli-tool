@@ -44,9 +44,13 @@
   `Target of URI doesn't exist`。判据看性质（红在文件上），别去比对字面。
 - **提交信息末尾统一附 `Co-Authored-By: Claude Code <noreply@anthropic.com>`**，
   与 `c965f31` / `b0ff29d` / `e8adc08` 一致。下面各 Step 5 里只写了主题行。
-- **Task 2~9 的围栏在写计划时已预跑过一遍**（`dart analyze` + `flutter test`，
-  逐条改到绿）。做这件事的原因就是 Task 1：它的围栏自己有编译错误
+- **Task 2~9 的围栏在写计划时已预跑过一遍**（`dart analyze` + `flutter test`）。
+  做这件事的原因就是 Task 1：它的围栏自己有编译错误
   （`library;` 写在 `import` 后面），到实现阶段才暴露，白跑一个来回。
+  **但别把它读成"每条中间提交的 `dart analyze` 都是干净的"** —— Task 3 就是反例：
+  它的围栏带着一个 `unused_field` 警告（`_rawJumpHosts` 要到 Task 4 的 `save()`
+  才被读）。那是**知情的**中间状态，不是漏改。门槛是**九条全做完之后 analyze 干净**，
+  不是每条提交都干净。
   **这不改变 Step 2 的做法** —— Step 2 的假红证明的是"文件还不存在"，
   与围栏本身对不对是两件事，仍然要跑、仍然要按假红判据读。
   各 Step 4 的**条数是实测值**，不是估的；对不上就是改动引入了偏差。
@@ -613,19 +617,20 @@ void main() {
     expect(result.devices.map((d) => d.name), ['好的1', '好的2']);
     expect(result.issues, hasLength(1));
     expect(result.issues.single.kind, LoadIssueKind.corruptEntry);
-    expect(result.issues.single.message, contains('1'),
+    expect(result.issues.single.message, contains('第 1 条'),
         reason: '要指出是第几条（0 基下标 1），否则用户不知道去改哪一条');
   });
 
-  test('构造期抛 ArgumentError 的也要被逐条目隔离（不是只 catch TypeError）', () async {
+  test('构造期抛出的 FormatException 与 TypeError 都要被逐条目隔离', () async {
     await write({
       'schemaVersion': 2,
       'jumpHosts': <Object?>[],
       'devices': [
         device('ok', name: '好的'),
         // protocol 是未知名字 -> DeviceProtocol.fromName 抛 FormatException；
-        // 这里再放一条值校验型的错误：port 传字符串 -> TypeError。
-        // 两条都必须只影响自己。
+        // port 传字符串 -> 模型里 `as int` 抛 TypeError。两条都必须只影响自己。
+        // 这条用例真正钉住的是 catch 的**宽度**：写成 `on TypeError`，上面那条
+        // FormatException 就会逃出整个 load()，下面的 hasLength(2) 立刻变红。
         {...device('badproto'), 'protocol': '不存在的协议'},
         {...device('badport'), 'port': '22'},
       ],
@@ -782,6 +787,36 @@ void main() {
     expect(result.devices.single.password, isNull);
     expect(result.issues, isEmpty);
   });
+
+  test('jumpHosts 形状不对时不让整次加载崩掉（NFR-R-03）', () async {
+    await write({
+      'schemaVersion': 2,
+      // 手改坏的一个键。**不能**让它把 load() 掀翻 —— 那样调用方拿不到
+      // DeviceLoadResult、文件也不会被留档，于是**每次启动都崩**。
+      'jumpHosts': '不是数组',
+      'devices': [device('d1')],
+    });
+    final result = await store().load();
+    expect(result.devices.single.id, 'd1');
+  });
+
+  // 两个字段都要钉：`postLoginCommands` 是**连接时**被 ConnectionManager 遍历的，
+  // `jumpHostIds` 则是在**存盘**时被 `toJson` + `jsonEncode` 遍历的 —— 两根都不在
+  // 本函数的 try 里，只有加载期把惰性视图收掉才能拦住。
+  for (final field in ['postLoginCommands', 'jumpHostIds']) {
+    test('惰性 .cast 的坏元素（$field）在加载期就被逮住，该条被跳过', () async {
+      final bad = device('d2')..[field] = [5];
+      await write({
+        'schemaVersion': 2,
+        'jumpHosts': <Object?>[],
+        'devices': [device('d1'), bad],
+      });
+      final result = await store().load();
+      expect(result.devices.map((d) => d.id), ['d1'],
+          reason: '坏记录必须被跳过 —— 报告了 corruptEntry 却还留在列表里更难查');
+      expect(result.issues.single.kind, LoadIssueKind.corruptEntry);
+    });
+  }
 }
 
 /// 假密钥库：**记录里没有 password 字段也拿得到密码**。这是"接口真的被用上了"
@@ -844,7 +879,12 @@ enum LoadIssueKind {
   /// 某一条记录坏了，已跳过。其余记录不受影响。
   corruptEntry,
 
-  /// 整个文件坏了，已留档，按默认值启动。
+  /// 整个文件读不出设备，按空配置启动。
+  ///
+  /// **留档与否取决于是哪一步发现的**，别照字面读成"一定留了档"：解析失败那条路
+  /// 会 `quarantine()`；`devices` 数组缺失或形状不对那条路**不留档** —— 那种文件是
+  /// **可以手改修好的**（键名写成 `Devices` 就是这样），改名留档反而先把用户的原件
+  /// 挪走了。代价是它可能被下一次 `save()` 覆盖掉，这是知情的取舍，不是疏忽。
   corruptFile,
 
   /// 文件是更老的版本（或没有版本号），已按当前语义读入。
@@ -874,7 +914,6 @@ class LoadIssue {
 再建 `lib/data/device_store.dart`：
 
 ```dart
-import 'dart:convert';
 import 'dart:io';
 
 import '../models/device_profile.dart';
@@ -920,7 +959,8 @@ class DeviceStore {
 
   /// 读盘。
   ///
-  /// 三层容错，从外到内：整个文件坏 → 留档 + 空配置；某一条坏 → 跳过该条；
+  /// 三层容错，从外到内：整个文件读不出设备 → 空配置（**解析失败时先留档**，
+  /// 见 [LoadIssueKind.corruptFile] 对两种情况的区分）；某一条坏 → 跳过该条；
   /// 字段级问题（v1 缺字段、跳板机 id）→ 补默认值 + 上报。
   Future<DeviceLoadResult> load() async {
     final issues = <LoadIssue>[];
@@ -953,7 +993,10 @@ class DeviceStore {
           '设备配置是老版本格式，已按新格式读入（补齐跳板机相关字段）。',
         ),
       );
-    } else if (version is int && version > kDevicesSchemaVersion) {
+      // `is! int` 那一半是必须的：`"schemaVersion": "3"`（手改出来的，或将来某个
+      // 写入方当字符串写）否则会**静默**按当前语义读入 —— 而 load_issue.dart 自己
+      // 就说"沉默地读错比报错更糟"。
+    } else if (version is! int || version > kDevicesSchemaVersion) {
       issues.add(
         LoadIssue(
           LoadIssueKind.newerSchema,
@@ -963,7 +1006,13 @@ class DeviceStore {
       );
     }
 
-    _rawJumpHosts = (raw['jumpHosts'] as List<Object?>?) ?? const [];
+    // 与下面 `devices` 的判法一致：**先查形状，不硬转**。`jumpHosts` 在 V1 里
+    // 只剩"原样写回"一个用途（跳板机已放弃支持），所以形状不对时退回空数组就够了。
+    // 但**绝不能**写成 `as List<Object?>?` —— 那是一个没有任何 try 兜着的强转，
+    // 一个手改坏的 `"jumpHosts": "x"` 会让 load() 抛 _TypeError 出去：调用方拿不到
+    // DeviceLoadResult、文件也不会被留档，于是**每次启动都崩**，正是 NFR-R-03 要防的。
+    final rawJumpHosts = raw['jumpHosts'];
+    _rawJumpHosts = rawJumpHosts is List<Object?> ? rawJumpHosts : const [];
 
     final rawDevices = raw['devices'];
     if (rawDevices is! List<Object?>) {
@@ -994,8 +1043,23 @@ class DeviceStore {
             DeviceProfile.fromJson(credentials.strip(record)).copyWith(
           password: password,
         );
-        devices.add(profile);
+        // **把惰性视图收一遍，而且必须在 add 之前。** 模型里 `postLoginCommands`
+        // 与 `jumpHostIds` 用的是 `.cast<String>()`（spec §13.6）—— 那是惰性校验
+        // 视图，坏元素要到有人**第一次遍历它**时才抛，而那时早已离开这个 try：
+        // `postLoginCommands` 是在连接时被 `ConnectionManager` 入队才遍历的，
+        // 用户看到的是"连不上"而不是"第 N 条设备记录坏了，已跳过"。
+        //
+        // **收在 add 之后是错的**（实测过）：那样这一条已经进了 devices，catch 只
+        // 补一条 corruptEntry，坏记录**照样留在列表里** —— 症状从"连接时崩"变成
+        // "加载时报告坏了、却还是用它"，比原来更难查。抛在 add 之前，它才真的被跳过。
+        // （与 settings_store.dart 收 `morePromptPatterns` 是同一个理由。）
+        profile.postLoginCommands.toList(growable: false);
+        profile.jumpHostIds.toList(growable: false);
 
+        // 跳板机提示也放在 add **之前**，理由同上：这里读的同样是模型的惰性
+        // `.cast<String>()`。今天 `isNotEmpty` 只看长度、不遍历元素，所以安全；
+        // 但哪天有人把这条消息改成列举跳板机 id，遍历就会抛在 add 之后，
+        // 又变回"报告了坏、却还留着"。
         if (profile.jumpHostIds.isNotEmpty) {
           issues.add(
             LoadIssue(
@@ -1005,6 +1069,8 @@ class DeviceStore {
             ),
           );
         }
+
+        devices.add(profile);
       } catch (e) {
         // catch 的宽度是「构造一条记录时抛出的**任何**错误」，不是 on TypeError：
         // 模型自己会做值校验并抛 ArgumentError（§13.3）。
@@ -1028,12 +1094,12 @@ class DeviceStore {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `flutter test test/data/device_store_load_test.dart`
-Expected: `All tests passed!`（15 条）
+Expected: `All tests passed!`（18 条）
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add lib/data/device_store.dart test/data/device_store_load_test.dart
+git add lib/data/load_issue.dart lib/data/device_store.dart test/data/device_store_load_test.dart
 git commit -m "feat(data): DeviceStore 读路径（迁移 / 逐条目隔离 / 加载上报）"
 ```
 
@@ -1304,7 +1370,7 @@ Expected: `All tests passed!`（12 条）
 
 再跑一次读路径的测试，确认没被改坏：
 Run: `flutter test test/data/device_store_load_test.dart`
-Expected: `All tests passed!`（15 条）
+Expected: `All tests passed!`（18 条）
 
 - [ ] **Step 5: Commit**
 
