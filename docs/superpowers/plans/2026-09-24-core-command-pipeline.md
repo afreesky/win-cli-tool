@@ -2009,6 +2009,38 @@ void main() {
       expect(output.join(), contains('设备型号：华为 S5700'));
     });
 
+    test('多字节 UTF-8 字符被切成两片时不会被解码成乱码', () async {
+      final (conn, session, output) = await _manualSession();
+      addTearDown(session.close);
+
+      // `你` = E4 BD A0，恰好从第二个字节之后切开
+      final bytes = utf8.encode('你');
+      expect(bytes, [0xE4, 0xBD, 0xA0], reason: '下面切分位置的前提');
+      conn.feed(bytes.sublist(0, 2));
+      conn.feed(bytes.sublist(2));
+
+      await _drain(output);
+
+      // 逐片 utf8.decode 会把两个残片各解成一个替换字符 U+FFFD；流式解码器
+      // 则会把不完整的字节留到下一片一起拼。
+      expect(output.join(), '你');
+    });
+
+    test('多字节字符被切成三片、两侧都是 ASCII 时不会错位', () async {
+      final (conn, session, output) = await _manualSession();
+      addTearDown(session.close);
+
+      // 分片边界落在 `你` 内部，且最后一片里同时有字符尾部与普通 ASCII：
+      // 只把残缺字节攒起来、不与后续内容重新同步的实现会在这里错位。
+      conn.feed([0x6F, 0x6B, 0x3A, 0xE4]); // "ok:" + `你` 的首字节
+      conn.feed([0xBD]); // `你` 的中字节
+      conn.feed([0xA0, 0x21]); // `你` 的末字节 + "!"
+
+      await _drain(output);
+
+      expect(output.join(), 'ok:你!');
+    });
+
     test('对端协商被自动应答，不进入输出流', () async {
       final device = await FakeDeviceServer.start(
         prompt: '[CoreSW]',
@@ -2119,6 +2151,33 @@ void main() {
       expect(conn.closed, isTrue, reason: '建连期间被 close，刚建好的连接必须关掉');
     });
   });
+}
+
+/// 用一条可手动喂字节的假连接建一个会话，并收集它解码出来的字符串。
+///
+/// 与依赖 OS/TCP 何时切分的用例不同：这里每一片的边界完全由用例决定，
+/// 因此可以确定性地把多字节字符切在分片中间。
+Future<(_FakeConnection, TelnetSession, List<String>)> _manualSession() async {
+  final conn = _FakeConnection();
+  final session = TelnetSession(
+    profile: _profile(1),
+    connector: _GatedConnector(Future.value(conn)),
+  );
+  final output = <String>[];
+  // 必须先订阅再喂字节：_output 是广播流，早到的片段没有回放。
+  session.output.listen(output.add);
+  await session.connect();
+  return (conn, session, output);
+}
+
+/// 等「连接 → 解码 → 输出」这条链跑干净：输出连续两次采样间不再变化。
+Future<void> _drain(List<String> output) async {
+  var previous = output.length;
+  while (true) {
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+    if (output.length == previous) return;
+    previous = output.length;
+  }
 }
 
 Future<void> _waitUntil(
@@ -2282,7 +2341,7 @@ class TelnetSession implements Session {
 flutter test test/connection/telnet_session_test.dart
 ```
 
-Expected：PASS，9 个测试全绿。
+Expected：PASS，11 个测试全绿。
 
 - [ ] **Step 6: 提交**
 
@@ -2929,6 +2988,43 @@ void main() {
       });
     });
 
+    test('反复翻页不重置命令超时，一条命令仍只在 10s 处超时', () {
+      fakeAsync((async) {
+        final h = _Harness();
+        h.dispatcher.enqueue(['display cur', 'next']);
+        async.flushMicrotasks();
+        expect(h.written, ['display cur\n']);
+
+        // 设备在 t≈0s、4s、9s 各翻一页，之后彻底静默。翻页提示用
+        // `---- More ----`：它不以 > 结尾，本来也匹配不上提示符正则，
+        // 于是这里只考察超时有没有被翻页重置，不掺入翻页-vs-提示符的判定。
+        h.dispatcher.onOutput('line1\r\n  ---- More ----');
+        async.elapse(const Duration(seconds: 4));
+        expect(h.completed, isEmpty, reason: '4s 时还没到超时');
+
+        h.dispatcher.onOutput('line2\r\n  ---- More ----');
+        async.elapse(const Duration(seconds: 5));
+        expect(h.completed, isEmpty, reason: '9s 时还没到超时');
+
+        h.dispatcher.onOutput('line3\r\n  ---- More ----');
+
+        // 最后一次翻页落在 9s。spec §5.3 要求翻页**不得**重置命令超时
+        // ——一条命令翻十页仍然只受一个 10s 超时约束。若翻页分支调用了
+        // _restartTimeout()，deadline 会被推到 19s，t=10.2s 处将没有任何
+        // 完成事件；设备一直翻页就能把队列永久挂住，正是该规则要防的。
+        async.elapse(const Duration(milliseconds: 1200)); // 走到 t=10.2s
+
+        expect(h.completed, hasLength(1), reason: '10s 处必须超时收尾');
+        expect(h.completed.single.command, 'display cur');
+        expect(h.completed.single.timedOut, isTrue);
+        expect(
+          h.written,
+          ['display cur\n', ' ', ' ', ' ', 'next\n'],
+          reason: '超时后仍要放行下一条',
+        );
+      });
+    });
+
     test('以 > 结尾的翻页提示不会被误判为命令结束', () {
       fakeAsync((async) {
         // 对照组：`---- More ----` 不以 > 结尾，本来也匹配不上提示符正则，
@@ -3399,7 +3495,7 @@ class CommandDispatcher {
 flutter test test/command/command_dispatcher_test.dart
 ```
 
-Expected：PASS，25 个测试全绿。
+Expected：PASS，26 个测试全绿。
 
 其中 `'内容行以 ] 结尾时会误判 —— 记录已知限制'` 断言的是**误判确实会发生**，这不是 bug 而是 spec §5.2 明确接受的残留风险（静默去抖只能排除"数据仍在流动"的那部分误判）。它的姊妹测试 `'内容行以 ] 结尾但随后仍有数据时不会误判'` 则证明去抖在数据连续流动时确实起作用。两条一起看，才算把这道边界钉住。
 
