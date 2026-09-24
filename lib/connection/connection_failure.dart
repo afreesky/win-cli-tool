@@ -69,15 +69,25 @@ class ConnectionFailure implements Exception {
   String toString() => 'ConnectionFailure(${kind.name}): $message';
 }
 
-/// `ETIMEDOUT` 的 errno。**两个都要认**：POSIX（Linux/macOS）是 110，
-/// Windows 是 10060（`WSAETIMEDOUT`）。
+/// `ETIMEDOUT` 的 errno。**Linux 是 110，Windows 是 10060（`WSAETIMEDOUT`）。**
 ///
-/// 110 是在本机连黑洞地址实测出来的（`Socket.connect(timeout:)` 到点后抛
-/// `SocketException ... errno = 110`）。10060 取自 Winsock 的文档值 ——
-/// 本机是 Linux，无法实测；但 Windows 是本程序的主要目标平台，漏掉它
-/// 恰好会让那一边的用户看不到「超时」。
-const int _etimedoutPosix = 110;
+/// 110 是在本机（Linux）连黑洞地址实测出来的（`Socket.connect(timeout:)` 到点后
+/// 抛 `SocketException ... errno = 110`，**不是** `TimeoutException`），并与
+/// `/usr/include/asm-generic/errno.h:93` 一致。10060 取自 Winsock 的文档值 ——
+/// 本机是 Linux，无法实测；但 Windows 是本程序的主要目标平台，漏掉它恰好会让
+/// 那一边的用户看不到「超时」。
+///
+/// **这个常数不叫 `_etimedoutPosix`，是故意的。** macOS/Darwin 的 `ETIMEDOUT`
+/// 是 60（XNU 头文件值，**文档来源，本机无法实测**），叫 POSIX 会让人以为 110
+/// 是所有 POSIX 系统的值。macOS 不在 NFR-P-01 的目标平台里（Windows + Linux），
+/// 所以这里不认 60 —— 但**别把这条读成"POSIX 通用"**。
+const int _etimedoutLinux = 110;
 const int _etimedoutWindows = 10060;
+
+/// 超时文案。**只写一份**：`TimeoutException` 与 `SocketException` 的 errno
+/// 判定两条路径都要用它，复制两份就会有一天悄悄不一致 —— 同一种失败，
+/// 用户看到两种说法（实测过：只改其中一份，26 条用例全绿）。
+const String _timeoutMessage = '连接超时：目标设备在超时时间内没有响应';
 
 /// 把任意异常归类成 [ConnectionFailure]。
 ///
@@ -127,28 +137,37 @@ ConnectionFailure _classify(Object error) {
   if (error is ConnectionFailure) return error;
 
   if (error is TimeoutException) {
-    // 这一支眼下是**防御性**的：dartssh2 在握手/认证超时时并不抛这个类型，
-    // 它抛 `SSHHandshakeError('Handshake timed out')` 与
-    // `SSHAuthAbortError('Authentication timed out')`（ssh_client.dart:1126）。
-    // 真正撑起 FR-C-13 的是下面 `SocketException` 那一支的 errno 判定 ——
-    // 别把这条用例的绿色读成"超时路径已验证"。
+    // 这一支是**防御性**的，而且比原先写的更"死"。原先这里说 dartssh2 在
+    // 握手/认证超时时抛 `SSHHandshakeError('Handshake timed out')` 与
+    // `SSHAuthAbortError('Authentication timed out')` —— 但那两条只在 dartssh2
+    // **自己设了超时定时器**时才成立，而 `handshakeTimeout` 与 `authTimeout`
+    // 的默认值都是 null（ssh_client.dart:299-302），V1 的 `lib/` 里**没有任何
+    // 一处**设过它们（grep 零命中）。所以那两条路径今天都到不了。
     //
-    // 顺带订正一条曾经写错的断言：`reason` 为 null 的来源**不是**只有
-    // :1126 那一处。:964 配 :321 的 `_handleTransportClosed(null)` 也会产出
-    // `SSHAuthAbortError(msg, null)` —— 认证前对端干净地关掉 TCP，实测里
-    // 比认证超时更常见。两者都落到下面"认不出的 reason"那条兜底。
+    // 真正撑起 FR-C-13 的只有下面 `SocketException` 那一支的 errno 判定 ——
+    // 别把这一支的绿色读成"超时路径已验证"。
+    //
+    // **给将来动手的人：** 谁要是给 `SSHClient` 设了 `handshakeTimeout`，超时就会
+    // 变成 `SSHHandshakeError('Handshake timed out')`，落进下面
+    // `is SSHHandshakeError` 那一支 → 报成 `protocolError`，文案说"对端可能不是
+    // SSH 服务" —— 那正是 §13.15 要防的"把超时说成协议问题"。设之前先在这里补一支。
+    //
+    // `reason` 为 null 的来源有两处：:1126（认证超时，需要上面那个定时器）与
+    // :964 配 :321 的 `_handleTransportClosed(null)`（认证前对端干净地关掉 TCP）。
+    // **后一种是今天唯一活的。** 两者都落到下面"认不出的 reason"那条兜底。
     return ConnectionFailure(
       ConnectionFailureKind.timeout,
-      '连接超时：目标设备在超时时间内没有响应',
+      _timeoutMessage,
       cause: error,
     );
   }
 
   // 两条顺序纪律都在这个函数里，两条都是"排错了不报错、只静默失效"：
-  //   1. 若将来要加 `is SSHAuthError`，它必须排在下面
-  //      `is SSHAuthAbortError` **之后** —— SSHAuthFailError 与
-  //      SSHAuthAbortError 都 implements SSHAuthError（前者 ssh_errors.dart:40，
-  //      后者 :49；别按 40/49 的顺序记，40 是 Fail）。排在前面会一次吞掉两者。
+  //   1. 若将来要加 `is SSHAuthError`，它必须排在 `is SSHAuthAbortError` 与
+  //      `is SSHAuthFailError` **两者之后**。只说"排在 Abort 之后"是不够的 ——
+  //      排在两者**之间**同样会静默吞掉 Fail（它俩是各自独立的类，都
+  //      implements SSHAuthError：ssh_errors.dart:40 是 Fail、:49 是 Abort，
+  //      别按 40/49 的顺序记）。
   //   2. `is SSHError` 是**兜底**，必须始终排在最后。任何新的
   //      `is <某个 SSHError>` 分支排到它后面就是死代码：编译器不报错，
   //      测试也不会红。下面的 `SSHKeyDecodeError` 分支正是为此特意插在
@@ -218,10 +237,10 @@ ConnectionFailure _classify(Object error) {
     // 不是 TimeoutException）。不认这个 errno 的话，最常见的失败会被归成
     // "主机不可达"，并把英文「Connection timed out」当中文说明交给用户。
     final int? code = error.osError?.errorCode;
-    if (code == _etimedoutPosix || code == _etimedoutWindows) {
+    if (code == _etimedoutLinux || code == _etimedoutWindows) {
       return ConnectionFailure(
         ConnectionFailureKind.timeout,
-        '连接超时：目标设备在超时时间内没有响应',
+        _timeoutMessage,
         cause: error,
       );
     }

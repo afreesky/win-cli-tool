@@ -1040,6 +1040,7 @@ void main() {
 
       expect(f.kind, ConnectionFailureKind.authFailed);
       expect(f.message, contains('私钥'));
+      expect(f.message, contains('Failed to decode private key'));
       expect(f.message, isNot(contains('口令')));
       expect(f.message, isNot(contains('null')));
     });
@@ -1049,6 +1050,8 @@ void main() {
         SSHHandshakeError('Invalid version: HTTP/1.1 200 OK'),
       );
       expect(f.kind, ConnectionFailureKind.protocolError);
+      // 同上：握手失败时，对端到底回了一句什么，是唯一能自查的东西。
+      expect(f.message, contains('Invalid version'));
     });
 
     test('跳板机失败会指明是第几跳', () {
@@ -1059,6 +1062,11 @@ void main() {
       expect(f.kind, ConnectionFailureKind.jumpHostFailed);
       expect(f.message, contains('第 1 跳'));
       expect(f.message, contains('堡垒机-A'));
+      // **内层原因必须还在。** 少了这一条，把 message 换成
+      // `'第 ${hop.index} 跳 ${hop.name} 失败'`（丢掉 `：${inner.message}`）
+      // 会让 26 条用例**全绿**（实测过）—— 用户只看到"第 1 跳 X 失败"，
+      // 而不知道 X 到底为什么没连上，FR-J-05 要的正是这个原因。
+      expect(f.message, contains('主机不可达'));
     });
   });
 
@@ -1078,7 +1086,7 @@ void main() {
       final f = classifyConnectionFailure(
         SSHAuthAbortError(
           'Connection closed before authentication',
-          SSHInternalError(StateError('Bad state: No matching key exchange algorithm')),
+          SSHInternalError(StateError('No matching key exchange algorithm')),
         ),
       );
       expect(f.kind, ConnectionFailureKind.protocolError);
@@ -1095,7 +1103,7 @@ void main() {
       final algo = classifyConnectionFailure(
         SSHAuthAbortError(
           'Connection closed before authentication',
-          SSHInternalError(StateError('Bad state: No matching key exchange algorithm')),
+          SSHInternalError(StateError('No matching key exchange algorithm')),
         ),
       );
 
@@ -1229,6 +1237,10 @@ void main() {
       final f = classifyConnectionFailure(ArgumentError('unexpected'));
       expect(f.kind, ConnectionFailureKind.unknown);
       expect(f.message, isNotEmpty);
+      // `unknown` 这一格按设计就是原始异常的 `$error` —— 认不出就不能编，
+      // 只能把原文交给用户。把 `'连接失败：$error'` 换成一句没有 $error 的
+      // 中文（比如只写 '连接失败'）实测全绿，那样连上报都没得报。
+      expect(f.message, contains('unexpected'));
     });
   });
 
@@ -1255,6 +1267,10 @@ void main() {
       );
 
       expect(f.message, contains('指纹'));
+      // §13.15 那张表里，主机密钥这一格之所以能收尾，全靠最后这句可操作
+      // 指引：设备确实换过密钥时用户得知道去哪儿清记录。删掉它实测全绿，
+      // 用户就只剩一个"不一致"的死结论。
+      expect(f.message, contains('清除'));
       expect(f.message, isNot(contains('口令')));
       expect(f.message, isNot(contains('密码')));
     });
@@ -1264,7 +1280,12 @@ void main() {
       // 一个纯粹的口令问题被说成安全事件。
       final f = classifyConnectionFailure(SSHAuthFailError('all failed'));
 
-      expect(f.message, contains('口令'));
+      // 钉的是"指向凭据"这个方向，不是一个具体词：文案改写成「用户名或密码
+      // 不正确」仍然是对的，不该因此变红（`isNot` 那些才是硬边界）。
+      expect(
+        f.message,
+        anyOf(contains('口令'), contains('密码'), contains('私钥')),
+      );
       expect(f.message, isNot(contains('指纹')));
     });
 
@@ -1275,13 +1296,16 @@ void main() {
         SSHAuthAbortError(
           'Connection closed before authentication',
           SSHInternalError(
-            StateError('Bad state: No matching key exchange algorithm'),
+            StateError('No matching key exchange algorithm'),
           ),
         ),
       );
 
       expect(f.kind, ConnectionFailureKind.protocolError);
       expect(f.message, contains('算法'));
+      // 附原文这件事本身也要钉住：丢掉 `原始信息：${reason.error}` 会让
+      // 用户拿不到"到底是哪个算法没协商上"这唯一的可上报细节（实测全绿）。
+      expect(f.message, contains('No matching key exchange algorithm'));
       expect(f.message, isNot(contains('口令')));
       expect(f.message, isNot(contains('密码')));
     });
@@ -1294,6 +1318,9 @@ void main() {
       final f = classifyConnectionFailure(SSHStateError('SSH connection closed'));
 
       expect(f.kind, ConnectionFailureKind.protocolError);
+      // 同一条规矩：兜底文案也要带原文，否则活会话断开时用户只知道
+      // "协议错误"，拿不到 `SSH connection closed` 这个真实原因。
+      expect(f.message, contains('SSH connection closed'));
     });
   });
 
@@ -1332,9 +1359,19 @@ void main() {
       expect(f.message, contains('第 2 跳'));
       expect(f.message, contains('堡垒机-B'));
       expect(f.message, contains('无法读取私钥文件'));
-      // 这一条才是真正钉住幂等的断言：没有幂等分支时，内层会先被
-      // 包成「连接失败：ConnectionFailure(authFailed): …」，再套上跳板机
-      // 前缀 —— 上面三条断言**全都照样通过**（实测过），只有这一条会红。
+      // 这一条钉的是"面具没被套上"：万一内层被包成
+      // 「连接失败：ConnectionFailure(authFailed): …」再套上跳板机前缀，
+      // 用户看到的就是两层英文面具。
+      //
+      // **但它不是钉住幂等的那条 —— 两种幂等变异下它都照样绿**（实测过）：
+      //   · 删 `classifyConnectionFailure` 顶部整块 → 红的是上面那条
+      //     `same(original)`。这条用例仍被 `_classify` 的递归守卫兜住，
+      //     内层是干净的。
+      //   · 删 `_classify` 顶部那一行守卫 → 红的是另一组那条
+      //     「内层已经是 ConnectionFailure 时，不再被包成 unknown」，
+      //     红在它的 `f.kind` 断言上。这条用例被上面那个前置块拦住了。
+      // 两道守卫各自被**别的**用例钉住；这条只钉"跳板机前缀之后内层原因
+      // 还在"。别指望它替你抓幂等回归。
       expect(f.message, isNot(contains('连接失败：')));
     });
   });
@@ -1420,15 +1457,25 @@ class ConnectionFailure implements Exception {
   String toString() => 'ConnectionFailure(${kind.name}): $message';
 }
 
-/// `ETIMEDOUT` 的 errno。**两个都要认**：POSIX（Linux/macOS）是 110，
-/// Windows 是 10060（`WSAETIMEDOUT`）。
+/// `ETIMEDOUT` 的 errno。**Linux 是 110，Windows 是 10060（`WSAETIMEDOUT`）。**
 ///
-/// 110 是在本机连黑洞地址实测出来的（`Socket.connect(timeout:)` 到点后抛
-/// `SocketException ... errno = 110`）。10060 取自 Winsock 的文档值 ——
-/// 本机是 Linux，无法实测；但 Windows 是本程序的主要目标平台，漏掉它
-/// 恰好会让那一边的用户看不到「超时」。
-const int _etimedoutPosix = 110;
+/// 110 是在本机（Linux）连黑洞地址实测出来的（`Socket.connect(timeout:)` 到点后
+/// 抛 `SocketException ... errno = 110`，**不是** `TimeoutException`），并与
+/// `/usr/include/asm-generic/errno.h:93` 一致。10060 取自 Winsock 的文档值 ——
+/// 本机是 Linux，无法实测；但 Windows 是本程序的主要目标平台，漏掉它恰好会让
+/// 那一边的用户看不到「超时」。
+///
+/// **这个常数不叫 `_etimedoutPosix`，是故意的。** macOS/Darwin 的 `ETIMEDOUT`
+/// 是 60（XNU 头文件值，**文档来源，本机无法实测**），叫 POSIX 会让人以为 110
+/// 是所有 POSIX 系统的值。macOS 不在 NFR-P-01 的目标平台里（Windows + Linux），
+/// 所以这里不认 60 —— 但**别把这条读成"POSIX 通用"**。
+const int _etimedoutLinux = 110;
 const int _etimedoutWindows = 10060;
+
+/// 超时文案。**只写一份**：`TimeoutException` 与 `SocketException` 的 errno
+/// 判定两条路径都要用它，复制两份就会有一天悄悄不一致 —— 同一种失败，
+/// 用户看到两种说法（实测过：只改其中一份，26 条用例全绿）。
+const String _timeoutMessage = '连接超时：目标设备在超时时间内没有响应';
 
 /// 把任意异常归类成 [ConnectionFailure]。
 ///
@@ -1478,28 +1525,37 @@ ConnectionFailure _classify(Object error) {
   if (error is ConnectionFailure) return error;
 
   if (error is TimeoutException) {
-    // 这一支眼下是**防御性**的：dartssh2 在握手/认证超时时并不抛这个类型，
-    // 它抛 `SSHHandshakeError('Handshake timed out')` 与
-    // `SSHAuthAbortError('Authentication timed out')`（ssh_client.dart:1126）。
-    // 真正撑起 FR-C-13 的是下面 `SocketException` 那一支的 errno 判定 ——
-    // 别把这条用例的绿色读成"超时路径已验证"。
+    // 这一支是**防御性**的，而且比原先写的更"死"。原先这里说 dartssh2 在
+    // 握手/认证超时时抛 `SSHHandshakeError('Handshake timed out')` 与
+    // `SSHAuthAbortError('Authentication timed out')` —— 但那两条只在 dartssh2
+    // **自己设了超时定时器**时才成立，而 `handshakeTimeout` 与 `authTimeout`
+    // 的默认值都是 null（ssh_client.dart:299-302），V1 的 `lib/` 里**没有任何
+    // 一处**设过它们（grep 零命中）。所以那两条路径今天都到不了。
     //
-    // 顺带订正一条曾经写错的断言：`reason` 为 null 的来源**不是**只有
-    // :1126 那一处。:964 配 :321 的 `_handleTransportClosed(null)` 也会产出
-    // `SSHAuthAbortError(msg, null)` —— 认证前对端干净地关掉 TCP，实测里
-    // 比认证超时更常见。两者都落到下面"认不出的 reason"那条兜底。
+    // 真正撑起 FR-C-13 的只有下面 `SocketException` 那一支的 errno 判定 ——
+    // 别把这一支的绿色读成"超时路径已验证"。
+    //
+    // **给将来动手的人：** 谁要是给 `SSHClient` 设了 `handshakeTimeout`，超时就会
+    // 变成 `SSHHandshakeError('Handshake timed out')`，落进下面
+    // `is SSHHandshakeError` 那一支 → 报成 `protocolError`，文案说"对端可能不是
+    // SSH 服务" —— 那正是 §13.15 要防的"把超时说成协议问题"。设之前先在这里补一支。
+    //
+    // `reason` 为 null 的来源有两处：:1126（认证超时，需要上面那个定时器）与
+    // :964 配 :321 的 `_handleTransportClosed(null)`（认证前对端干净地关掉 TCP）。
+    // **后一种是今天唯一活的。** 两者都落到下面"认不出的 reason"那条兜底。
     return ConnectionFailure(
       ConnectionFailureKind.timeout,
-      '连接超时：目标设备在超时时间内没有响应',
+      _timeoutMessage,
       cause: error,
     );
   }
 
   // 两条顺序纪律都在这个函数里，两条都是"排错了不报错、只静默失效"：
-  //   1. 若将来要加 `is SSHAuthError`，它必须排在下面
-  //      `is SSHAuthAbortError` **之后** —— SSHAuthFailError 与
-  //      SSHAuthAbortError 都 implements SSHAuthError（前者 ssh_errors.dart:40，
-  //      后者 :49；别按 40/49 的顺序记，40 是 Fail）。排在前面会一次吞掉两者。
+  //   1. 若将来要加 `is SSHAuthError`，它必须排在 `is SSHAuthAbortError` 与
+  //      `is SSHAuthFailError` **两者之后**。只说"排在 Abort 之后"是不够的 ——
+  //      排在两者**之间**同样会静默吞掉 Fail（它俩是各自独立的类，都
+  //      implements SSHAuthError：ssh_errors.dart:40 是 Fail、:49 是 Abort，
+  //      别按 40/49 的顺序记）。
   //   2. `is SSHError` 是**兜底**，必须始终排在最后。任何新的
   //      `is <某个 SSHError>` 分支排到它后面就是死代码：编译器不报错，
   //      测试也不会红。下面的 `SSHKeyDecodeError` 分支正是为此特意插在
@@ -1569,10 +1625,10 @@ ConnectionFailure _classify(Object error) {
     // 不是 TimeoutException）。不认这个 errno 的话，最常见的失败会被归成
     // "主机不可达"，并把英文「Connection timed out」当中文说明交给用户。
     final int? code = error.osError?.errorCode;
-    if (code == _etimedoutPosix || code == _etimedoutWindows) {
+    if (code == _etimedoutLinux || code == _etimedoutWindows) {
       return ConnectionFailure(
         ConnectionFailureKind.timeout,
-        '连接超时：目标设备在超时时间内没有响应',
+        _timeoutMessage,
         cause: error,
       );
     }
@@ -1642,7 +1698,7 @@ Expected: 26 个用例全部 PASS
 | 4 | 把主机密钥那条消息整段换成 `'认证失败：用户名、口令或私钥不正确'` | 「主机密钥的文案指向指纹，不指向口令」 |
 | 5 | 把算法那条消息整段换成上面同一句 | 「算法协商失败的文案指向算法，同样不指向口令」 |
 | 6 | 删掉 `SocketException` 分支里的 errno 判定整块 | 「Socket.connect 到点（errno 110）→ timeout，不是 unreachable」与「Windows 的 WSAETIMEDOUT（10060）同样归 timeout」 |
-| 7 | 把 errno 判定改成只认 `_etimedoutPosix` | 「Windows 的 WSAETIMEDOUT（10060）同样归 timeout」 |
+| 7 | 把 errno 判定改成只认 `_etimedoutLinux` | 「Windows 的 WSAETIMEDOUT（10060）同样归 timeout」 |
 | 8 | 把 `if (error is SSHKeyDecryptError)` 那一支**挪到** `if (error is SSHKeyDecodeError)` **之后**（子类排到父类后面） | 「带口令的私钥 → 指向"去掉口令"，不要说成协议错误」 |
 | 9 | 把 `error.osError?.message ?? error.message` 改成 `error.message` | 「不可达的文案保留操作系统给的原文」 |
 | 10 | 把 `authFailed` 那条消息整段换成主机密钥那一句 | 「认证失败的文案指向口令/密钥，不指向指纹」 |
@@ -1652,6 +1708,14 @@ Expected: 26 个用例全部 PASS
 | 14 | 删掉 `if (error is SSHKeyDecodeError)` **整支** | 「读不出私钥但不是口令问题 → 不能提口令」 |
 | 15 | 把带口令那条消息**两行都**换成 `'无法读取私钥。'` | 「带口令的私钥 → 指向"去掉口令"，不要说成协议错误」 |
 | 16 | 删掉 `_classify` 开头那一**行** `if (error is ConnectionFailure) return error;`（只删这一行） | 「SSHSocketError 必须拆开按内层分类 > 内层已经是 ConnectionFailure 时，不再被包成 unknown」 |
+| 17 | 把跳板机包装里的 `：${inner.message}` 去掉（只留「第 N 跳 X 失败」） | 「跳板机失败会指明是第几跳」 |
+| 18 | 删掉算法那条消息末尾的 `原始信息：${reason.error}` | 「算法协商失败的文案指向算法，同样不指向口令」 |
+| 19 | 删掉握手那条消息末尾的 `原始信息：${error.message}` | 「协议错误（握手失败）」 |
+| 20 | 把 `'无法读取私钥：${error.message}'` 改成 `'无法读取私钥。'` | 「读不出私钥但不是口令问题 → 不能提口令」 |
+| 21 | 把 `'连接失败：$error'` 改成 `'连接失败'` | 「非 SSHError 的意外异常不会漏出去」 |
+| 22 | 把 `'协议错误：$error'` 改成 `'协议错误'` | 「SSHError 兜底归 protocolError，不归 unknown」 |
+| 23 | 把主机密钥那条消息末尾的可操作指引换成一句没有指引的话 | 「主机密钥的文案指向指纹，不指向口令」 |
+| 24 | 把 `_timeoutMessage` 的值改成**不含「超时」**的一句 | 「Socket.connect 到点（errno 110）→ timeout，不是 unreachable」 |
 
 第 2、8 条要删**整支**：只删 `if (...) {` 一行会留下语法破损的残块，编译不过 ——
 那不是有效的变异，会让人误以为"变红了"。第 8 条尤其要注意：把 `is SSHKeyDecodeError`
@@ -1686,6 +1750,18 @@ Expected: 26 个用例全部 PASS
 删顶部整块（第 12 条）时只红 `已经是 ConnectionFailure 的原样返回`，递归那条用例**全绿**；
 删 `_classify` 那一行（第 16 条）时只红递归那条，第 12 条的两条用例**全绿**。
 两处各有一条用例、各红各的，所以**两条都要跑**。
+
+**第 17—24 条是补上来的，它们此前**全部全绿**（实测，26/26 通过）。** 这一批的共同点
+是被测的不是 `kind` 而是**文案里的某个片段**：跳板机前缀后面还跟着内层原因、四条
+`原始信息/：${…}` 的原文、`unknown` 与 `SSHError` 兜底里的 `$error`、主机密钥那句
+可操作的收尾、以及超时文案本身。它们全都**只在「这个片段被删掉」时才红**，所以
+**每一条都必须真的跑一遍** —— 这类片段的删除不会让任何 `kind` 改变，看代码是看不出来的。
+
+**第 24 条第一次做会踩一个坑，别以为自己测错了。** 把 `_timeoutMessage` 改成
+`'连接超时。'` 是**无效变异**：它**仍然含「超时」**，而用例断言的正是
+`contains('超时')`，于是照样全绿。这与第 15 条是同一个坑的第二次出现 ——
+**改文案类变异时，先问一句「我改完这句，用例断言的那个字/词还在不在？」**
+不在，才是有效变异。
 
 **识别假红的通用办法：**看 `[E]` 那一行点名的是什么。点的是**用例名**才是断言失败；
 点的是**文件路径**（`loading /…/connection_failure.dart [E]`）就是加载/编译失败，

@@ -106,6 +106,7 @@ void main() {
 
       expect(f.kind, ConnectionFailureKind.authFailed);
       expect(f.message, contains('私钥'));
+      expect(f.message, contains('Failed to decode private key'));
       expect(f.message, isNot(contains('口令')));
       expect(f.message, isNot(contains('null')));
     });
@@ -115,6 +116,8 @@ void main() {
         SSHHandshakeError('Invalid version: HTTP/1.1 200 OK'),
       );
       expect(f.kind, ConnectionFailureKind.protocolError);
+      // 同上：握手失败时，对端到底回了一句什么，是唯一能自查的东西。
+      expect(f.message, contains('Invalid version'));
     });
 
     test('跳板机失败会指明是第几跳', () {
@@ -125,6 +128,11 @@ void main() {
       expect(f.kind, ConnectionFailureKind.jumpHostFailed);
       expect(f.message, contains('第 1 跳'));
       expect(f.message, contains('堡垒机-A'));
+      // **内层原因必须还在。** 少了这一条，把 message 换成
+      // `'第 ${hop.index} 跳 ${hop.name} 失败'`（丢掉 `：${inner.message}`）
+      // 会让 26 条用例**全绿**（实测过）—— 用户只看到"第 1 跳 X 失败"，
+      // 而不知道 X 到底为什么没连上，FR-J-05 要的正是这个原因。
+      expect(f.message, contains('主机不可达'));
     });
   });
 
@@ -144,7 +152,7 @@ void main() {
       final f = classifyConnectionFailure(
         SSHAuthAbortError(
           'Connection closed before authentication',
-          SSHInternalError(StateError('Bad state: No matching key exchange algorithm')),
+          SSHInternalError(StateError('No matching key exchange algorithm')),
         ),
       );
       expect(f.kind, ConnectionFailureKind.protocolError);
@@ -161,7 +169,7 @@ void main() {
       final algo = classifyConnectionFailure(
         SSHAuthAbortError(
           'Connection closed before authentication',
-          SSHInternalError(StateError('Bad state: No matching key exchange algorithm')),
+          SSHInternalError(StateError('No matching key exchange algorithm')),
         ),
       );
 
@@ -295,6 +303,10 @@ void main() {
       final f = classifyConnectionFailure(ArgumentError('unexpected'));
       expect(f.kind, ConnectionFailureKind.unknown);
       expect(f.message, isNotEmpty);
+      // `unknown` 这一格按设计就是原始异常的 `$error` —— 认不出就不能编，
+      // 只能把原文交给用户。把 `'连接失败：$error'` 换成一句没有 $error 的
+      // 中文（比如只写 '连接失败'）实测全绿，那样连上报都没得报。
+      expect(f.message, contains('unexpected'));
     });
   });
 
@@ -321,6 +333,10 @@ void main() {
       );
 
       expect(f.message, contains('指纹'));
+      // §13.15 那张表里，主机密钥这一格之所以能收尾，全靠最后这句可操作
+      // 指引：设备确实换过密钥时用户得知道去哪儿清记录。删掉它实测全绿，
+      // 用户就只剩一个"不一致"的死结论。
+      expect(f.message, contains('清除'));
       expect(f.message, isNot(contains('口令')));
       expect(f.message, isNot(contains('密码')));
     });
@@ -330,7 +346,12 @@ void main() {
       // 一个纯粹的口令问题被说成安全事件。
       final f = classifyConnectionFailure(SSHAuthFailError('all failed'));
 
-      expect(f.message, contains('口令'));
+      // 钉的是"指向凭据"这个方向，不是一个具体词：文案改写成「用户名或密码
+      // 不正确」仍然是对的，不该因此变红（`isNot` 那些才是硬边界）。
+      expect(
+        f.message,
+        anyOf(contains('口令'), contains('密码'), contains('私钥')),
+      );
       expect(f.message, isNot(contains('指纹')));
     });
 
@@ -341,13 +362,16 @@ void main() {
         SSHAuthAbortError(
           'Connection closed before authentication',
           SSHInternalError(
-            StateError('Bad state: No matching key exchange algorithm'),
+            StateError('No matching key exchange algorithm'),
           ),
         ),
       );
 
       expect(f.kind, ConnectionFailureKind.protocolError);
       expect(f.message, contains('算法'));
+      // 附原文这件事本身也要钉住：丢掉 `原始信息：${reason.error}` 会让
+      // 用户拿不到"到底是哪个算法没协商上"这唯一的可上报细节（实测全绿）。
+      expect(f.message, contains('No matching key exchange algorithm'));
       expect(f.message, isNot(contains('口令')));
       expect(f.message, isNot(contains('密码')));
     });
@@ -360,6 +384,9 @@ void main() {
       final f = classifyConnectionFailure(SSHStateError('SSH connection closed'));
 
       expect(f.kind, ConnectionFailureKind.protocolError);
+      // 同一条规矩：兜底文案也要带原文，否则活会话断开时用户只知道
+      // "协议错误"，拿不到 `SSH connection closed` 这个真实原因。
+      expect(f.message, contains('SSH connection closed'));
     });
   });
 
@@ -398,9 +425,19 @@ void main() {
       expect(f.message, contains('第 2 跳'));
       expect(f.message, contains('堡垒机-B'));
       expect(f.message, contains('无法读取私钥文件'));
-      // 这一条才是真正钉住幂等的断言：没有幂等分支时，内层会先被
-      // 包成「连接失败：ConnectionFailure(authFailed): …」，再套上跳板机
-      // 前缀 —— 上面三条断言**全都照样通过**（实测过），只有这一条会红。
+      // 这一条钉的是"面具没被套上"：万一内层被包成
+      // 「连接失败：ConnectionFailure(authFailed): …」再套上跳板机前缀，
+      // 用户看到的就是两层英文面具。
+      //
+      // **但它不是钉住幂等的那条 —— 两种幂等变异下它都照样绿**（实测过）：
+      //   · 删 `classifyConnectionFailure` 顶部整块 → 红的是上面那条
+      //     `same(original)`。这条用例仍被 `_classify` 的递归守卫兜住，
+      //     内层是干净的。
+      //   · 删 `_classify` 顶部那一行守卫 → 红的是另一组那条
+      //     「内层已经是 ConnectionFailure 时，不再被包成 unknown」，
+      //     红在它的 `f.kind` 断言上。这条用例被上面那个前置块拦住了。
+      // 两道守卫各自被**别的**用例钉住；这条只钉"跳板机前缀之后内层原因
+      // 还在"。别指望它替你抓幂等回归。
       expect(f.message, isNot(contains('连接失败：')));
     });
   });
