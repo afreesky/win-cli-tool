@@ -38,20 +38,28 @@ void main() {
 
   test('每次调用返回新实例（重连要换新会话，不能复用旧的）', () {
     final factory = SessionFactory(hostKeyStore: InMemoryHostKeyStore());
-    final p = _profile(DeviceProtocol.ssh);
 
-    expect(identical(factory.create(p), factory.create(p)), isFalse);
+    for (final protocol in DeviceProtocol.values) {
+      final p = _profile(protocol);
+      expect(identical(factory.create(p), factory.create(p)), isFalse);
+    }
   });
 
-  test('可以把建连方式换掉（计划 3 的跳板机靠这个注入）', () {
+  test('注入的 resolver 收到本设备的 profile，返回的 connector 被转发（计划 3 的跳板机靠这里）', () {
     const injected = _FakeConnector();
+    final p = _profile(DeviceProtocol.ssh);
+    DeviceProfile? seen;
     final factory = SessionFactory(
       hostKeyStore: InMemoryHostKeyStore(),
-      connectorResolver: (profile) => injected,
+      connectorResolver: (profile) {
+        seen = profile;
+        return injected;
+      },
     );
 
-    final session = factory.create(_profile(DeviceProtocol.ssh)) as SshSession;
+    final session = factory.create(p) as SshSession;
     expect(identical(session.connector, injected), isTrue);
+    expect(identical(seen, p), isTrue);
   });
 
   test('默认开着主机密钥校验（NFR-S-03）—— 这一行改成 false 就是全线静默裸奔', () {

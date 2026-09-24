@@ -9,9 +9,12 @@ import 'telnet_session.dart';
 ///
 /// 默认直连。计划 3 的跳板机在这里注入 —— `SshSession` 与
 /// `ConnectionManager` 都不需要为此改动。
+///
+/// 同步是**有意为之**：跳板机链在内存里解析，构造路径上不做 IO。
+/// 将来若真需要异步查表（例如按需取凭据），改动点就是这里，不是别处。
 typedef ConnectorResolver = Connector Function(DeviceProfile profile);
 
-Connector _directConnector(DeviceProfile profile) => const DirectConnector();
+Connector _directConnector(DeviceProfile _) => const DirectConnector();
 
 /// 按设备协议造出对应的 [Session]。
 ///
@@ -31,7 +34,14 @@ class SessionFactory {
 
   final ConnectorResolver connectorResolver;
   final Duration connectTimeout;
+
+  /// 是否校验主机密钥（FR-C-11）。默认开启（NFR-S-03）。
+  ///
+  /// 这一行决定**每一台设备**的安全姿态，不是可选的舒适项。
   final bool verifyHostKey;
+
+  /// 首次连接某主机时询问用户是否接受该指纹。
+  /// 返回 true 表示接受并保存。为 null 时一律拒绝 —— 见 [SshSession.onUnknownHostKey]。
   final Future<bool> Function(KnownHost host)? onUnknownHostKey;
 
   Session create(DeviceProfile profile) {
