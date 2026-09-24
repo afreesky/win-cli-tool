@@ -3437,6 +3437,16 @@ DeviceProfile _profile(DeviceProtocol protocol) => DeviceProfile(
       username: 'admin',
     );
 
+/// 与 [DirectConnector] 可区分：`const DirectConnector()` 会被规范化，
+/// 用它做注入就分不清"转发了"和"没转发、用了默认值"。
+class _FakeConnector implements Connector {
+  const _FakeConnector();
+
+  @override
+  Future<Connection> open(String host, int port, {Duration? timeout}) =>
+      throw UnimplementedError('本测试只验证注入是否被转发，不真的建连');
+}
+
 void main() {
   test('SSH 设备造出 SshSession', () {
     final factory = SessionFactory(hostKeyStore: InMemoryHostKeyStore());
@@ -3456,11 +3466,58 @@ void main() {
   });
 
   test('可以把建连方式换掉（计划 3 的跳板机靠这个注入）', () {
+    const injected = _FakeConnector();
     final factory = SessionFactory(
       hostKeyStore: InMemoryHostKeyStore(),
-      connectorResolver: (profile) => const DirectConnector(),
+      connectorResolver: (profile) => injected,
     );
-    expect(factory.create(_profile(DeviceProtocol.ssh)), isA<SshSession>());
+
+    final session = factory.create(_profile(DeviceProtocol.ssh)) as SshSession;
+    expect(identical(session.connector, injected), isTrue);
+  });
+
+  test('默认开着主机密钥校验（NFR-S-03）—— 这一行改成 false 就是全线静默裸奔', () {
+    final factory = SessionFactory(hostKeyStore: InMemoryHostKeyStore());
+    final session = factory.create(_profile(DeviceProtocol.ssh)) as SshSession;
+
+    expect(session.verifyHostKey, isTrue);
+  });
+
+  test('构造参数逐个原样转交 SshSession（工厂只做转发，转错一个就是静默降级）', () {
+    final store = InMemoryHostKeyStore();
+    Future<bool> onUnknown(KnownHost host) async => true;
+    const injected = _FakeConnector();
+    const timeout = Duration(seconds: 7);
+
+    final factory = SessionFactory(
+      hostKeyStore: store,
+      connectorResolver: (profile) => injected,
+      connectTimeout: timeout,
+      verifyHostKey: false,
+      onUnknownHostKey: onUnknown,
+    );
+
+    final session = factory.create(_profile(DeviceProtocol.ssh)) as SshSession;
+    expect(identical(session.hostKeyStore, store), isTrue);
+    expect(identical(session.connector, injected), isTrue);
+    expect(session.connectTimeout, timeout);
+    expect(session.verifyHostKey, isFalse);
+    expect(identical(session.onUnknownHostKey, onUnknown), isTrue);
+  });
+
+  test('Telnet 也拿到同一个 connector 与超时', () {
+    const injected = _FakeConnector();
+    const timeout = Duration(seconds: 7);
+    final factory = SessionFactory(
+      hostKeyStore: InMemoryHostKeyStore(),
+      connectorResolver: (profile) => injected,
+      connectTimeout: timeout,
+    );
+
+    final session =
+        factory.create(_profile(DeviceProtocol.telnet)) as TelnetSession;
+    expect(identical(session.connector, injected), isTrue);
+    expect(session.connectTimeout, timeout);
   });
 }
 ```
@@ -3536,51 +3593,69 @@ class SessionFactory {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `flutter test test/connection/session_factory_test.dart`
-Expected: 4 个用例全部 PASS
+Expected: 7 个用例全部 PASS
 
 - [ ] **Step 5: 反证测试的非空性**
 
-本 Task 的 **4** 条单测逐条变异验证，每条改完**逐字还原**（每条变异后都比 md5）。
+本 Task 的 **7** 条单测逐条变异验证，每条改完**逐字还原**（每条变异后都比 md5）。
 实测环境：2026-09-25，Flutter 3.44.4 / Dart 3.12.2，Linux。
 这一层不建真连接，全部停在对象层面，所以不受 Task 4 那些真实握手类限制的影响。
 
-| # | 把缺陷放回去 | 必须变红的测试 |
-|---|---|---|
-| M1 | 两个 `switch` 分支对调（`ssh => TelnetSession(…)`、`telnet => SshSession(…)`，两支各自带全自己那份具名参数，保持语法完整） | `SSH 设备造出 SshSession`、`Telnet 设备造出 TelnetSession` |
-| M2 | `create` 改成复用实例（去掉构造函数的 `const`，加一个 `Session? _cached;`，`return _cached ??= switch (…)`） | `每次调用返回新实例（重连要换新会话，不能复用旧的）` |
-| M3 | 无视注入的 resolver：`connectorResolver(profile)` 换成 `const DirectConnector()` | **无 —— 实测 4 条全绿**，见下 |
-| M4 | 不再转发调参字段：① `verifyHostKey: false`；② `connectTimeout: const Duration(seconds: 99)` | **无 —— 两种改法各自实测 4 条全绿**，见下 |
+用例编号：1「SSH 设备造出 SshSession」、2「Telnet 设备造出 TelnetSession」、
+3「每次调用返回新实例（重连要换新会话，不能复用旧的）」、
+4「可以把建连方式换掉（计划 3 的跳板机靠这个注入）」、
+5「默认开着主机密钥校验（NFR-S-03）—— 这一行改成 false 就是全线静默裸奔」、
+6「构造参数逐个原样转交 SshSession（工厂只做转发，转错一个就是静默降级）」、
+7「Telnet 也拿到同一个 connector 与超时」。
 
-**M1、M2 是有效证据。** 两条的红都是点名**用例名**的 `[E]` 行，不是点名文件路径的
-加载/编译失败。M1 实测 **3 红** —— 前两条之外，`可以把建连方式换掉（计划 3 的跳板机靠
-这个注入）` 也一并变红，因为它同样断言 ssh 造出 `SshSession`（顺带，不是误伤）。
-M2 实测 **1 红 3 绿**，只打中"每次调用返回新实例"这一条。
+| # | 把缺陷放回去 | 必须变红 | 实测 |
+|---|---|---|---|
+| M1 | 两个 `switch` 分支对调（两支各自带全自己那份具名参数，保持语法完整） | 1、2、4 | **6 红**：1、2、4、5、6、7 |
+| M2 | `create` 改成复用实例（去掉构造函数的 `const`，加一个 `Session? _cached;`，`return _cached ??= switch (…)`） | 3 | **1 红**：3 |
+| M3 | 无视注入的 resolver：`connectorResolver(profile)` 换成 `const DirectConnector()` | 4、6、7 | **3 红**：4、6、7 |
+| M4 | `verifyHostKey` 硬编码成 `false` | 5、6 | **1 红**：5 |
+| M5 | `verifyHostKey` 硬编码成 `true` | 6 | **1 红**：6 |
+| M6 | 两个分支的 `connectTimeout` 都硬编码成 `const Duration(seconds: 99)` | 6、7 | **2 红**：6、7 |
+| M7 | 丢掉 `onUnknownHostKey`（传 `null`） | 6 | **1 红**：6 |
+| M8 | `hostKeyStore` 换成新建的 `InMemoryHostKeyStore()` | 6 | **1 红**：6 |
+| M9 | Telnet 分支的 `connectTimeout` 单独硬编码 | 7 | **1 红**：7 |
 
-**M3、M4 是真空的，如实记下，不当证据用。** 需要说清楚**为什么**：
-这 4 条用例合起来只约束了两件事 —— ① 协议选对了类；② 每次调用是新实例。
-它们**没有**约束注入的 `Connector` 是否真的被用上，也**没有**约束
-`connectTimeout` / `verifyHostKey` / `onUnknownHostKey` 是否真的转发给了 `SshSession`。
+**9 行全部变红，没有一行是绿的**；每一条红都是点名**用例名**的 `[E]` 行，
+没有一条是点名文件路径的加载/编译失败。
 
-- M3 全绿的原因很具体：那条用例注入的 resolver 是 `(profile) => const DirectConnector()`，
-  与默认的 `_directConnector` **返回的是同一个东西**。于是"resolver 被调用"与
-  "resolver 被无视"产出完全相同的会话（`SshSession` 的 `connector` 字段语义相等），
-  用例读不出区别。它实际只证明了 `SessionFactory` **接受** `connectorResolver`
-  这个具名参数并且不会因此崩掉 —— 这仍有价值（命名对不上就编译不过），
-  但它**不是**"跳板机注入可用"的论据。
-- M4 全绿，是因为没有一条用例读过 `SshSession.verifyHostKey` 或 `connectTimeout`。
-  注意 M4① 放回去的缺陷是有**安全含义**的：它会把主机密钥校验**静默关掉**
-  （FR-C-11 / NFR-S-03），而 4 条用例一条都不会叫。
+两处与上表预期不同，都记在这里：M1 多红了 5、6、7 —— 它们也要把 ssh 造出的会话
+转型成 `SshSession`，分支一对调，转型本身先炸（顺带，不是误伤）；
+M4 只红了 5，**6 没红** —— 因为第 6 条自己就传 `verifyHostKey: false` 并断言
+`isFalse`，硬编码 `false` 恰好与它一致。也就是说 M4 这一行守的是"**默认值**必须是
+true"（第 5 条），而"显式传 `false` 必须被原样转交"由 M5（硬编码 `true`）那一行守；
+两条合起来才是完整的，少一条就有一半是空的。
 
-**这条缺口本轮只披露、不修补。** 补法需要改 Task 5 已经评审过的测试围栏
-（要么给 M4 加"从会话上读 `verifyHostKey` / `connectTimeout`"的断言，要么把 M3 那条
-用例的 resolver 换成一个可辨识的 Connector 并断言它被真的传了下去），
-这不属于"显然正确"的加强，留给评审决定。
-**也不要把兜底寄托在 Task 6** —— Task 6 的测试用的是 `_FakeFactory implements SessionFactory`
-（见该 Task 的测试围栏），整条 `SessionFactory → Session` 的真转发路径在测试里**不会被走到**，
-所以下游也不会替这一层把 M3/M4 照出来。
-**唯一真正压住这两条的是"实现里没有分支"**：`create` 里那几行是直白的一对一透传，
-没有 `if`、没有默认值覆盖。一旦有人给 `create` 加上真正的分支逻辑（比如按协议区分超时、
-或按跳板机链挑 connector），M3/M4 这两条缺口就必须先补上测试再动代码。
+**本节为什么存在（第一轮的教训，别删。）** 第一版这 4 条用例只约束了两件事 ——
+① 协议选对了类；② 每次调用是新实例。**参数转发完全没有约束**。当时实测三条变异
+**全绿**：
+
+- **M3（无视注入的 resolver）：4 条全绿。** 因为那条用例注入的 resolver 本身就是
+  `(profile) => const DirectConnector()`，与默认的 `_directConnector` **返回同一个东西**——
+  "转发了"与"没转发、用了默认值"产出完全相同的会话，用例读不出区别。
+  也就是说，当时那条名为「可以把建连方式换掉」的用例，**断言的是它名字的反面**。
+  一个高估覆盖的名字比一条缺失的测试更糟：它恰好在计划 3 依赖的那个注入点上
+  制造虚假的信心。
+- **M4a（`verifyHostKey` 硬编码 `false`）：在当时的完整 188 条用例上全绿。**
+  这不是本 Task 一条测试的问题，是一次**套件级的**静默绕过（NFR-S-03 / FR-C-11）——
+  应用里每一台设备的会话都经过这一行。
+- **M4b（`connectTimeout` 硬编码）：4 条全绿。**
+
+补法是**加强测试**，不是改文案：分发与新鲜度已经被压住，转发没有，
+而转发是真的会被依赖的性质（工厂的全部职责就是分发 + 转发）。补上第 4—7 条之后，
+上表 9 行全部变红。
+
+**仍然覆盖不到的（如实记下，不假称已覆盖）：** 默认 `onUnknownHostKey` 是不是 `null`，
+本层没有断言 —— 第 5 条只读了 `verifyHostKey`。而"没有可询问的 UI 时一律拒绝"这个
+语义本身由 `SshSession` 自己的用例守着（`ssh_session.dart:158`
+的 `onUnknownHostKey?.call(candidate) ?? false`，Task 4 已反证，测试在
+`ssh_session_test.dart:331` 一带），且那几条用例是直接构造 `SshSession`、
+不经过本工厂 —— 所以本层的默认值转发属于**未被压住**的一格，
+M7 压的是"显式传进来的回调必须原样转交"，不是"默认是 null"。
 
 - [ ] **Step 6: 提交**
 
