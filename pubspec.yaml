@@ -35,6 +35,10 @@ dependencies:
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
   dartssh2: ^4.1.0
+  # 只为一个注解：lib/connection/ 是纯 Dart 层（现状零 flutter import），
+  # 为了让 SshSession.debugLastBuiltClient 打上 @visibleForTesting 而引它。
+  # 它有 flutter_test 的传递依赖，但直接 import 的包必须显式声明。
+  meta: ^1.18.0
   # 可被 fake_async 接管的时间源：ConnectionManager 用它计算 FR-C-09 的
   # 断线时长。用 DateTime.now() 的话，测试里 fakeAsync.elapse() 推进的是
   # 假时钟，而 DateTime.now() 是真实时间，断线时长恒为 0，无法断言。

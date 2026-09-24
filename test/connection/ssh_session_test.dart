@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:dartssh2/dartssh2.dart' show SSHKeyDecodeError;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:win_cli_tool/connection/connection_failure.dart';
 import 'package:win_cli_tool/connection/connector.dart';
@@ -36,17 +37,29 @@ class _FailingConnector implements Connector {
 
 /// 一条**不参与任何 SSH 握手**的字节流。
 ///
-/// **它不是"假 SSH 服务端"**：对端永远不说话，握手根本不会开始（Task 7 才
-/// 造真服务端）。它能做的只有两件事 —— 给 `debugBuildClient()` 一个真
-/// `SSHClient` 收得下的 socket，以及让 `close()` 走到 `_client?.close()`
-/// 那一行（夹具可令其抛错）。
+/// **它不是"假 SSH 服务端"**：对端永远不说话，握手**发不出也走不完**（Task 7
+/// 才造真服务端）。措辞要紧：**不是"根本不会开始"** —— `SSHClient` 的构造
+/// 函数就会建起 `SSHTransport`（其构造函数里 `_initSocket();
+/// _startHandshake();`），状态机确实启动了，只是没人应它，推进不下去。
+///
+/// 它能做的有三件事 —— 给 `debugBuildClient()` 与 `connect()` 一个真
+/// `SSHClient` 收得下的 socket；让 `connect()` 停在 `await client.authenticated`
+/// 这个中间态（此时 `_client` 已赋值、`_session` 还是 null）；以及让 `close()`
+/// 走到 `_client?.close()` 那一行（夹具可令其抛错）。
 class _StubConnection implements Connection {
   _StubConnection({this.throwOnClose = false});
 
   /// 为 true 时 `close()` 抛错，用来守 `close()` 的"清理必须走完"。
   final bool throwOnClose;
 
-  final _input = StreamController<List<int>>();
+  /// **必须是广播 controller。** 单订阅的 `close()` 在**无人监听**时永不完成
+  /// （订阅流要有人 drain 才发得出 done），于是 `await _input.close()` 会永远
+  /// 挂着。实测过代价：第 17 条变异（删掉 `connect()` 顶上的
+  /// `if (_closed) return;`）本该是一条**点名断言**的 `[E]`，在这块夹具下退化成
+  /// `TimeoutException after 0:00:30: Test timed out after 30 seconds` ——
+  /// 证据还在，却被这条与缺陷无关的挂起盖住了。广播 controller 的 `close()`
+  /// 立刻完成，红就落回它自己的断言上。
+  final _input = StreamController<List<int>>.broadcast();
 
   @override
   Stream<List<int>> get input => _input.stream;
@@ -270,6 +283,44 @@ void main() {
     }
   });
 
+  test('connect() 自己那条传参路径：它建出来的 client 也必须拿到非 null 回调', () async {
+    // 上面那条用例断言的是**用例自己**通过 `debugBuildClient()` 造出来的
+    // client —— 它钉住的是"工厂会传非 null"。但复审实测过：在 `connect()`
+    // 里**直接内联** `SSHClient(…, onVerifyHostKey: null)` 编译得过、而且整套
+    // 用例照绿（那条内联路径根本不经过工厂）。也就是说 `connect()` **自己的**
+    // 传参点此前没人钉 —— 与当初那个代理断言是同一类缺口。
+    //
+    // 这一条让 `connect()` 自己跑：`_StubConnector` 交出一条 stub `Connection`
+    // （对端不说话），`connect()` 会停在 `await client.authenticated` ——
+    // 那正是需要的中间态，此时它手上的 client 已经建好。断言的是**它真的建出来的
+    // 那个对象**（`debugLastBuiltClient`），不是用例另造的一个。
+    //
+    // 内联绕开 `_createClient()` 的写法会让 `debugLastBuiltClient` **保持
+    // null**，于是第一条断言先红 —— 见 Step 5 第 24 条。
+    final session = SshSession(
+      profile: _profile(),
+      connector: _StubConnector(_StubConnection()),
+      hostKeyStore: InMemoryHostKeyStore(),
+    );
+
+    unawaited(session.connect().catchError((Object _) {}));
+    await Future<void>.delayed(Duration.zero);
+
+    final built = session.debugLastBuiltClient;
+    expect(
+      built,
+      isNotNull,
+      reason: 'connect() 必须经由 _createClient() 造 client —— 内联会绕过那个'
+          '唯一的传参点，onVerifyHostKey 就没人钉了',
+    );
+    expect(
+      built!.onVerifyHostKey,
+      isNotNull,
+      reason: 'connect() 建出来的 client 上，onVerifyHostKey 为 null 时 dartssh2 '
+          '接受任意主机密钥（§13.14-1，FR-C-11 整体旁路）',
+    );
+  });
+
   // ---------------------------------------------------------------------
   // 以下五条直接调用**交给 SSHClient 的那个回调**，守它的函数体：
   // find → 比对 → 询问用户 → save / 拒绝。这些用例既不需要假服务端，
@@ -440,14 +491,15 @@ void main() {
   });
 
   // ---------------------------------------------------------------------
-  // 以下九条守 `_identities()` 的翻译。**这是 Task 4 里唯一不需要假 SSH
+  // 以下十条守 `_identities()` 的翻译。**这是 Task 4 里唯一不需要假 SSH
   // 服务端就能测的真行为** —— 因为实现把加载私钥排在建连**之前**（见 Step 3
   // 的 connect()），所以一个必然失败的 connector 就足以证明"先失败的是私钥"。
   //
   // 每条用例喂的输入都在 2026-09-24 实测过，抛出的类型写在注释里。
-  // 九条合起来覆盖 `_identities()` 的每一支：PathNotFound / UnsupportedError
+  // 十条合起来覆盖 `_identities()` 的每一支：PathNotFound / UnsupportedError
   // （公钥、加密 PKCS#8、明文 PKCS#8 三种输入） / FormatException /
-  // SSHKeyDecryptError / FileSystemException（目录与无读权限两种输入）/ 兜底。
+  // SSHKeyDecryptError / SSHKeyDecodeError（损坏的 RSA 与损坏的 EC，
+  // 两种输入同一支）/ FileSystemException（目录与无读权限两种输入）/ 兜底。
   // **每一条分支都必须有对应用例** —— 少一条就有一支失去约束。
   // ---------------------------------------------------------------------
 
@@ -616,11 +668,18 @@ void main() {
 
   test('带口令的 OPENSSH 私钥 → 走分类器，绝不能漏出字面 null', () async {
     // 守 `_identities()` 里 `on SSHKeyDecryptError` 那一支。**这一支不能删**
-    // —— 删了它，这个异常会落进兜底 `catch`，而 `SSHKeyDecryptError` 的
-    // `error` 字段**就是 null**（实测
-    // `SSHKeyDecryptError(Private key is encrypted, null)`），于是用户看到
-    // 「无法读取私钥：<路径>\n原始信息：SSHKeyDecryptError(Private key is
-    // encrypted, null)」—— §13.19-7 修好的那个 null 泄漏，换一层原样复活，
+    // —— 删了它，这个异常会落进**下一支** `on SSHKeyDecodeError`
+    // （`SSHKeyDecryptError extends SSHKeyDecodeError`，所以父类那一支接得住），
+    // 用户看到的是"内容已损坏，或格式不认识" —— **方向是错的**：一个只是带了口令
+    // 的用户会被告知文件坏了，于是去重新生成密钥，而真正该做的是去掉口令。
+    // 实测：这类变异红的正是 `contains('口令')` 这一条。
+    //
+    // 下面两条 `isNot` 守的是**更深一层的洞**：`SSHKeyDecodeError` 家族两个类的
+    // `toString()` 都会把 `error` 字段打进字符串（`'$runtimeType($message,
+    // $error)'`），而 `SSHKeyDecryptError` 的 `error` **就是 null**（实测
+    // `SSHKeyDecryptError(Private key is encrypted, null)`）。只要上面那一支
+    // 或 `on SSHKeyDecodeError` 那一支退化成"把 `$error` 附回去"，用户就会看到
+    // 字面 `null` / 英文类名 —— §13.19-7 修好的那个泄漏，换一层原样复活，
     // 而 Task 3 的用例**照绿**（它们直接测分类器，不经过 `_identities()`）。
     //
     // 也**不能改成 `rethrow`**：那样 `connect()` 抛出的就不是
@@ -654,6 +713,53 @@ void main() {
     expect(failure.message, contains('口令'));
     expect(failure.message, isNot(contains('null')));
     expect(failure.message, isNot(contains('SSHKeyDecryptError')));
+  });
+
+  test('损坏的 RSA 私钥 → 中文 ConnectionFailure，一个英文类名都不许漏', () async {
+    // 复审实测（2026-09-24，Dart 3.12 / dartssh2 4.1.0）：
+    //   -----BEGIN RSA PRIVATE KEY----- + 一段垃圾 →
+    //   `SSHKeyDecodeError(Failed to decode private key, Instance of 'ASN1Exception')`
+    //
+    // 此前它落到兜底 `catch`，而兜底的 `原始信息：$error` 用的是
+    // `SSHKeyDecodeError.toString()` = `'$runtimeType($message, $error)'`
+    // —— 用户看到的就是 `Instance of 'ASN1Exception'` 这个英文类名。
+    //
+    // **这一支尤其要看紧**：本应用自己的文案就把用户往这个格式上引 ——
+    // `on UnsupportedError` 里"明文 PKCS#8"那一支推荐的正是
+    // 「改用 PEM 格式的 RSA 私钥（-----BEGIN RSA PRIVATE KEY-----）」。
+    // 用户照着这条建议去转格式、转坏了一个文件，落到这里的那句话必须是中文。
+    //
+    // 这一条也是 `on SSHKeyDecodeError` 与 `on SSHKeyDecryptError` **判序**的
+    // 记录点：把新那一支排到前面，"带口令的 OPENSSH 私钥"那条用例就会红
+    // （见 Step 5 第 26 条）。
+    final session = SshSession(
+      profile: _profile(
+        keyPath: _writeTemp(
+          'id_rsa_corrupt',
+          '-----BEGIN RSA PRIVATE KEY-----\n'
+              'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n'
+              '-----END RSA PRIVATE KEY-----\n',
+        ),
+      ),
+      connector: _FailingConnector(Exception('不该走到这里')),
+      hostKeyStore: InMemoryHostKeyStore(),
+    );
+
+    final failure = await _failureOf(session.connect());
+
+    expect(failure.kind, ConnectionFailureKind.authFailed);
+    expect(failure.message, contains('私钥'));
+    expect(failure.message, contains('损坏'));
+    // 关键：英文类名一个都不许漏 —— 这条用例存在的全部理由。
+    expect(failure.message, isNot(contains('ASN1Exception')));
+    expect(failure.message, isNot(contains('SSHKeyDecodeError')));
+    expect(failure.message, isNot(contains('Instance of')));
+    expect(failure.message, isNot(contains('Failed to decode')));
+    // 也不能被误当成口令问题：那是另一个方向，用户会去翻一个不存在的口令。
+    expect(failure.message, isNot(contains('口令')));
+    // 原文不丢：整个异常挂在 `cause` 上（§13.19-1「永远不吞掉异常」）。
+    // 少了这条断言，把 `cause: error` 删掉是一样的绿 —— 那才是真的吞了异常。
+    expect(failure.cause, isA<SSHKeyDecodeError>());
   });
 
   test('私钥路径指向目录 → 中文 ConnectionFailure，不漏英文类名', () async {

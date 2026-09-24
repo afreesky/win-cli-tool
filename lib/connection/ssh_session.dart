@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:dartssh2/dartssh2.dart';
+import 'package:meta/meta.dart';
 
 import '../models/device_profile.dart';
 import 'connection_failure.dart';
@@ -73,16 +74,37 @@ class SshSession implements Session {
   Future<void> get done => _done.future;
 
   /// 构造 `SSHClient`。**只有这一处**给 `onVerifyHostKey` 传参 ——
-  /// 单独成方法就是为了让那个传参点可以被直接断言（见 [debugBuildClient]）。
-  SSHClient _createClient(ConnectionSocket socket, List<SSHIdentity>? identities) =>
-      SSHClient(
-        socket,
-        username: profile.username,
-        identities: identities,
-        onPasswordRequest: _onPasswordRequest,
-        // 始终非 null，见 _buildHostKeyCallback 的说明。
-        onVerifyHostKey: _buildHostKeyCallback(),
-      );
+  /// 单独成方法就是为了让那个传参点可以被直接断言（见 [debugBuildClient]
+  /// 与 [debugLastBuiltClient]）。
+  SSHClient _createClient(ConnectionSocket socket, List<SSHIdentity>? identities) {
+    final client = SSHClient(
+      socket,
+      username: profile.username,
+      identities: identities,
+      onPasswordRequest: _onPasswordRequest,
+      // 始终非 null，见 _buildHostKeyCallback 的说明。
+      onVerifyHostKey: _buildHostKeyCallback(),
+    );
+    // 记在**唯一的构造点**上：只要 `connect()` 真的走这条路径，被记下的就是
+    // 它手上那个 client。`connect()` 若改成自己内联一个 `SSHClient(…,
+    // onVerifyHostKey: null)`，这里会**保持 null** —— 用例随即变红。
+    debugLastBuiltClient = client;
+    return client;
+  }
+
+  /// 仅供测试：**最近一次经 [_createClient] 造出来的那个** `SSHClient`。
+  ///
+  /// 与 [debugBuildClient] 的分工：后者让用例**自己**造一个 client 来断言形状
+  /// （读到的是"工厂会造出什么"）；这一个记的是**实际造出来的那一个**，于是
+  /// 用例可以让 `connect()` 自己跑一遍，再断言它手上那个 client 的
+  /// `onVerifyHostKey` 非 null。
+  ///
+  /// 这个区别不是形式上的：复审实测过 —— 在 `connect()` 里**直接内联**一个
+  /// `SSHClient(…, onVerifyHostKey: null)` 编译得过、而只钉 [debugBuildClient]
+  /// 的用例**全部照绿**（那条路径根本没经过工厂）。内联的写法现在会让这里
+  /// 保持 null，用例因此变红（见 Step 5 第 24 条）。
+  @visibleForTesting
+  SSHClient? debugLastBuiltClient;
 
   /// 仅供测试：用**与 [connect] 同一段代码**构造 `SSHClient` 并交出来。
   ///
@@ -92,8 +114,11 @@ class SshSession implements Session {
   /// `onVerifyHostKey == null` 意味着 dartssh2 接受任意主机密钥
   /// （§13.14-1），即 FR-C-11 被整体旁路（NFR-S-03）而整套用例照绿。
   ///
-  /// 传一条**假 `Connection` 不是假会话**：对端不说话，握手根本不会开始。
-  /// 真服务端（首次询问 / 接受后落库 / 拒绝则连不上）仍然只有 Task 7 能验。
+  /// 传一条**假 `Connection` 不是假会话**：对端永远不说话，握手发不出也走不完
+  /// —— 注意**不是"根本不会开始"**：`SSHClient` 的构造函数就会建起
+  /// `SSHTransport`（其构造函数里 `_initSocket(); _startHandshake();`），
+  /// 状态机确实启动了，只是对端不回答，它推进不下去。真服务端（首次询问 /
+  /// 接受后落库 / 拒绝则连不上）仍然只有 Task 7 能验。
   SSHClient debugBuildClient(Connection conn, List<SSHIdentity>? identities) =>
       _createClient(ConnectionSocket(conn), identities);
 
@@ -330,6 +355,47 @@ class SshSession implements Session {
         ConnectionFailureKind.authFailed,
         '私钥已加密，本版本暂不支持带口令的私钥。'
         '请改用不带口令的私钥，或等待后续版本支持。',
+      );
+    } on SSHKeyDecodeError catch (error) {
+      // 读不出私钥，但**不是**口令问题：密钥内容损坏 / 解析不了。实测
+      // （2026-09-24，Dart 3.12 / dartssh2 4.1.0，跑 `SSHKeyPair.fromPem`）：
+      //
+      //   -----BEGIN RSA PRIVATE KEY----- + 一段垃圾 → `SSHKeyDecodeError(
+      //       Failed to decode private key, Instance of 'ASN1Exception')`
+      //   -----BEGIN RSA PRIVATE KEY----- + 空体   → `SSHKeyDecodeError(
+      //       Failed to decode private key, RangeError (length): …)`
+      //   -----BEGIN EC PRIVATE KEY----- + 垃圾    → 同上（`ASN1Exception`）
+      //
+      // 三种此前都掉进兜底，而兜底的 `原始信息：$error` 用的是
+      // `SSHKeyDecodeError.toString()` = `'$runtimeType($message, $error)'`
+      // （dartssh2 `lib/src/ssh_errors.dart:97-100`）—— 于是用户看到
+      // `Instance of 'ASN1Exception'` 这种**英文类名**。判据是"调用点不许漏"
+      // （见 [_identities] 的文档），不是"§13.19-9 那张表里的七种"。
+      //
+      // **这一支尤其要看紧**：上面 `PUBLIC KEY` / 明文 `PRIVATE KEY` 两句
+      // 推荐的正是 `-----BEGIN RSA PRIVATE KEY-----`（PEM 格式的 RSA 私钥），
+      // 也就是**这个分支接的形状** —— 用户照着本应用自己的建议去转格式，
+      // 转坏一个文件，看到的那句话必须是中文，不能是 `ASN1Exception`。
+      //
+      // **顺序**：必须在 `on SSHKeyDecryptError` **之后** —— 后者
+      // `extends SSHKeyDecodeError`（dartssh2 `ssh_errors.dart:104`），先判
+      // 这一支会把"带口令"吞掉，方向就从"去掉口令"退成"文件坏了"，而用户
+      // 照做也没用。这与 `connection_failure.dart:262-264` 记录的**同一处**
+      // 顺序陷阱是同一个理由，只是那一边靠 `is` 判、这一边靠 `on` 判。
+      //
+      // 原文不丢：`cause: error` 带走整个异常对象（§13.19-1 的"永远不吞掉
+      // 异常"）。不进 `message` 是因为 `message` 的契约就是"可直接展示给
+      // 用户的中文说明"（connection_failure.dart:58-63）—— 认得出的形状给
+      // 干净中文，认不出的才由兜底附原文。
+      // （分类器里那一支给的是 `无法读取私钥：${error.message}`
+      // （connection_failure.dart:275-285）—— 那里只有裸 `Object` 可用，
+      // 这里知道上下文，能给得比它干净。**两处不一样是刻意的**。）
+      throw ConnectionFailure(
+        ConnectionFailureKind.authFailed,
+        '无法读取私钥：$path\n'
+        '这个私钥文件读不出来：内容已损坏，或不是本程序认识的私钥格式。'
+        '请确认它是一个完好的私钥文件（可以重新生成，或从原处再导出一次）。',
+        cause: error,
       );
     } catch (error) {
       // 兜底：损坏的 OPENSSH（`SSHPacketError`）、带口令的 PKCS#1
