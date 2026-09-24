@@ -512,6 +512,7 @@ if (编辑区存在非空选中范围) {
 | **Windows 产物构建** | Linux 开发机无法产出 Windows 桌面包 | 实现阶段落实 Windows 机器或 CI（GitHub Actions `windows-latest`） |
 | **非 UTF-8 配置脚本** | 中文环境下存在 GBK 编码的配置文件，导入会乱码 | V1 仅支持 UTF-8 并给出明确提示；GBK 支持列入 V1.1 候选 |
 | **明文凭据** | 配置文件泄露即凭据泄露 | 已接受该风险。存储接口独立封装，为后续替换预留（NFR-S-01） |
+| **旧设备只提供已被淘汰的 SSH 算法** | `dartssh2` 4.x 已从默认算法集中移除 `ssh-rsa`/SHA-1、`diffie-hellman-group14-sha1`、`aes128-cbc`/`aes256-cbc`、`hmac-md5` 等。只提供这些算法的老设备**直接协商失败**，表现为「连不上」，而本工具的目标设备里这类机器占比不低 | **V1 明确不做兼容开关**（见 §10.1），失败时按 FR-C-06 给出可读原因。缓解：算法集在 `dartssh2` 里是 `SSHAlgorithms` 的一个参数，后续补充为纯增量改动，不需要动 `Connector`/`Session` 抽象 |
 
 ### 8.5 目录结构
 
@@ -657,7 +658,12 @@ test/
 
 编辑区输入 → 发送 → 队列串行下发 → 提示符判定 → 输出渲染 → 日志落盘
 
-该假服务器同时用于 Telnet 与 SSH 两条链路（SSH 侧用 `dartssh2` 的服务端能力，如不可行则退化为仅覆盖 Telnet 端到端 + SSH 侧用 mock）。
+该假服务器同时用于 Telnet 与 SSH 两条链路。**SSH 侧的结论已由调研落实（2026-09-24）**：`dartssh2` **不提供 SSH 服务端**（无 `SSHServer` 之类的 API），因此原定的「用 dartssh2 的服务端能力」不可行。替代方案按可用性分两层：
+
+1. **真 `sshd` 回环集成测试（首选）**：在测试里用 `ssh-keygen` 现生成主机密钥与用户密钥，起一个监听 `127.0.0.1` 高位端口的 `sshd`，跑真实链路。已验证本机具备 `/usr/sbin/sshd` 与 `/usr/bin/ssh-keygen`（OpenSSH 8.0p1），且探测工程 `/tmp/wct-ssh-probe` 中 9/9 用例通过。**该测试必须带同步的可用性跳过守卫**（`sshd` 不存在、端口不可用、Windows 上无 `sshd` 时 `skip:` 而非失败），否则会在 CI 与 Windows 开发机上变成红灯。
+2. **纯 Dart 单元测试（打底，始终运行）**：`JumpHostPool` 的引用计数与前缀复用、`Connection` ↔ `SSHSocket` 双向适配器、错误分类（FR-C-06 的五种原因）都做成不依赖真实 sshd 的纯逻辑测试，用假 `Connection`/假 `SSHSession` 驱动。
+
+即：**能用真 sshd 的地方用真 sshd，不能用跳过，但打底的单元测试永远跑。**
 
 ---
 
@@ -680,11 +686,17 @@ test/
 | GBK 等非 UTF-8 编码导入 | V1 仅支持 UTF-8 |
 | SOCKS5 / HTTP CONNECT 代理 | V1 只做 SSH 跳板机。`Connector` 抽象层已预留，后续补充实现为纯增量 |
 | 跳板机的图形化管理之外的自动化 | 跳板机仅作为连接链的一环，不做跳板机自身的状态监控或会话管理 |
+| 旧 SSH 算法的兼容开关 | `dartssh2` 4.x 默认算法集不含 `ssh-rsa`/SHA-1、`group14-sha1`、`aes*-cbc`、`hmac-md5`。**V1 不提供开启它们的设置项**：只提供这些算法的设备将协商失败（按 FR-C-06 报可读原因）。理由见 §10.2 |
 
 ### 10.2 已明确接受的风险
 
 - V1 凭据以明文存储于 `devices.json`
 - Telnet 协议本身明文传输（这是协议固有属性，非本工具的决策）
+- **V1 只使用 `dartssh2` 的现代算法默认集，不提供旧算法兼容开关**（2026-09-24 决定）
+
+  取舍：加上兼容开关意味着「每台设备多一个安全等级需要用户理解」，且开关一旦存在，用户遇到连接失败的第一反应会是「打开它」，从而在**本可以协商强加密**的设备和链路上也降级到 SHA-1/CBC。反过来，不加开关的代价是部分老设备在 V1 里连不上 —— 这个代价是**可见且可诊断**的（FR-C-06 会报协议错误），而不是静默的安全降级。
+
+  三点缓解：① 该决策**不阻塞**任何架构 —— `SSHAlgorithms` 是 `dartssh2` 连接参数，后续补充只需改 `SshSession` 内部，`Connector`/`Session` 抽象不动；② 失败设备会走 FR-C-06 的可读原因路径，用户能立刻分清「连不上是因为算法」而不是逐个排查网络；③ 已列入 §12 的 V1.1 候选。
 
 ---
 
@@ -716,6 +728,7 @@ test/
 | 输出区搜索/过滤 | V1.1 候选 |
 | 多设备群发 | 后续版本候选 |
 | 设备分组 | 后续版本候选 |
+| 旧 SSH 算法兼容开关（`ssh-rsa`/SHA-1、`group14-sha1`、`aes*-cbc`、`hmac-md5`） | V1.1 候选（`SSHAlgorithms` 参数，改动局限在 `SshSession` 内） |
 
 ---
 
@@ -835,3 +848,29 @@ Foo copyWith({Object? bar = _unset}) => Foo(
 2. 13.9 提到的 `MorePager` 用 `contains` 匹配，因此正常输出里只要出现 `--More--` 字样就会回送一个空格（B6）。收紧成 `endsWith` 会漏掉 `---- More ---- (24%)` 这类带后缀的提示，所以**不该那么改**。
 
 两者同一个根因：**把「我们刚回过翻页键、还在等下一页」这件事记成一个显式状态标志，在新数据到达时清除**，比每次从缓冲区重新推断更可靠，也能一并消除上面两条。（计划 2 的 `SshSession` 若也做翻页判定，应直接采用状态标志的写法。）
+
+**13.14 `dartssh2` 4.1.0 的行为与默认值（调研结论，计划 2 必须照此写）**
+
+版本 4.1.0 已确认可在本项目的 Dart 3.12 上解析（8 个传递依赖，无冲突），与 §8.1 的选型一致。以下每一条都会让「照着直觉写」的代码出错：
+
+1. **没有 `connect()`，且主机密钥校验默认是关的。**
+   API 是 socket 优先：自己建好 `SSHSocket`，交给 `SSHClient(socket, username: ...)`，再 `await client.authenticated`。
+   **NFR-S-03 要求默认开启校验，而库的默认是不校验** —— 也就是说「什么都不传」等于**静默关闭了**需求要求默认开启的安全属性。必须显式传 `onVerifyHostKey: (String type, Uint8List fingerprint)`，其中 `fingerprint` 已经是可直接显示给用户的 UTF-8 字符串（形如 `SHA256:<base64>`），不需要自己再算哈希。
+
+2. **主机密钥被拒绝，抛出的是 `SSHAuthAbortError` 且 `.reason` 为 `SSHHostkeyError`。**
+   FR-C-06 要求区分「认证失败」与「协议错误」，因此**不能把这个异常和密码错误一起归为「认证失败」** —— 用户看到「认证失败」会去改密码，而真正要改的是接受指纹。
+
+3. **`SSHSession.flush()` 不可用。**
+   调用它会丢出一个未处理的异步错误，且写入内容丢失。因此 `SshSession` 对 `Session.flush()` 的实现必须是**空操作**，不能转发给 dartssh2。（`Session` 接口里保留 `flush()` 是为了 Telnet 侧，SSH 侧不适用。）
+
+4. **`SSHSession.stdout` 是 `Stream<Uint8List>`，照抄 Telnet 的管道会在运行时报错。**
+   与 §8.5 `connector.dart` 中 `_SocketConnection.input` 记录的**同一个协变陷阱**：静态类型兼容，但 `Stream.transform` 按运行时类型校验 transformer，于是 `.transform(Utf8Decoder())` 编译通过、运行时抛 `type 'Utf8Decoder' is not a subtype of type 'StreamTransformer<Uint8List, String>'`。**必须 `.cast<List<int>>()`。** Telnet 侧已经踩过并写下了注释，SSH 侧是同一条坑。
+
+5. **`SSHSession.close()` 不会完成 `session.done`。**
+   这**正好符合** `Session.done` 的契约（「主动 `close()` 不触发 `done`，只有意外断线才触发」），无需额外处理 —— 但要知道这一点是刻意依赖库行为的，别在后续重构里「顺手」改成 `close()` 里也完成 `done`。
+
+6. **`keepAliveInterval` 默认 10 秒。**
+   对 FR-C-07 的重连有直接影响：设备侧静默断开时，dartssh2 会先靠自己发现的 keepalive 失败来结束 `done`，而不是等 TCP 超时。计划 2 若要调整该值，需与 FR-C-07 的退避序列一起考虑，避免「keepalive 判定断开」与「重连退避」互相打架。
+
+7. **`SSHForwardChannel.close()` 会挂起，必须用 `destroy()`。**（计划 3 的跳板机直接受影响，先记在此处。）
+   通道关闭是 `close()` 还是 `destroy()` 属于**必须显式选对**的一类 API —— 选错的表现是关连接时永久挂起，与 13.11 的症状相同但根因不同。
