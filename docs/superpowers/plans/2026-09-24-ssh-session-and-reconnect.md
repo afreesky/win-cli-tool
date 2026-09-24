@@ -2914,4 +2914,5 @@ FR-C-06 要求「连接失败时，设备按钮变红」，但本计划的 `Conn
 
 - **spec §13.10 的翻页恢复方案**尚未选定（三个选项）。它影响 `CommandDispatcher` 与计划 5 的显示逻辑，**不影响计划 2**：`SshSession` 只把字节交给既有管线，不自己做提示符或翻页判定（§13.9 提到"SshSession 若也做翻页判定"—— 本计划的选择是**不做**，判定权仍归 `CommandDispatcher` 一处）。
 - **FR-C-14（启动时自动连接）不在本计划**：`DeviceProfile.autoConnect` 字段已存在，但"应用启动后自动发起连接"是应用装配层的行为，属于计划 5（providers）。本计划提供的能力是 `ConnectionManager.connect()`，计划 5 在启动时对 `autoConnect == true` 的设备各调用一次即可。
+- **用户主动断开时，命令队列不会发出任何队列事件。** `disconnect()` / `dispose()` 走的是 `dispatcher.dispose()`，它只静默清空队列，**不发** `QueueDropped` 也不发 `QueueAborted`（对比 `onDisconnected()` 会发 `QueueDropped`）。后果：若界面上还挂着"执行中 3/8"这类进度显示，主动断开时没有队列事件去清它。界面应当改用 `ConnectionStateChanged(disconnected)` 兜底清空。这不是缺陷，但**别留到计划 5 去发现** —— 已知信息，记在这里。
 - **`you@example.com` 这个 git 作者**仍是占位值，推送前需处理。
