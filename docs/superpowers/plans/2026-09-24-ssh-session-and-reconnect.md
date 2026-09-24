@@ -3538,7 +3538,51 @@ class SessionFactory {
 Run: `flutter test test/connection/session_factory_test.dart`
 Expected: 4 个用例全部 PASS
 
-- [ ] **Step 5: 提交**
+- [ ] **Step 5: 反证测试的非空性**
+
+本 Task 的 **4** 条单测逐条变异验证，每条改完**逐字还原**（每条变异后都比 md5）。
+实测环境：2026-09-25，Flutter 3.44.4 / Dart 3.12.2，Linux。
+这一层不建真连接，全部停在对象层面，所以不受 Task 4 那些真实握手类限制的影响。
+
+| # | 把缺陷放回去 | 必须变红的测试 |
+|---|---|---|
+| M1 | 两个 `switch` 分支对调（`ssh => TelnetSession(…)`、`telnet => SshSession(…)`，两支各自带全自己那份具名参数，保持语法完整） | `SSH 设备造出 SshSession`、`Telnet 设备造出 TelnetSession` |
+| M2 | `create` 改成复用实例（去掉构造函数的 `const`，加一个 `Session? _cached;`，`return _cached ??= switch (…)`） | `每次调用返回新实例（重连要换新会话，不能复用旧的）` |
+| M3 | 无视注入的 resolver：`connectorResolver(profile)` 换成 `const DirectConnector()` | **无 —— 实测 4 条全绿**，见下 |
+| M4 | 不再转发调参字段：① `verifyHostKey: false`；② `connectTimeout: const Duration(seconds: 99)` | **无 —— 两种改法各自实测 4 条全绿**，见下 |
+
+**M1、M2 是有效证据。** 两条的红都是点名**用例名**的 `[E]` 行，不是点名文件路径的
+加载/编译失败。M1 实测 **3 红** —— 前两条之外，`可以把建连方式换掉（计划 3 的跳板机靠
+这个注入）` 也一并变红，因为它同样断言 ssh 造出 `SshSession`（顺带，不是误伤）。
+M2 实测 **1 红 3 绿**，只打中"每次调用返回新实例"这一条。
+
+**M3、M4 是真空的，如实记下，不当证据用。** 需要说清楚**为什么**：
+这 4 条用例合起来只约束了两件事 —— ① 协议选对了类；② 每次调用是新实例。
+它们**没有**约束注入的 `Connector` 是否真的被用上，也**没有**约束
+`connectTimeout` / `verifyHostKey` / `onUnknownHostKey` 是否真的转发给了 `SshSession`。
+
+- M3 全绿的原因很具体：那条用例注入的 resolver 是 `(profile) => const DirectConnector()`，
+  与默认的 `_directConnector` **返回的是同一个东西**。于是"resolver 被调用"与
+  "resolver 被无视"产出完全相同的会话（`SshSession` 的 `connector` 字段语义相等），
+  用例读不出区别。它实际只证明了 `SessionFactory` **接受** `connectorResolver`
+  这个具名参数并且不会因此崩掉 —— 这仍有价值（命名对不上就编译不过），
+  但它**不是**"跳板机注入可用"的论据。
+- M4 全绿，是因为没有一条用例读过 `SshSession.verifyHostKey` 或 `connectTimeout`。
+  注意 M4① 放回去的缺陷是有**安全含义**的：它会把主机密钥校验**静默关掉**
+  （FR-C-11 / NFR-S-03），而 4 条用例一条都不会叫。
+
+**这条缺口本轮只披露、不修补。** 补法需要改 Task 5 已经评审过的测试围栏
+（要么给 M4 加"从会话上读 `verifyHostKey` / `connectTimeout`"的断言，要么把 M3 那条
+用例的 resolver 换成一个可辨识的 Connector 并断言它被真的传了下去），
+这不属于"显然正确"的加强，留给评审决定。
+**也不要把兜底寄托在 Task 6** —— Task 6 的测试用的是 `_FakeFactory implements SessionFactory`
+（见该 Task 的测试围栏），整条 `SessionFactory → Session` 的真转发路径在测试里**不会被走到**，
+所以下游也不会替这一层把 M3/M4 照出来。
+**唯一真正压住这两条的是"实现里没有分支"**：`create` 里那几行是直白的一对一透传，
+没有 `if`、没有默认值覆盖。一旦有人给 `create` 加上真正的分支逻辑（比如按协议区分超时、
+或按跳板机链挑 connector），M3/M4 这两条缺口就必须先补上测试再动代码。
+
+- [ ] **Step 6: 提交**
 
 ```bash
 dart analyze lib/connection/session_factory.dart test/connection/session_factory_test.dart
