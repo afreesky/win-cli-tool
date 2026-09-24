@@ -1521,10 +1521,32 @@ void main() {
   test('remove 不存在的记录不抛，且不改动文件内容', () async {
     final s = store();
     await s.save(host());
-    final before = await file.readAsString();
+    // **前态必须是本 store 自己写不出来的形状。** 这里原本是"存一条、把文件内容
+    // 读出来当基准"，那条断言**永远不会红**：`writeJsonObject` 是确定性的，把没变过
+    // 的 map 重写一遍得到逐字节相同的文件（实测过 —— 把空操作改成无条件 `_persist`，
+    // 用例照样绿，只有 ctime 变了）。手写一段带 `note` 的 JSON 塞进去就不一样了：
+    // 此时 `s` 的缓存里已经有记录，一旦它重写，写出来的是缓存（规范形态），
+    // 绝不会是这段手写文本。
+    const handWritten = '{"schemaVersion": 1, "hosts": [], "note": "手写"}';
+    await file.writeAsString(handWritten);
     await s.remove('10.0.0.9', 22, 'ssh-ed25519');
-    expect(await file.readAsString(), before,
+    expect(await file.readAsString(), handWritten,
         reason: '空操作不该重写文件 —— 无谓的写盘会放大"写失败"的窗口');
+  });
+
+  test('写盘失败时，本实例不留下"文件里没有"的记录（缓存不领先于文件）', () async {
+    // 父路径是一个**普通文件**，所以写盘必定失败，且与 uid 无关（chmod 挡不住
+    // root，这个形状挡得住）。要钉的是顺序：`save` 必须先写盘、成功之后才换缓存。
+    // 反过来的话，失败之后本实例会声称这条记录存在 —— 设置界面（FR-G-01）把它
+    // 列出来，`find` 把它当已知主机放行，而重启之后它就消失了。已知主机记录
+    // **悄悄消失**正是 [FileHostKeyStore._load] 那段注释最想避免的结局。
+    final blocker = File('${root.path}/blocker')..writeAsStringSync('not a dir');
+    final s = FileHostKeyStore(file: File('${blocker.path}/known_hosts.json'));
+
+    await expectLater(s.save(host()), throwsA(isA<FileSystemException>()));
+
+    expect(await s.find('10.0.0.1', 22, 'ssh-ed25519'), isNull,
+        reason: '写盘失败后本实例不得声称这条记录存在 —— 否则重启后它就不见了');
   });
 
   test('remove 之后新实例也读不到（真的删了盘上的）', () async {
@@ -1588,8 +1610,13 @@ void main() {
     final s = store();
     final h = host();
     await s.save(h);
-    // identity 是给人看的字符串；本 store 内部用元组。两者必须指向同一条：
-    // 若哪天有人改回字符串拼接并且拼法变了，这条会红。
+    // identity 是给人看的字符串；本 store 内部用元组。这条钉住的是 `save` 与
+    // `find`/`remove` **用的是同一个键的形状** —— 只改一半（比如把 `save` 的键
+    // 写成 `(host.keyType, host.port, host.host)`）会让 `find` 找不到，下面的
+    // `!` 立刻抛。
+    // **它不是在钉"内部必须用元组"**：`KnownHost` 的构造函数已经拒绝含冒号的
+    // keyType，所以拼接键其实也撞不了，两种写法在行为上无法区分（实测过：把六处
+    // 键全换成拼接串，整个文件照样全绿）。元组是纵深防御，不是可观测行为。
     expect((await s.find(h.host, h.port, h.keyType))!.identity, h.identity);
     await s.remove(h.host, h.port, h.keyType);
     expect(await s.all(), isEmpty);
@@ -1627,24 +1654,46 @@ class FileHostKeyStore implements HostKeyStore {
   /// 同时成立才守得住（构造函数拒绝含冒号的 keyType + find/remove 不校验 +
   /// identity 的拼法），而这三处已经出现过一处不设防的形状。元组把它变成
   /// 类型系统的事。
+  ///
+  /// **缓存只会保存"已经落盘"的内容，而且不会失效。** `save`/`remove` 都是
+  /// **写盘成功之后**才换缓存，所以进程内的状态永远不会领先于文件 —— 写盘失败时
+  /// 抛出去的东西与磁盘是一致的（见 [save]）。代价有两个，与 `DeviceStore` 的
+  /// 同款警告是一回事：**同一个文件不要建两个实例**（后写的会盖掉先写的），
+  /// 以及一个长命实例的 [all] 是快照、文件被外部改了它不会重读。计划 5 的装配
+  /// 只建一个，别改。
   Map<(String, int, String), KnownHost>? _cache;
 
   @override
   Future<KnownHost?> find(String host, int port, String keyType) async =>
       (await _load())[(host, port, keyType)];
 
+  /// **先写盘，成功了才换缓存**（顺序不能反）。
+  ///
+  /// 反过来写（先改 `_cache` 再 `_persist`）在写盘失败时会留下一条"进程内说有、
+  /// 文件里没有"的记录：`find` 会把它当已知主机直接放行，设置界面（FR-G-01）也会
+  /// 把它列出来，而**重启之后它就不见了**。已知主机记录悄悄消失正是本类最想避免
+  /// 的结局（见 [_load] 里那段），所以宁可让缓存晚一步。
   @override
   Future<void> save(KnownHost host) async {
-    final map = await _load();
-    map[(host.host, host.port, host.keyType)] = host;
-    await _persist(map);
+    // 拷一份再改：`_load()` 可能返回的就是 `_cache` 本身，就地改就等于先动了缓存。
+    final next = Map.of(await _load())
+      ..[(host.host, host.port, host.keyType)] = host;
+    await _persist(next);
+    _cache = next;
   }
 
+  /// 同样**先写盘，成功了才换缓存**，理由见 [save]。
+  ///
+  /// 删除失败却换了缓存的话，用户以为已经清掉了那把密钥、文件里却还在 ——
+  /// 而"清掉一条已知主机密钥"正是用户遇到真的密钥变更时唯一的出路
+  /// （`known_host.dart` 里 [HostKeyStore.remove] 的文档）。
   @override
   Future<void> remove(String host, int port, String keyType) async {
     final map = await _load();
-    if (map.remove((host, port, keyType)) == null) return;
-    await _persist(map);
+    if (!map.containsKey((host, port, keyType))) return;
+    final next = Map.of(map)..remove((host, port, keyType));
+    await _persist(next);
+    _cache = next;
   }
 
   /// 全部记录，供 FR-G-01 的「已知主机密钥记录的查看与逐条清除」使用。
@@ -1698,7 +1747,7 @@ class FileHostKeyStore implements HostKeyStore {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `flutter test test/data/host_key_store_test.dart`
-Expected: `All tests passed!`（17 条）
+Expected: `All tests passed!`（18 条）
 
 - [ ] **Step 5: Commit**
 
