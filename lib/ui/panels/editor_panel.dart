@@ -23,10 +23,10 @@ class EditorPanel extends ConsumerStatefulWidget {
   final String deviceId;
 
   @override
-  ConsumerState<EditorPanel> createState() => _EditorPanelState();
+  ConsumerState<EditorPanel> createState() => EditorPanelState();
 }
 
-class _EditorPanelState extends ConsumerState<EditorPanel> {
+class EditorPanelState extends ConsumerState<EditorPanel> {
   final SentLineController _text = SentLineController();
   final ScrollController _gutter = ScrollController();
   final ScrollController _editor = ScrollController();
@@ -54,9 +54,9 @@ class _EditorPanelState extends ConsumerState<EditorPanel> {
   }
 
   @override
-  void didUpdateWidget(EditorPanel old) {
-    super.didUpdateWidget(old);
-    if (old.deviceId == widget.deviceId) return;
+  void didUpdateWidget(EditorPanel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.deviceId == widget.deviceId) return;
     // 换设备：先把上一台的草稿落盘（不能等防抖），再清空载入新的。
     _autosave.flush();
     _autosave.dispose();
@@ -81,9 +81,15 @@ class _EditorPanelState extends ConsumerState<EditorPanel> {
   }
 
   Future<void> _loadDraft() async {
+    // **续体要回认设备。** 本方法是异步的：切到 B 之后 B 那次读还没回来，
+    // 用户又切回 A —— B 的续体会把**A 的**编辑区刷成 B 的草稿。实测的表现是
+    // "切回 A 之后草稿是空的"（`draftProvider('d1')` 已经是 `AsyncData('sys')`，
+    // 而编辑区的 text 是 `''`）。`didUpdateWidget` 只管得住换设备的那一刻，
+    // 管不住换完之后回来的续体，所以这里自己比一次。
+    final deviceId = widget.deviceId;
     try {
-      final text = await ref.read(draftProvider(widget.deviceId).future);
-      if (!mounted) return;
+      final text = await ref.read(draftProvider(deviceId).future);
+      if (!mounted || deviceId != widget.deviceId) return;
       setState(() {
         _seeded = true;
         _text.text = text;
@@ -91,7 +97,7 @@ class _EditorPanelState extends ConsumerState<EditorPanel> {
     } on DraftUnreadableException {
       // FR-E-03 的失败分支：草稿文件读不了（不是 UTF-8 / 读盘失败）。
       // **不降级成空串** —— 那会让用户以为草稿没了而其实文件还在。
-      if (!mounted) return;
+      if (!mounted || deviceId != widget.deviceId) return;
       setState(() => _seeded = true);
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('草稿无法读取（文件不是 UTF-8 或读盘失败），已从空白开始')),
@@ -112,7 +118,7 @@ class _EditorPanelState extends ConsumerState<EditorPanel> {
     _gutter.jumpTo(_editor.offset);
   }
 
-  void _send() {
+  void send() {
     final commands = commandsToSend(_text.text, _text.selection);
     if (commands.isEmpty) {
       // §5.1 结尾：结果为空时给轻提示。**不能静默** —— 用户按了发送却什么都没
@@ -265,7 +271,7 @@ class _EditorPanelState extends ConsumerState<EditorPanel> {
             IconButton(
               tooltip: '发送',
               icon: const Icon(Icons.send, size: 18),
-              onPressed: connected ? _send : null,
+              onPressed: connected ? send : null,
             ),
           const Spacer(),
           if (progress != null)

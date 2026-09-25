@@ -3,12 +3,12 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'models/app_settings.dart';
 import 'state/providers.dart';
+import 'ui/main_window.dart';
 
 /// 应用外壳：主题、`MaterialApp`、以及启动后**一次**的副作用。
 ///
-/// **计划 5a 到此为止 —— 界面在 5b。** 这里的 `home` 是一个明确写着"界面还没
-/// 做"的占位页，不是脚手架残留：它证明装配是通的（设置读得到、provider 建得
-/// 起来、生命周期跑得完），而 5b 把 `MainWindow` 换进来时只需要动这一个字面量。
+/// 界面在 5b 接上（计划 5a 的占位页到此为止）：`home` 现在是真的
+/// `MainWindow`。
 class WinCliToolApp extends ConsumerStatefulWidget {
   const WinCliToolApp({super.key});
 
@@ -49,18 +49,7 @@ class _WinCliToolAppState extends ConsumerState<WinCliToolApp> {
           brightness: Brightness.dark,
         ),
       ),
-      home: const _PlaceholderPage(),
+      home: const MainWindow(),
     );
   }
-}
-
-/// 计划 5b 会用真正的主窗口换掉它。**别在这里长东西。**
-class _PlaceholderPage extends StatelessWidget {
-  const _PlaceholderPage();
-
-  @override
-  Widget build(BuildContext context) => Scaffold(
-    appBar: AppBar(title: const Text('网络设备命令行工具')),
-    body: const Center(child: Text('界面尚未实现（计划 5b）')),
-  );
 }

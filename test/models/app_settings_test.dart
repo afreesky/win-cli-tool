@@ -20,6 +20,7 @@ void main() {
       expect(s.verifySshHostKey, isTrue);
       expect(s.theme, AppTheme.system);
       expect(s.editorSplitRatio, 0.4);
+      expect(s.deviceListWidth, 240);
       expect(s.outputBufferLines, 5000);
     });
 
@@ -35,6 +36,7 @@ void main() {
         verifySshHostKey: false,
         theme: AppTheme.dark,
         editorSplitRatio: 0.6,
+        deviceListWidth: 320,
         outputBufferLines: 1000,
       );
 
@@ -50,6 +52,7 @@ void main() {
       expect(restored.verifySshHostKey, isFalse);
       expect(restored.theme, AppTheme.dark);
       expect(restored.editorSplitRatio, 0.6);
+      expect(restored.deviceListWidth, 320);
       expect(restored.outputBufferLines, 1000);
     });
 
@@ -70,6 +73,7 @@ void main() {
       expect(restored.verifySshHostKey, defaults.verifySshHostKey);
       expect(restored.theme, defaults.theme);
       expect(restored.editorSplitRatio, defaults.editorSplitRatio);
+      expect(restored.deviceListWidth, defaults.deviceListWidth);
       expect(restored.outputBufferLines, defaults.outputBufferLines);
     });
 

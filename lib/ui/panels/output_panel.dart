@@ -22,10 +22,10 @@ class OutputPanel extends ConsumerStatefulWidget {
   final String deviceId;
 
   @override
-  ConsumerState<OutputPanel> createState() => _OutputPanelState();
+  ConsumerState<OutputPanel> createState() => OutputPanelState();
 }
 
-class _OutputPanelState extends ConsumerState<OutputPanel> {
+class OutputPanelState extends ConsumerState<OutputPanel> {
   final ScrollController _scroll = ScrollController();
   late final AutoScroll _auto = AutoScroll(controller: _scroll);
 
@@ -56,6 +56,13 @@ class _OutputPanelState extends ConsumerState<OutputPanel> {
       if (!mounted) return;
       setState(() => _auto.onContentChanged());
     });
+  }
+
+  /// 清屏（FR-O-05 / Ctrl+L）。**只在显示层动手**：`OutputBuffer.clear()` 按
+  /// 设计不调 `onText`，所以日志分毫不动。
+  void clearOutput() {
+    _buffer?.clear();
+    setState(_auto.jumpToBottom);
   }
 
   String _deviceName(List<DeviceProfile> devices) {
@@ -146,10 +153,7 @@ class _OutputPanelState extends ConsumerState<OutputPanel> {
           IconButton(
             tooltip: '清屏',
             icon: const Icon(Icons.clear_all, size: 18),
-            onPressed: () {
-              _buffer?.clear();
-              setState(_auto.jumpToBottom);
-            },
+            onPressed: clearOutput,
           ),
         ],
       ),

@@ -34,6 +34,7 @@ class AppSettings {
     this.theme = AppTheme.system,
     this.editorSplitRatio = 0.4,
     this.outputBufferLines = 5000,
+    this.deviceListWidth = 240,
   });
 
   /// 提示符正则的全局默认值。
@@ -65,6 +66,9 @@ class AppSettings {
   /// 输出缓冲保留的最大行数。
   final int outputBufferLines;
 
+  /// 设备列表宽度（像素）。
+  final double deviceListWidth;
+
   AppSettings copyWith({
     String? defaultPromptRegex,
     int? promptDebounceMs,
@@ -77,6 +81,7 @@ class AppSettings {
     AppTheme? theme,
     double? editorSplitRatio,
     int? outputBufferLines,
+    double? deviceListWidth,
   }) =>
       AppSettings(
         defaultPromptRegex: defaultPromptRegex ?? this.defaultPromptRegex,
@@ -90,6 +95,7 @@ class AppSettings {
         theme: theme ?? this.theme,
         editorSplitRatio: editorSplitRatio ?? this.editorSplitRatio,
         outputBufferLines: outputBufferLines ?? this.outputBufferLines,
+        deviceListWidth: deviceListWidth ?? this.deviceListWidth,
       );
 
   factory AppSettings.fromJson(Map<String, Object?> json) => AppSettings(
@@ -110,6 +116,7 @@ class AppSettings {
         theme: AppTheme.fromName(json['theme'] as String? ?? 'system'),
         editorSplitRatio: (json['editorSplitRatio'] as num?)?.toDouble() ?? 0.4,
         outputBufferLines: json['outputBufferLines'] as int? ?? 5000,
+        deviceListWidth: (json['deviceListWidth'] as num?)?.toDouble() ?? 240,
       );
 
   Map<String, Object?> toJson() => {
@@ -124,5 +131,6 @@ class AppSettings {
         'theme': theme.name,
         'editorSplitRatio': editorSplitRatio,
         'outputBufferLines': outputBufferLines,
+        'deviceListWidth': deviceListWidth,
       };
 }
