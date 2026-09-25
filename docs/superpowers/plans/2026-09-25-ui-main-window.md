@@ -1043,7 +1043,11 @@ void main() {
       autosave.flush();
       expect(saved, ['写了一半'], reason: '退出时必须立刻落盘，不能等防抖');
 
-      // 防抖定时器要真的被取消掉，否则退出后还会再来一次（重复写同一内容）。
+      // 防抖定时器**应当**被取消。但下面这一条断言**钉不住"取消"本身** ——
+      // 即便那个定时器漏掉了，它到点时 `_pending` 已被 `flush` 清空，`_write`
+      // 会当场早退，写不出第二次。我构造不出让漏取消咬人的用例（要 `_pending`
+      // 非空才有效，而 `schedule` 又会先取消旧定时器），所以这里只把"退出后不
+      // 再多写一次"当作依据，**不声称它验了取消**。
       async.elapse(const Duration(seconds: 2));
       expect(saved, ['写了一半']);
 
@@ -1148,8 +1152,9 @@ class DraftAutosave {
   /// 待落盘的内容。null 表示"没有待写的东西"。
   String? _pending;
 
-  /// 上一次**成功交给 [save]** 的内容。用来跳过无谓的重复写 —— 切设备会重建
-  /// 编辑区、`setState` 会重跑 `initState` 之外的路径，那些都不该产生磁盘写。
+  /// 上一次**交给 [save]** 的内容（**不是"最后成功落盘的"** —— 见 [_write]）。
+  /// 用来跳过无谓的重复写 —— 切设备会重建编辑区、`setState` 会重跑
+  /// `initState` 之外的路径，那些都不该产生磁盘写。
   String? _lastSaved;
 
   bool _disposed = false;
@@ -1176,8 +1181,10 @@ class DraftAutosave {
     final text = _pending;
     if (text == null) return;
     _pending = null;
-    // 先记下再写：写失败时不该让 `schedule` 以为"内容没变"而拒绝重试，
-    // 那样用户改动后的第二次编辑会被静默丢掉。
+    // **先记下再写**，而不是等 `save` 成功之后再记。本类不认识存储层，也拿不到
+    // "写成功了"这个事实 —— `save(text)` 是异步的，这里并不 await 它。所以
+    // `_lastSaved` 的准确含义是"最后一次**交给** `save` 的内容"，不是"最后一次
+    // **成功落盘**的内容"。失败了由 [onError] 报给调用方去提示，本类**不重试**。
     if (text == _lastSaved) return;
     _lastSaved = text;
     // `save` 返回的 Future 必须被接住 —— 它是异步的，异常不会在这里同步抛出。
