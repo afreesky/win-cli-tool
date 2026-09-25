@@ -121,6 +121,13 @@ class SessionController {
   /// 当前会话的日志。**一次会话一个实例**，会话结束调 `end()`。
   LogWriter? _log;
 
+  /// [dispose] 一开始就同步置位，此后**一个事件都不再处理**。
+  ///
+  /// 它不是"纵深防御"，是 [dispose] 那个条件成立的原因：`ConnectionManager.events`
+  /// 是广播流，`connect()` 返回时事件可能还排在队列里，而 `dispose()` 里任何一次
+  /// `await` 都会把控制权让出去，让那个事件落到一个正在被拆掉的 controller 上。
+  var _disposed = false;
+
   var _status = const SessionStatus();
 
   /// 状态变化时回调（界面订阅它重绘）。
@@ -152,9 +159,27 @@ class SessionController {
   }
 
   /// 应用退出时调用（FR-C-12）。**不向设备发送任何命令。**
+  ///
+  /// **第一件事是"此后不再处理任何事件"，而且必须在任何 `await` 之前。**
+  ///
+  /// 本方法经 `ref.onDispose(_controller.dispose)` 注册，Riverpod **不 await
+  /// 它**（`onDispose` 收的是 `void Function()`，这里给的是 async 函数，返回的
+  /// Future 被丢掉）；而 `ConnectionManager.events` 是**广播流**，`connect()`
+  /// 返回时 `SessionReady` / `ConnectionStateChanged` 可能**还排在队列里**。
+  /// 所以这里但凡先 `await` 一次，那个已排队的事件就会被投递进来，
+  /// `_onSessionReady` 于是**在销毁过程中**重新订阅 dispatcher 并 `_startLog()` ——
+  /// 建出一个此后再也取消不掉的订阅，还为一个正在被拆掉的会话开一个日志文件。
+  ///
+  /// 这不是推理出来的：退出用例（`connect()` 之后立刻 dispose）实跑连红 4 次，
+  /// 栈就是 `_onEvent → _onSessionReady → _setStatus`，抛在 `state = status` 上
+  /// （`Cannot use the Ref ... after it has been disposed`）。
+  ///
+  /// [_disposed] 那个标志是这条件成立的原因，`cancel()` 是顺带清理；两者都要，
+  /// 因为标志不依赖 `cancel()` 的投递语义。
   Future<void> dispose() async {
-    await _dispatchSub?.cancel();
+    _disposed = true;
     await _eventsSub.cancel();
+    await _dispatchSub?.cancel();
     await _outputSub.cancel();
     // 残留的半条序列放出来，否则它永远留在缓冲里 —— 而输出区此后不再有新数据
     // 来把它补齐。
@@ -164,6 +189,7 @@ class SessionController {
   }
 
   void _onEvent(ConnectionEvent event) {
+    if (_disposed) return;
     // `ConnectionEvent` 是 `sealed`：将来新增一种会成为**编译错误**，
     // 而不是某个分支悄悄不处理。
     switch (event) {
@@ -205,6 +231,8 @@ class SessionController {
   }
 
   void _onDispatchEvent(DispatchEvent event) {
+    // 与 [_onEvent] 同一个理由：dispatcher 的广播流也可能有已排队的事件。
+    if (_disposed) return;
     if (event is QueueDropped) {
       _setStatus(_status.copyWith(droppedCommands: event.count));
       _markWarn('--- 连接断开，${event.count} 条未发送的命令已丢弃 ---');

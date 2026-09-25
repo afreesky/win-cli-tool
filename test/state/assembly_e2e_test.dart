@@ -167,18 +167,6 @@ void main() {
     final session = factory.sessions.single;
     session.written.clear();
 
-    // **dispose 之前必须先让 `SessionReady` 投递完，否则这一条是红的。**
-    // `_manager.events` 是异步广播流：`connect()` 返回时 `SessionReady` 与
-    // `ConnectionStateChanged(connected)` 还排在投递队列里（实测：这里不 settle
-    // 的话，下一行读到的是 `connecting`，而不是 `connected`）。
-    // `SessionController.dispose()` 的第一句是 `await _dispatchSub?.cancel()` ——
-    // 即使 `_dispatchSub` 是 null，那个 `await` 也让出一轮微任务，于是**在途的
-    // 那个事件赶在 `_eventsSub.cancel()` 之前**投递到 `onStatus` → `state = status`，
-    // 而此刻 notifier 已经被 dispose，抛出 "Cannot use the Ref ... after it has
-    // been disposed"。**在 `dispose()` 之后补 await 挡不住它**（实测：补
-    // `Duration.zero` 仍然红）—— 事件已经排在那里，补的 await 只是给它让路。
-    await settle();
-
     container.dispose();
     await settle();
 
