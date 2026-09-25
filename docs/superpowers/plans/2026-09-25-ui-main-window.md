@@ -3147,11 +3147,13 @@ EOF
 
 **§9.2 的第 2 条落在本任务**（设备切换）。
 
-**本任务要改两处已提交的代码**，都在下面 Step 2 里给全：把编辑区与输出区的
-State 类**公开**并各留一个动作方法，供窗口级快捷键调用。
+**本任务要改两处已提交的代码**（`editor_panel.dart` 与 `output_panel.dart`），
+都在下面 Step 2 里给全：把两个 State 类**公开**并各留一个动作方法，供窗口级快捷键
+调用。同一步里还带上两处**实测出来的**小改：`didUpdateWidget` 的参数名（类一公开
+就会报 info）与 `_loadDraft` 的续体回认设备（切走再切回来会丢草稿）。
 
 **Files:**
-- Modify: `lib/ui/panels/editor_panel.dart`（State 类公开 + `send()` 公开）
+- Modify: `lib/ui/panels/editor_panel.dart`（State 类公开 + `send()` 公开 + `didUpdateWidget` 参数名 + `_loadDraft` 续体回认设备）
 - Modify: `lib/ui/panels/output_panel.dart`（State 类公开 + `clearOutput()` 公开）
 - Modify: `lib/models/app_settings.dart`（加 `deviceListWidth`）
 - Create: `lib/ui/widgets/splitter.dart`
@@ -3167,20 +3169,62 @@ State 类**公开**并各留一个动作方法，供窗口级快捷键调用。
 `selectedDeviceProvider` 与 `SelectedDeviceNotifier` 即可。**不要重复添加**
 （重复定义会红在 `already_declared`）。定义与理由见 Task 8 Step 4。
 
-- [ ] **Step 2: 把那两个 State 类公开**
+- [ ] **Step 2: 改已提交的两个面板（State 类公开 + 各留一个动作方法 + 两处实测缺陷）**
 
-`editor_panel.dart`：
+**本步一共七处改动，两个文件**，都在下面给全。第 3、4 处（`editor_panel.dart` 的后两处）
+**原本不在计划里** —— 是派发前照本步的代码把整个 Task 摆出来跑的时候红的，现象分别是
+`dart analyze` 多出一条 info、以及"切回 A 之后草稿是空的"。
 
-- `ConsumerState<EditorPanel> createState() => EditorPanelState();`
-- `class _EditorPanelState extends ConsumerState<EditorPanel>` → `class EditorPanelState extends ConsumerState<EditorPanel>`
-- `void _send()` → `void send()`
-- 工具栏里 `onPressed: connected ? _send : null` → `onPressed: connected ? send : null`
+`editor_panel.dart` 四处：
 
-`output_panel.dart`：
+**（1）State 类公开：**
 
-- `ConsumerState<OutputPanel> createState() => OutputPanelState();`
-- `class _OutputPanelState` → `class OutputPanelState`
-- 清屏按钮的 `onPressed` 抽成公开方法：
+```dart
+  ConsumerState<EditorPanel> createState() => EditorPanelState();
+```
+
+```dart
+class EditorPanelState extends ConsumerState<EditorPanel> {
+```
+
+**（2）`_send` 公开**：`void _send()` → `void send()`，工具栏里
+`onPressed: connected ? _send : null` → `onPressed: connected ? send : null`。
+
+**（3）`didUpdateWidget` 的参数名要一起改** —— 类一公开，`old` 这个名字就开始报
+`avoid_renaming_method_parameters`（info）：
+
+```dart
+  void didUpdateWidget(EditorPanel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.deviceId == widget.deviceId) return;
+```
+
+实测：HEAD 上同名的参数**不报**（那时 State 类还是私有的），把类公开、参数名不动之后
+`dart analyze lib/ test/` 输出 1 条 info，改名之后才回到 `No issues found!`。info 会打掉
+本计划"analyze 干净"这条验收，所以这不是"顺手改"。
+
+**（4）`_loadDraft` 的续体要回认设备**（真机缺陷）：方法开头加 `final deviceId =
+widget.deviceId;`，`draftProvider(widget.deviceId)` 换成 `draftProvider(deviceId)`，
+**两个** `if (!mounted) return;` 都改成 `if (!mounted || deviceId != widget.deviceId) return;`：
+
+```dart
+  Future<void> _loadDraft() async {
+    // **续体要回认设备。** 本方法是异步的：切到 B 之后 B 那次读还没回来，
+    // 用户又切回 A —— B 的续体会把**A 的**编辑区刷成 B 的草稿。实测的表现是
+    // "切回 A 之后草稿是空的"（`draftProvider('d1')` 已经是 `AsyncData('sys')`，
+    // 而编辑区的 text 是 `''`）。`didUpdateWidget` 只管得住换设备的那一刻，
+    // 管不住换完之后回来的续体，所以这里自己比一次。
+    final deviceId = widget.deviceId;
+    try {
+      final text = await ref.read(draftProvider(deviceId).future);
+      if (!mounted || deviceId != widget.deviceId) return;
+```
+
+`output_panel.dart` 三处：
+
+**（1）`ConsumerState<OutputPanel> createState() => OutputPanelState();`
+（2）`class _OutputPanelState` → `class OutputPanelState`
+（3）清屏按钮的 `onPressed` 抽成公开方法：**
 
 ```dart
   /// 清屏（FR-O-05 / Ctrl+L）。**只在显示层动手**：`OutputBuffer.clear()` 按
@@ -3226,17 +3270,22 @@ void main() {
     WidgetTester tester, {
     FakeSessionFactory? factory,
     AppSettings settings = const AppSettings(),
-  }) => pumpUi(
-    tester,
-    root: root,
-    devices: [
-      fakeProfile(id: 'd1', name: '核心交换机', autoConnect: true),
-      fakeProfile(id: 'd2', name: '边界防火墙'),
-    ],
-    settings: settings,
-    factory: factory,
-    child: const MainWindow(),
-  );
+  }) async {
+    await pumpUi(
+      tester,
+      root: root,
+      devices: [
+        fakeProfile(id: 'd1', name: '核心交换机', autoConnect: true),
+        fakeProfile(id: 'd2', name: '边界防火墙'),
+      ],
+      settings: settings,
+      factory: factory,
+      child: const MainWindow(),
+    );
+    // 编辑区要在 `initState` 里把草稿读出来才算就绪，而那次读是**真盘 I/O**
+    // （`pumpAndSettle` 里走不完，见 `settleDisk` 的文档）。
+    await settleDisk(tester);
+  }
 
   testWidgets('三个区都在，且默认选中第一台（§7.1 的布局）', (tester) async {
     await pumpWindow(tester);
@@ -3265,13 +3314,14 @@ void main() {
 
     await tester.enterText(find.byType(TextField), 'sys');
     await tester.pump(const Duration(milliseconds: 600));
-
+    await settleDisk(tester);
     await tester.tap(find.text('边界防火墙'));
     await tester.pumpAndSettle();
     expect(find.text('sys'), findsNothing, reason: 'B 设备不该看到 A 的草稿');
 
     await tester.tap(find.text('核心交换机').first);
-    await tester.pumpAndSettle();
+    await settleDisk(tester);
+
     expect(find.text('sys'), findsOneWidget, reason: '切回来草稿还在');
   });
 
@@ -3336,7 +3386,7 @@ void main() {
 
     final splitter = find.byKey(const ValueKey('splitter-h'));
     await tester.drag(splitter, const Offset(0, 60));
-    await tester.pumpAndSettle();
+    await settleDisk(tester);
 
     final after = container.read(settingsProvider).editorSplitRatio;
     expect(after, greaterThan(before), reason: '往下拖应当让编辑区变高');
@@ -3352,7 +3402,34 @@ void main() {
 **`FakeSessionFactory.sessions` 在 `create()` 时就把会话 `add` 进去**，所以它记的
 是"**建过**几个会话"而不是"连上了几个"。`app_test.dart` 里那条 autoConnect 断言
 靠的是"`create()` 只在真的去连时才被调用"，不是靠 `sessions` 的语义 —— 别把它
-读成后者。
+读成后者。**这一点对本文件的 Esc 那条尤其要紧**：`pumpUi` 装的是 `MainWindow`
+而不是 `WinCliToolApp`，所以 `connectAutoConnectDevicesAtStartup`（唯一调用点在
+`app.dart` 的 `initState`）**根本不会跑** —— `autoConnect: true` 在这里是惰性的，
+`sessions.single` 就是那条用例自己点出来的那一台。
+
+**泵盘（`settleDisk`）在这里有四处是承重的**，都是实测出来的，少一处就红：
+
+1. **`pumpWindow` 结尾那次**：编辑区在 `initState` 里读草稿，而那次读是**真盘 I/O**。
+   `pumpUi` 结尾的 `pumpAndSettle()` **走不完它** —— 实测派发前那一版里
+   `draftProvider('d1')` 在 `pumpAndSettle` 之后仍是 `AsyncLoading`，于是
+   `_seeded` 一直是 false、`_onTextChanged` 直接早返回、防抖根本没被武装，
+   表现是"写进编辑区的内容一个字都没落盘"。
+2. **`enterText` 之后那次**：`DraftAutosave` 的 500ms 防抖到点才发起写，
+   `pump(600ms)` 只把**定时器**烧掉，写本身仍要真盘轮转。
+3. **切回来之后那次**：`draftProvider('d1')` 这时已经是 `AsyncData`，但把它灌进
+   `TextEditingController` 仍要跨一次 `await`（微任务），而假时钟里的
+   `pumpAndSettle` 之后**未必**已经落到界面上了。这两处用 `settleDisk` 都是一次
+   到底，不必推敲。
+4. **分隔条那条**：拖动松手后要写 `settings.json`（同 1、2 的理由）。
+
+**分隔条那条为什么用 `onDragEnd` 落盘、而断言只看"变大了"**：`tester.drag(Offset(0, 60))`
+实测会被 touch slop 拆成 **20 + 40 两段**（探针打印过），也就是**一次拖动两次
+`onDrag`**。若按每次 `onDrag` 都写盘，两次写就**同时上路**，而
+`writeFileAtomically` 是先写同目录 `.tmp` 再 rename —— 先完成的那次把 `.tmp`
+挪走了，后一次的 rename 直接抛
+`PathNotFoundException: Cannot rename file .../settings.json.tmp (errno = 2)`
+（实测，那条用例当时就红在这里）。所以 `MainWindow` 在拖动期间只动本地值、
+松手落盘一次；顺带把未决项 10 与 11 一起了掉（见那两条的说明）。
 
 - [ ] **Step 4: 跑测试确认红**
 
@@ -3373,6 +3450,7 @@ class Splitter extends StatelessWidget {
     super.key,
     required this.axis,
     required this.onDrag,
+    this.onDragEnd,
     this.thickness = 6,
   });
 
@@ -3381,6 +3459,10 @@ class Splitter extends StatelessWidget {
 
   /// 拖动时回调：参数是**沿拖动方向的像素增量**。
   final void Function(double delta) onDrag;
+
+  /// 松手时回调。**落盘要挂在这里，不要挂在 [onDrag] 上** —— 理由见
+  /// `main_window.dart` 里 `_draggingWidth` 的文档。
+  final VoidCallback? onDragEnd;
 
   final double thickness;
 
@@ -3399,6 +3481,12 @@ class Splitter extends StatelessWidget {
         onVerticalDragUpdate: axis == Axis.horizontal
             ? (d) => onDrag(d.delta.dy)
             : null,
+        onHorizontalDragEnd: axis == Axis.vertical
+            ? (_) => onDragEnd?.call()
+            : null,
+        onVerticalDragEnd: axis == Axis.horizontal
+            ? (_) => onDragEnd?.call()
+            : null,
         child: SizedBox(
           width: axis == Axis.vertical ? thickness : null,
           height: axis == Axis.horizontal ? thickness : null,
@@ -3415,6 +3503,9 @@ class Splitter extends StatelessWidget {
   }
 }
 ```
+
+**`onDragEnd` 不是可选的装饰**，它是 `MainWindow` 唯一能落盘的地方 —— 理由见
+Step 3 末尾那一段与 `main_window.dart` 里 `_draggingWidth` 的文档。
 
 - [ ] **Step 6: 实现主窗口**
 
@@ -3448,6 +3539,20 @@ class _MainWindowState extends ConsumerState<MainWindow> {
   final _outputKey = GlobalKey<OutputPanelState>();
 
   static const double _minPane = 160;
+
+  /// 拖动中的临时宽度／比例（null = 没在拖）。
+  ///
+  /// **拖动过程里不写 settings。** 每次 `onDragUpdate` 都写一趟的话：
+  /// （一）那条链里有 `chmod` —— 一个**进程** —— 60Hz 的拖动就是每秒起 60 个；
+  /// （二）两次写会重叠，而 `writeFileAtomically` 是先写同目录 `.tmp` 再 rename，
+  /// 重叠时先完成的那次把 `.tmp` 挪走了，后一次的 rename 就红在
+  /// `Cannot rename file .../settings.json.tmp (errno = 2)`。这两条都是实测的：
+  /// `tester.drag(Offset(0, 60))` 一次就被 touch slop 拆成 20 + 40 两段，
+  /// 于是两条写同时上路，那条测试红在 PathNotFoundException 上。
+  ///
+  /// 所以拖动期间只动本地状态（界面照样实时跟手），松手才落盘一次。
+  double? _draggingWidth;
+  double? _draggingRatio;
 
   @override
   Widget build(BuildContext context) {
@@ -3492,14 +3597,12 @@ class _MainWindowState extends ConsumerState<MainWindow> {
   Widget _empty() => const Center(child: Text('请先添加一台设备'));
 
   Widget _body(String deviceId, AppSettings settings) {
-    // 工具栏的"添加设备"与 Ctrl+N 都走这里。设备编辑对话框属 5b-2，所以 5b-1
-    // 只能给出提示 —— **这是一个已知的占位**，不是遗漏。
-    void addDevice() => _addDevice();
+    final width = _draggingWidth ?? settings.deviceListWidth;
 
     return Row(
       children: [
         SizedBox(
-          width: settings.deviceListWidth,
+          width: width,
           child: DeviceListPanel(),
         ),
         // 设备列表与右侧之间的分隔条改动的是列表宽度。
@@ -3507,20 +3610,26 @@ class _MainWindowState extends ConsumerState<MainWindow> {
           key: const ValueKey('splitter-v'),
           axis: Axis.vertical,
           onDrag: (delta) {
-            final next = (settings.deviceListWidth + delta)
-                .clamp(_minPane, 480.0);
-            if (next == settings.deviceListWidth) return;
-            ref
-                .read(settingsProvider.notifier)
-                .update(settings.copyWith(deviceListWidth: next));
+            final base = _draggingWidth ?? settings.deviceListWidth;
+            setState(() => _draggingWidth = (base + delta).clamp(_minPane, 480.0));
+          },
+          onDragEnd: () {
+            final next = _draggingWidth;
+            if (next == null || next == settings.deviceListWidth) {
+              setState(() => _draggingWidth = null);
+              return;
+            }
+            _commit(settings.copyWith(deviceListWidth: next));
           },
         ),
         Expanded(
           child: LayoutBuilder(
             builder: (context, constraints) {
               final total = constraints.maxHeight;
+              // 拖动中的比例走本地值：设置里那份要等松手才更新。
+              final ratio = _draggingRatio ?? settings.editorSplitRatio;
               final editorHeight =
-                  (total * settings.editorSplitRatio).clamp(_minPane, total - _minPane);
+                  (total * ratio).clamp(_minPane, total - _minPane);
               return Column(
                 children: [
                   SizedBox(
@@ -3532,10 +3641,19 @@ class _MainWindowState extends ConsumerState<MainWindow> {
                     axis: Axis.horizontal,
                     onDrag: (delta) {
                       if (total <= 0) return;
-                      final next = ((editorHeight + delta) / total).clamp(0.15, 0.85);
-                      ref
-                          .read(settingsProvider.notifier)
-                          .update(settings.copyWith(editorSplitRatio: next));
+                      final base = _draggingRatio ?? settings.editorSplitRatio;
+                      setState(
+                        () => _draggingRatio =
+                            (base + delta / total).clamp(0.15, 0.85),
+                      );
+                    },
+                    onDragEnd: () {
+                      final next = _draggingRatio;
+                      if (next == null || next == settings.editorSplitRatio) {
+                        setState(() => _draggingRatio = null);
+                        return;
+                      }
+                      _commit(settings.copyWith(editorSplitRatio: next));
                     },
                   ),
                   Expanded(
@@ -3548,6 +3666,31 @@ class _MainWindowState extends ConsumerState<MainWindow> {
         ),
       ],
     );
+  }
+
+  /// 松手时把拖动中的值写回设置。**成功与失败都要清掉本地值** —— 留着的话，
+  /// 之后 `settings` 再怎么变界面都不跟着走了。
+  Future<void> _commit(AppSettings next) async {
+    try {
+      // 存盘成功之后 `SettingsNotifier` 才改内存状态，所以 await 回来时
+      // `settingsProvider` 已经是 `next`，清本地值不会闪回旧值。
+      await ref.read(settingsProvider.notifier).update(next);
+    } catch (_) {
+      // 存盘失败时异常从 `update` 原样抛出来（见它的文档）。**不能静默回弹** ——
+      // 用户会把"拖了但没生效"当成拖动失灵，而真正的原因是设置没写下去。
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('设置未能保存')),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _draggingWidth = null;
+          _draggingRatio = null;
+        });
+      }
+    }
   }
 
   void _send() => _editorKey.currentState?.send();
@@ -3570,18 +3713,40 @@ class _MainWindowState extends ConsumerState<MainWindow> {
 }
 ```
 
-**`_body` 里那个 `addDevice` 局部函数是多余的吗？** 是 —— 删掉它，`_empty()`
-分支之外不需要它。上面留着是为了让你看清它**不该**存在；实现时不要写它。
+**`_body` 里不要有 `addDevice` 局部函数。** 5b-1 的 Ctrl+N 只给 SnackBar 提示
+（见 `_addDevice`），没有第二个落点需要它；多一个没人调的函数会红在
+`unused_element`（info），又打掉"analyze 干净"。
 
 **`AppSettings` 需要一个新字段 `deviceListWidth`。** 在 `lib/models/app_settings.dart`
-里按既有字段的写法加：`final double deviceListWidth`，默认 `240`，进构造函数的
-默认值、`copyWith`、`fromJson`（`(json['deviceListWidth'] as num?)?.toDouble() ?? 240`）
-与 `toJson`。**照抄 `editorSplitRatio` 那一套**（它的默认值是 0.4）。
+里按既有字段的写法加六处：构造函数的 `this.deviceListWidth = 240,`、字段声明
+`final double deviceListWidth;`、`copyWith` 的形参与赋值、`fromJson` 的
+`(json['deviceListWidth'] as num?)?.toDouble() ?? 240`、以及 `toJson`。**照抄
+`editorSplitRatio` 那一套**（它的默认值是 0.4）。
 
-**同时在 `test/models/app_settings_test.dart` 里照 `editorSplitRatio` 的写法补三处**
-（默认值 `240` / round-trip 之后仍是写入的那个值 / 旧 JSON 里没有这个字段时回落
-`240`）—— 否则 Step 10 的 `git add` 里那个路径是个空动作，而这个新字段最容易在
-`fromJson` 上写漏（漏了就是"每次启动列表宽度都弹回默认"）。
+**同时在 `test/models/app_settings_test.dart` 里补三处**，否则 Step 10 的 `git add`
+里那个路径是个空动作，而这个新字段最容易在 `fromJson` 上写漏（漏了就是"每次启动
+列表宽度都弹回默认"）：
+
+```dart
+      expect(s.editorSplitRatio, 0.4);
+      expect(s.deviceListWidth, 240);            // 默认值那条用例里
+```
+
+```dart
+        editorSplitRatio: 0.6,
+        deviceListWidth: 320,                     // 往返用例的构造参数里
+```
+
+```dart
+      expect(restored.editorSplitRatio, 0.6);
+      expect(restored.deviceListWidth, 320);      // 往返用例的断言里
+```
+
+```dart
+      expect(restored.editorSplitRatio, defaults.editorSplitRatio);
+      expect(restored.deviceListWidth, defaults.deviceListWidth);   // 缺失回落那条
+```
+
 
 - [ ] **Step 7: 把主窗口接进 `app.dart`**
 
@@ -3626,6 +3791,18 @@ sessionProvider(那个 id) 会去列表 firstWhere 并抛。挡在一处，两�
 
 Ctrl+N 目前只给提示（设备编辑对话框属 5b-2）。快捷键接线是真的，落点是占位，
 这是知情留的。
+
+分隔条的落盘挂在 onDragEnd 而不是每次 onDragUpdate：一次 tester.drag 实测被 touch slop
+拆成 20 + 40 两段，每次都写盘就是两条原子写同时上路，而 writeFileAtomically 是先写
+同目录 .tmp 再 rename —— 先完成的那条把 .tmp 挪走，后到的那条红在 PathNotFoundException。
+拖动期间只动本地值（界面照旧实时跟手），松手落盘一次。顺带了掉未决项 10 与 11。
+
+_loadDraft 的续体回认设备：切到 B 之后 B 那次读还没回来、用户又切回 A 时，B 的续体会把
+A 的编辑区刷成 B 的草稿（实测表现为"切回来草稿是空的"）。didUpdateWidget 只管得住换设备
+那一刻，管不住换完之后回来的续体。
+
+两个 State 类公开之后 didUpdateWidget 的参数名要一起改：old 这个名字在类私有时不报，
+公开后报 avoid_renaming_method_parameters（info），而 info 会打掉"analyze 干净"这条验收。
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>
 EOF
@@ -4079,16 +4256,28 @@ EOF
    能在同一行多次发送时不乱），不是缺陷；真要修得给每次发送留一个内容指纹。
    Task 7 那条高亮用例**只验了"标记落在对的行上"**，没有验这个场景 —— 名字已
    按实测范围改准。
-10. **同一个画面里的多次拖拽会各自从同一个基准算起。** 分隔条的 `onDrag` 用的是
-    `build` 时捕获的 `settings`，而 `SettingsNotifier.update` 是"**写盘成功之后**
-    才改内存状态"（`providers.dart:100`）—— 所以一帧里到达的多个 pointer move
-    都从同一个旧值算起，**只有最后一个的 delta 生效**。真机上一次拖动多半是一
-    move 一帧，影响被摊薄；行为用例只断言"变大了"，验不到。真要修得在分隔条
-    内部累积（`onDragStart` 记基准），而不是每次重算。
-11. **拖动分隔条是"一次 pointer move 写一次 `settings.json`"** —— `update` 里没有
-    防抖，而 `SettingsStore.save` 每次都是原子写（临时文件 + rename）。拖两秒
-    可能写上百次盘。功能上没错（需求没规定频率），但值得在 5b-2 或以后加个短防抖。
-12. **`settleDisk` 的轮数是拍的**（12 轮 × 5ms 真实时间 + 16ms 假时间）。它够用是因为
+10. ~~**同一个画面里的多次拖拽会各自从同一个基准算起。**~~ **已在 Task 9 修掉。**
+    分隔条现在在 `MainWindow` 的本地状态里累积（`_draggingWidth` / `_draggingRatio`），
+    `onDrag` 以本地值为基准，所以一次拖动里到达的多个 pointer move 会**相加**而不是
+    各自从旧值重算 —— 实测 `tester.drag(Offset(0, 60))` 的两段（20 + 40）合起来正好
+    是 60px 对应的比例，而改之前只有 40 那段生效。
+11. ~~**拖动分隔条是"一次 pointer move 写一次 `settings.json`"。**~~ **已在 Task 9
+    修掉，而且原先那句"功能上没错"是错的。** 落盘现在挂在 `onDragEnd` 上，一次拖动
+    一次写。原判断错的理由：重叠的两次原子写**不是"多写几次盘"，而是会抛** ——
+    `writeFileAtomically` 写 `.tmp` 再 rename，先完成的那条把 `.tmp` 挪走，后到的
+    那条 rename 红在 `PathNotFoundException: ... (errno = 2)`，实测复现（见 Step 3
+    末尾）。另一条代价也真实存在：那条链里有 `chmod`（**一个进程**），60Hz 的拖动
+    就是每秒起 60 个。
+12. **重叠的原子写是一个**通用**隐患，Task 9 只堵住了拖动这一条路。**
+    `writeFileAtomically` 的两步（写 `.tmp` → rename）**不支持同一路径上的并发写**：
+    后到的那条 rename 会抛 `PathNotFoundException`（见未决项 11 的实测）。Task 9 把
+    拖动改成"松手写一次"，界面上唯一"高频写同一个文件"的路径就此没有了；但**别的路径
+    仍可能重叠** —— 例如在设备列表里连着删两台（两次 `DevicesNotifier.remove` →
+    两次 `_save` → 两条 `devices.json` 原子写）。真机上要两只手同时按才碰得上，所以
+    这一版没修。要修的话位置在 `json_file.dart`（给 `.tmp` 加唯一后缀 —— 不再互踩，
+    但"最后落盘的到底是谁"变成不确定的）或在 store 那一层串行化（推荐，顺序也一起
+    保住了）。
+13. **`settleDisk` 的轮数是拍的**（12 轮 × 5ms 真实时间 + 16ms 假时间）。它够用是因为
     `save()` 的 I/O 链就两三步；**哪天 `DeviceStore` 的写入步数变多，这个数字就可能
     不够**，表现是用例偶发红在"状态没变"—— 而那个现象看着像断言写错了（Task 8 第 2 条
     就是这么骗了一次）。真要收紧，正确做法不是把轮数继续加大，而是给 store 开一个
@@ -4196,3 +4385,31 @@ Ctrl+N 的 SnackBar，已在 Task 9 与未决项第 2 条两处写明。
 6. **`selectedDeviceProvider` 原本定义在 Task 9，却第一个被 Task 8 用到**：任务按顺序
    执行，照原计划 Task 8 连编译都过不去（`Undefined name 'selectedDeviceProvider'`）。
    已把那个块**整体挪到 Task 8 Step 4**，Task 9 的那一步改成只做核对（"本步不要再添加"）。
+
+**实现期在 Task 9 又抓到四处**，全部是**派发前**照计划的代码摆出来跑的时候红的
+（`flutter test test/ui/main_window_test.dart`）。改完实测：该用例文件 **6/6 绿**、
+全仓 `flutter test` = **507 条全绿**、`dart analyze lib/ test/` = `No issues found!`。
+改后的代码已作为 Step 3 / 5 / 6 的围栏逐字贴回本计划。
+
+1. **草稿用例的两处泵盘**：`pumpUi` 结尾的 `pumpAndSettle()` 走不完编辑区 `initState`
+   里那次真盘读（实测：`draftProvider('d1')` 仍是 `AsyncLoading`），于是 `_seeded`
+   一直是 false、`_onTextChanged` 早返回、防抖根本没武装 —— 表现是"敲进去的字一个
+   都没落盘"。已在 `pumpWindow` 结尾与 `enterText` 之后各补一次 `settleDisk`。
+   **这一条也是"假时钟里真盘 I/O 走不完"的第三种表现**（前两种是 Task 8 的删除与拖拽）：
+   前两种是**写**，这一种是**读**。
+2. **`_loadDraft` 的续体不回认设备**（真机缺陷）：切到 B 再立刻切回 A 时，B 那次读的
+   续体会把 A 的编辑区刷成 B 的草稿。实测的现象是"切回来草稿是空的"，而
+   `draftProvider('d1')` 那一刻已经是 `AsyncData('sys')` —— 证据在**编辑区的 text**
+   而不是在 provider 里，所以只看状态层永远查不出来。已在 Step 2 加了 `deviceId`
+   比对（真机上"手快"就能碰到，不是测试的毛病）。
+3. **分隔条的两种写法都会红，而且原因不同**：原先"每次 `onDrag` 都写盘"红在
+   `PathNotFoundException: Cannot rename file .../settings.json.tmp (errno = 2)`
+   —— 探针打印出一次 `tester.drag(Offset(0, 60))` 会发**两次** `onDrag`（touch slop
+   把它拆成 20 + 40），两条原子写同时上路，先完成的那条把 `.tmp` 挪走了。
+   **这不是"多写几次盘"，是会抛**，所以未决项 11 原先那句"功能上没错"是错的。
+   已改成"拖动期间只动本地值、`onDragEnd` 落盘一次"（`Splitter` 因此多了一个
+   `onDragEnd` 参数），顺带把未决项 10 的"多次 move 各自从旧值重算"一起了掉。
+4. **`didUpdateWidget(EditorPanel old)` 在类公开之后会报 info**：HEAD 上不报（类当时
+   是私有的），公开后 `dart analyze lib/ test/` 输出 1 条
+   `avoid_renaming_method_parameters`。info 会打掉"analyze 干净"这条验收，所以参数名
+   要一起改成 `oldWidget`（Step 2 第 3 处）。
