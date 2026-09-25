@@ -965,7 +965,7 @@ List<int> linesToSend(String text, TextSelection selection) {
 - [ ] **Step 4: 跑测试确认绿**
 
 Run: `flutter test test/ui/send_range_test.dart`
-Expected: 全绿（14 条）。
+Expected: 全绿（**17 条** —— Step 1 那个块里有 17 个 `test(`、5 个 `group(`；此处早先写的"14 条"是残留，实测修正）。
 
 - [ ] **Step 5: 提交**
 
