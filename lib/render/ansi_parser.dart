@@ -212,7 +212,7 @@ class AnsiSpan {
 /// 另有一个**两边共有**的缺陷：`ESC ( B`（选择字符集，三字节）都不被剥离 ——
 /// 它不属于两字节规则覆盖的范围。修它要动已冻结的 `ansi.dart`，本计划不改
 /// （见计划末尾「本计划发现的既有问题」）。
-List<AnsiSpan> parseAnsi(String input, {AnsiStyle initial = AnsiStyle.none}) {
+AnsiParseResult parseAnsiChunk(String input, {AnsiStyle initial = AnsiStyle.none}) {
   final spans = <AnsiSpan>[];
   final buffer = StringBuffer();
   var style = initial;
@@ -296,7 +296,84 @@ List<AnsiSpan> parseAnsi(String input, {AnsiStyle initial = AnsiStyle.none}) {
 
   flush();
   emitRun();
-  return spans;
+  return AnsiParseResult(spans, style);
+}
+
+/// [parseAnsiChunk] 的结果，多带一个**块末样式**。
+///
+/// 流式调用方（输出缓冲）必须把 [finalStyle] 接给下一块，否则 `'\x1b[32m'`
+/// 与紧随其后的文本分属两块时颜色会丢。
+class AnsiParseResult {
+  const AnsiParseResult(this.spans, this.finalStyle);
+
+  final List<AnsiSpan> spans;
+
+  /// 输入走完时的当前样式。
+  ///
+  /// **它与 `spans.last.style` 不是一回事**：输入以 `'\x1b[32m'` 结尾时
+  /// `spans` 是空的，而样式已经是绿的。照 `spans.last` 取会丢掉末尾那次换色。
+  final AnsiStyle finalStyle;
+}
+
+/// 剥离控制符之外什么都不做，返回样式片段。
+///
+/// 等同于 `parseAnsiChunk(input, initial: initial).spans` —— 保留这个名字是因为
+/// 一次性调用的地方（日志、测试）读起来更直接，且它保证了 [stripToPlainText]
+/// 与 `parseAnsi` 走的是同一条实现路径。
+List<AnsiSpan> parseAnsi(String input, {AnsiStyle initial = AnsiStyle.none}) =>
+    parseAnsiChunk(input, initial: initial).spans;
+
+/// 一条不完整的控制序列最多可能有多长。
+///
+/// 超过它就不再往回找：一段永远等不到后半截的畸形字节不该把输出区**永久**卡住。
+/// 64 远大于现实里任何一条序列（CSI 参数很少超过 20 字符）。
+const int kMaxAnsiHoldBack = 64;
+
+/// [input] 的末尾有多少个字符必须**留在缓冲里**等下一块 —— 因为从某个 `\x1b`
+/// 开始的控制序列可能还没收完。
+///
+/// 存在的理由只有一个，见 [parseAnsiChunk] 上面那段前提：解析**每次调用独立**，
+/// 把 `'\x1b['` 与 `'31mred'` 分两次喂，前半个序列会退化成字面文本。输出区要
+/// 正确渲染就得留住它，而日志要与输出区一致就得从**同一处缓冲**取文本 —— 所以
+/// 这个判断属于"两边共用的那处缓冲"，不属于渲染。
+///
+/// **只看最后一个 `\x1b`。** 控制序列之间不会嵌套（OSC 的 ST 终止符 `ESC \`
+/// 自己就是一条完整的两字节序列），所以更早的 ESC 若已经收完，就不可能被末尾的
+/// 半条影响。
+///
+/// **返回 0 是常态**：输入里没有控制序列，或末尾那条已经完整。
+int ansiHoldBackLength(String input) {
+  final lowerBound = input.length - kMaxAnsiHoldBack;
+  for (var i = input.length - 1; i >= 0 && i >= lowerBound; i--) {
+    if (input.codeUnitAt(i) != 0x1b) continue;
+    return _isCompleteSequenceAt(input, i) ? 0 : input.length - i;
+  }
+  return 0;
+}
+
+/// 从 [i] 处的 `\x1b` 起是不是一条**已经完整**的序列（或是一个解析器会当作
+/// 普通字符留下的裸 ESC —— 那种也算"完整"，因为它不会因为后续输入而改变含义）。
+bool _isCompleteSequenceAt(String input, int i) {
+  final next = i + 1;
+  if (next >= input.length) {
+    // 末尾裸露的 ESC：解析器**可能**把它当普通字符留下，但下一块一来就可能
+    // 变成序列的开头。留。
+    return false;
+  }
+  if (input.codeUnitAt(next) == 0x5b /* [ */) {
+    return _matchCsi(input, i) != null;
+  }
+  if (input.codeUnitAt(next) == 0x5d /* ] */) {
+    return _matchOsc(input, i) != null;
+  }
+  // 走到这里说明下一个字符既不是 `[` 也不是 `]`。解析器在 ESC 处的判定**只**取决于
+  // 下一个字符（优先级顺序：CSI、OSC、两字节、最后才把 ESC 当普通字符），所以此刻
+  // **已经定死**，后续输入改不了它 —— 于是"完整"。
+  //
+  // 原先这里问的是 `_isTwoByteFinal(...)`，那是错的：`\x1b(` 后面跟普通字符时它判
+  // "不完整"，于是把已经定死的字面文本一直扣在缓冲里 —— 设备此后不再发数据的话，
+  // 那段文本要等缓冲涨过 kMaxAnsiHoldBack 才放行，在此之前**不显示**。
+  return true;
 }
 
 /// 剥离控制符，只留文本。**日志用它，输出区用 [parseAnsi]** —— 两条路径共用
