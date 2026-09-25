@@ -1369,7 +1369,7 @@ void main() {
 Run: `flutter test test/ui/auto_scroll_test.dart`
 Expected: **编译失败**（`Target of URI doesn't exist: .../auto_scroll.dart`）。
 
-**那段红里还会夹一条与本步无关的编译错误**：`ui_harness.dart` 用到 `Override` 而 Step 5 的 import 块（在本步之后才写）少一行 —— 见 Step 5 的说明，那一行已经补上了。两条一起出现时按两条看，别把它当成 `AutoScroll` 的错。
+**这一步的红是干净的**：`test/ui/auto_scroll_test.dart` 只 import 三处（`material` / `flutter_test` / `auto_scroll.dart`），**没有** `import 'ui_harness.dart';`。Dart 的 import 不传递、编译单元也不共享，所以共享夹具里的问题**不会**夹进这条红里 —— 夹具第一次被编进来是 Step 6（`output_panel_test.dart` 才 import 它），而它的 import 块到 Step 5 才写（`misc.dart` 那一行是承重的，理由见 Step 5）。
 
 **`builder: (_, n, _)` 里两个下划线不是笔误**：Dart 3.7+ 的 `_` 是**非绑定通配符**，可以重复；写成 `__` 会被 `flutter_lints` 的 `unnecessary_underscores` 记一条 info，而"`dart analyze lib/ test/` 干净"是验收项。
 
@@ -2022,9 +2022,7 @@ Expected: 4 条全绿。
 import 'dart:io';
 
 import 'package:flutter/material.dart';
-import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:win_cli_tool/state/providers.dart';
 import 'package:win_cli_tool/ui/panels/editor_panel.dart';
 import 'package:win_cli_tool/ui/widgets/sent_line_controller.dart';
 
@@ -2053,6 +2051,26 @@ void main() {
     child: const SizedBox(height: 400, child: EditorPanel(deviceId: 'd1')),
   );
 
+  /// 让命令队列往前走 [count] 步：每步吐一个提示符，再推过 `promptDebounce`
+  /// （生产默认 120ms，见 `CommandDispatcher` 的构造默认值；这里给 300ms 留余量）。
+  ///
+  /// **`FakeSession` 不会自己回提示符** —— 它的 `output` 是空的广播流，只有
+  /// `emit` 才吐数据。而队列是**一条一条发的**：第一条出去之后要等提示符才轮到
+  /// 第二条。少了这一步，队列就停在第一条，那条 10 秒超时定时器会一直挂着，
+  /// 用例在拆卸期红在 `A Timer is still pending even after the widget tree was
+  /// disposed`，**而 `written` / `sentLines` 的断言其实已经过了** —— 别被那个
+  /// 假象骗了，以为断言写错了。（Task 9 里推队列用的也是这个手法。）
+  Future<void> drainQueue(
+    WidgetTester tester,
+    FakeSessionFactory factory,
+    int count,
+  ) async {
+    for (var i = 0; i < count; i++) {
+      factory.sessions.single.emit('Switch# ');
+      await tester.pump(const Duration(milliseconds: 300));
+    }
+  }
+
   testWidgets('发送选中范围覆盖到的行（§9.2 第 1 条）', (tester) async {
     final factory = FakeSessionFactory();
     await pumpEditor(tester, factory: factory);
@@ -2069,7 +2087,9 @@ void main() {
     await tester.pump();
 
     await tester.tap(find.byTooltip('发送'));
-    await tester.pumpAndSettle();
+    await tester.pump();
+    // 队列里就这一条，吐一个提示符它就结束了。
+    await drainQueue(tester, factory, 1);
 
     expect(
       factory.sessions.single.written.map((w) => w.trim()),
@@ -2101,15 +2121,21 @@ void main() {
 
     await tester.enterText(find.byType(TextField), 'a\nb\nc');
     await tester.pump();
+    // **`enterText` 会把光标收到文本末尾**（`TextSelection.collapsed(offset: 5)`），
+    // 而"没有选中就只发光标那一行" —— 那样队列里只有 `c` 一条，"队列执行中"
+    // 就名不副实了。全选，让三条都进队列。
+    final editor = tester.widget<TextField>(find.byType(TextField)).controller!;
+    editor.selection = const TextSelection(baseOffset: 0, extentOffset: 5);
+    await tester.pump();
     await tester.tap(find.byTooltip('发送'));
     await tester.pump();
 
-    expect(find.textContaining('执行中'), findsOneWidget,
-        reason: 'FR-E-14：队列执行中要有 执行中 n/m');
+    expect(find.text('执行中 1/3'), findsOneWidget,
+        reason: 'FR-E-14：队列执行中要有 执行中 n/m，且 m 是队列长度');
     expect(find.byTooltip('中止'), findsOneWidget);
 
-    // 让队列自己跑完（FakeSession 的提示符是同步回的）。
-    await tester.pumpAndSettle();
+    // 三条命令，三个提示符，队列跑完。
+    await drainQueue(tester, factory, 3);
     expect(find.byTooltip('发送'), findsOneWidget, reason: '队列空了应当能再发');
   });
 
@@ -2133,8 +2159,13 @@ void main() {
 
     await tester.enterText(find.byType(TextField), 'a\nb');
     await tester.pump();
+    // 同上：不给选中就只发光标那一行，而本用例要的是两行都被标出来。
+    final editor = tester.widget<TextField>(find.byType(TextField)).controller!;
+    editor.selection = const TextSelection(baseOffset: 0, extentOffset: 3);
+    await tester.pump();
     await tester.tap(find.byTooltip('发送'));
-    await tester.pumpAndSettle();
+    await tester.pump();
+    await drainQueue(tester, factory, 2);
 
     final controller =
         tester.widget<TextField>(find.byType(TextField)).controller!
@@ -2165,6 +2196,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../command/command_dispatcher.dart';
+// **`DeviceConnectionState` 只能从这里来。** 它在 `connection_manager.dart` 里
+// 定义，而 Dart 的 import **不传递** —— `providers.dart` 虽然 import 了它，
+// 却不会把它再导出给本文件。
+import '../../connection/connection_manager.dart';
 import '../../data/draft_store.dart';
 import '../../state/providers.dart';
 import '../draft_autosave.dart';
@@ -2441,6 +2476,8 @@ class _EditorPanelState extends ConsumerState<EditorPanel> {
       ),
     );
   }
+}
+
 ```
 
 **为什么"未连接时发送不可用"**：`SessionController.enqueue` 在未连接时**什么都不做**（`_manager.dispatcher?.enqueue`），所以按钮可点而命令掉进空处是最糟的一种"看起来能用"。禁用 + tooltip 说明才是诚实的。
@@ -3864,3 +3901,32 @@ Ctrl+N 的 SnackBar，已在 Task 9 与未决项第 2 条两处写明。
 的事，见 `lib/ui/widgets/refresh_throttle.dart`"，而那个文件在 Task 2 才建。**先有
 注释后有文件是有意的** —— Task 1 必须先跑完（`OutputBuffer` 得先会通知），Task 2
 才有东西可节流。Task 1 单独提交时那个引用暂时指不到东西，Task 2 提交后成立。
+
+**实现期在 Task 7 抓到四处誊抄错 + 两处 `unused_import`，已就地改掉**
+（改完实测 `flutter test test/ui/editor_panel_test.dart` = 5/5 绿，
+`test/ui/sent_line_controller_test.dart` = 4/4 绿，
+`dart analyze` 这四个文件 = `No issues found!`）：
+
+1. **Step 7 的三段片段拼起来少一个类收尾 `}`**（`{` 32 个、`}` 31 个）——
+   照抄会红在 `Can't find '}' to match '{'`。已补。
+2. **Step 7 的 import 块没有 `DeviceConnectionState` 的来源**：它定义在
+   `lib/connection/connection_manager.dart:20`，而 **Dart 的 import 不传递**，
+   `providers.dart` 虽然 import 了它却不会转手导出。已补
+   `import '../../connection/connection_manager.dart';`。
+3. **Step 5 原先那句"`FakeSession` 的提示符是同步回的"是错的**：它**没有**提示符
+   行为（`output` 是空的广播流，只有 `emit` 才吐数据），而队列是**一条一条发的** ——
+   不吐提示符就停在第一条，那条 10 秒超时定时器一直挂着，用例在**拆卸期**红在
+   `A Timer is still pending even after the widget tree was disposed`，
+   而 `written` / `sentLines` 的断言**其实已经过了**。这是个会把人引向"断言写错了"
+   的假象。已改成 `drainQueue()`（`emit('Switch# ')` + `pump(300ms)`，越过
+   `CommandDispatcher` 默认的 120ms `promptDebounce`），三处各按队列长度推 1 / 3 / 2 步。
+   **Task 9 的 Esc 用例本来就是这么推队列的**，Task 7 当时没跟上。
+4. **第 5 条用例断言 `sentLines == {0, 1}` 却没设选中**：`tester.enterText` 会把光标
+   收到文本末尾（`TextSelection.collapsed(offset: 2)` = 第 2 行），而"没有选中就只发
+   光标那一行" → 只发出 1 条，`Actual: Set:[1]`。已按第 1 条的写法显式设
+   `TextSelection(baseOffset: 0, extentOffset: 3)`；第 3 条同样需要（它的名字叫
+   "队列执行中"，只发一条就名不副实），顺手把断言从 `textContaining('执行中')`
+   收紧成 `find.text('执行中 1/3')`。
+5. **Step 5 的 import 块里两处 `unused_import`**（`flutter_riverpod` 与
+   `state/providers.dart`：两者都由 `ui_harness.dart` 代劳）已删 —— 它们会让
+   "`dart analyze lib/ test/` 干净"这条验收项挂掉。
