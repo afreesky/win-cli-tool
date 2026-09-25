@@ -674,7 +674,16 @@ TextSpan ansiLinesToTextSpan(List<List<AnsiSpan>> lines) {
       children.add(ansiSpanOf(span));
     }
   }
-  if (children.isEmpty) return const TextSpan();
+  // **总是返回带 `children` 的节点，空的时候也不返回 `const TextSpan()`。**
+  //
+  // `TextSpan.children` 的类型是 `List<InlineSpan>?`，构造器直接存参、不做
+  // "空表归一成 null" 的转换 —— 所以 `const TextSpan().children` 是 **null**，
+  // 而不是空表。于是"空输入给得出一个空的 children"那条断言会在 `isEmpty` 上
+  // 抛 `NoSuchMethodError`（该匹配器直接对值调 `.isEmpty`，不接受 null）。
+  //
+  // 两种写法渲染结果没有区别，但只有这一种能让那条断言成立。这不是迁就断言：
+  // 那条断言要钉的是"空输入不吐出任何子节点"，而 `const TextSpan()` 恰好让它
+  // 退化成一个匹配器内部的空指针错误 —— 断言表达不出它要说的话。
   return TextSpan(children: children);
 }
 ```
@@ -684,7 +693,9 @@ TextSpan ansiLinesToTextSpan(List<List<AnsiSpan>> lines) {
 Run: `flutter test test/ui/ansi_text_test.dart`
 Expected: 全绿。
 
-**注意"空缓冲"那条**：`ansiLinesToTextSpan([<AnsiSpan>[]])` 的输入长度是 1（`OutputBuffer` 的 `_lines` 永远至少有一项），循环进去 0 个片段、也不加 `\n`，所以 `children` 是空的——断言 `root.children` 为空成立。若实现里把"空 children"改成"给个空串"，那条会红，**不要改断言去迁就**。
+**注意"空缓冲"那条**：`ansiLinesToTextSpan([<AnsiSpan>[]])` 的输入长度是 1（`OutputBuffer` 的 `_lines` 永远至少有一项），循环进去 0 个片段、也不加 `\n`，所以 `children` 是空的 —— 断言 `root.children` 为空成立。
+
+**它成立的前提是 Step 3 里那句"总是 `return TextSpan(children: children)`"。** 计划的前一版在这里写的是 `if (children.isEmpty) return const TextSpan();`，那条断言对它**恒红**：`const TextSpan().children` 是 `null`（不是空表），`isEmpty` 会在 `null` 上抛 `NoSuchMethodError`。实测过，没有例外 —— **不存在**能让 `TextSpan.children` 在空输入时成为非 null 空表、同时又走 `const TextSpan()` 分支的写法。所以错在实现，不在断言。若实现里把"空 children"改成"给个空串"，那条会红，**那时才**是断言该讨论的时候，不要默认去改它。
 
 **这一节里没有 16 色表、没有立方公式、没有灰阶公式，这是对的。** 如果你觉得"总得有个地方把 `AnsiColor` 变成 `Color`"，那就是 `ansiColorOf` 那个三行函数，而值来自 `AnsiColor.rgb`。计划的前一版在这里放了一份复制的表和一套重写的公式，被推翻了 —— 理由与修正见上面的说明。
 
