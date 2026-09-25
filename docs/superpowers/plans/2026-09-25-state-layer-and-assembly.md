@@ -2420,6 +2420,13 @@ class SessionController {
   /// 当前会话的日志。**一次会话一个实例**，会话结束调 `end()`。
   LogWriter? _log;
 
+  /// [dispose] 一开始就同步置位，此后**一个事件都不再处理**。
+  ///
+  /// 它不是"纵深防御"，是 [dispose] 那个条件成立的原因：`ConnectionManager.events`
+  /// 是广播流，`connect()` 返回时事件可能还排在队列里，而 `dispose()` 里任何一次
+  /// `await` 都会把控制权让出去，让那个事件落到一个正在被拆掉的 controller 上。
+  var _disposed = false;
+
   var _status = const SessionStatus();
 
   /// 状态变化时回调（界面订阅它重绘）。
@@ -2451,9 +2458,30 @@ class SessionController {
   }
 
   /// 应用退出时调用（FR-C-12）。**不向设备发送任何命令。**
+  ///
+  /// **第一件事是"此后不再处理任何事件"，而且必须在任何 `await` 之前。**
+  ///
+  /// 本方法经 `ref.onDispose(_controller.dispose)` 注册，Riverpod **不 await
+  /// 它**（`onDispose` 收的是 `void Function()`，这里给的是 async 函数，返回的
+  /// Future 被丢掉）；而 `ConnectionManager.events` 是**广播流**，`connect()`
+  /// 返回时 `SessionReady` / `ConnectionStateChanged` 可能**还排在队列里**。
+  /// 所以这里但凡先 `await` 一次（哪怕只是 `await null`），那个已排队的事件就会
+  /// 被投递进来，`_onSessionReady` 于是**在销毁过程中**重新订阅 dispatcher 并
+  /// `_startLog()` —— 建出一个此后再也取消不掉的订阅，还为一个正在被拆掉的会话
+  /// 开一个日志文件。
+  ///
+  /// 这不是推理出来的：Task 10 的退出用例（`connect()` 之后立刻 dispose）实跑
+  /// 连红 4 次，栈就是 `_onEvent → _onSessionReady → _setStatus`，抛在
+  /// `state = status` 上（`Cannot use the Ref ... after it has been disposed`）。
+  /// 计划原先给的对策（dispose 之后多等一轮 `Duration.zero`）**治的是另一头**，
+  /// 实测照样红 —— 事件早就在队列里了，多等一轮只是给它机会真的炸出来。
+  ///
+  /// [_disposed] 那个标志是这条件成立的原因，`cancel()` 是顺带清理；两者都要，
+  /// 因为标志不依赖 `cancel()` 的投递语义。
   Future<void> dispose() async {
-    await _dispatchSub?.cancel();
+    _disposed = true;
     await _eventsSub.cancel();
+    await _dispatchSub?.cancel();
     await _outputSub.cancel();
     // 残留的半条序列放出来，否则它永远留在缓冲里 —— 而输出区此后不再有新数据
     // 来把它补齐。
@@ -2463,6 +2491,8 @@ class SessionController {
   }
 
   void _onEvent(ConnectionEvent event) {
+    if (_disposed) return;
+
     // `ConnectionEvent` 是 `sealed`：将来新增一种会成为**编译错误**，
     // 而不是某个分支悄悄不处理。
     switch (event) {
@@ -2504,6 +2534,8 @@ class SessionController {
   }
 
   void _onDispatchEvent(DispatchEvent event) {
+    // 与 [_onEvent] 同一个理由：dispatcher 的广播流也可能有已排队的事件。
+    if (_disposed) return;
     if (event is QueueDropped) {
       _setStatus(_status.copyWith(droppedCommands: event.count));
       _markWarn('--- 连接断开，${event.count} 条未发送的命令已丢弃 ---');
@@ -3841,9 +3873,27 @@ Future<String> _readAllLogs(Directory root) async {
 - [ ] **Step 2: 跑用例**
 
 Run: `flutter test test/state/assembly_e2e_test.dart`
-Expected: 4 条全绿。**如果红**，多半是两处时序：`container.dispose()` 之后
-`ref.onDispose` 里的 `_controller.dispose()` 是异步的（多 `await` 一轮
-`Duration.zero`）；或 A 的重连退避第一档正好 1s，`Future.delayed(2s)` 要留够。
+Expected: 4 条全绿。
+
+**第 4 条（本条）曾经是红的，而且不是时序问题 —— 记在这里免得 5b 再把同一个坑
+踩一遍。** 第一次跑连红 4 次，栈是
+`_onEvent → _onSessionReady → _setStatus`，抛在 `providers.dart` 的
+`state = status` 上：`Cannot use the Ref of NotifierProvider<SessionNotifier,
+SessionStatus> after it has been disposed`。原因与修法见 `SessionController.dispose()`
+的文档 —— 一句话是"`ConnectionManager.events` 是广播流，`connect()` 返回时事件
+可能还排在队列里，而 `dispose()` 里第一次 `await` 就会让路给它"。
+
+**当时试过、并且确实不管用的对策**（写在这里是因为它看起来很合理）：在
+`container.dispose()` 之后多 `await` 一轮 `Duration.zero`。**不要再试它** ——
+事件早在队列里，多等一轮只是给它机会真的炸出来。
+
+同一条还有两个连带后果，只在 `_onEvent` 上设标志才治得住，值得记：那条迟到的
+`SessionReady` 会跑完 `_onSessionReady`，于是一来**重新订阅** dispatcher（那次
+`cancel()` 早已执行过，这条订阅此后再也没人取消 —— 泄漏），二来 `_startLog()`
+为**一个正在被拆掉的会话**建出 `LogWriter`、开日志文件。
+
+另一处真时序（与上面无关，仍要留够）：A 的重连退避第一档正好 1s，
+`Future.delayed(2s)` 必须留够。
 
 - [ ] **Step 3: 全仓跑一遍 + 分析器**
 
@@ -3901,6 +3951,10 @@ EOF
 12. **断开时那句告警的措辞与它报的数字对不上。** `CommandDispatcher.onDisconnected()` 算的是 `_queue.length + (_current != null ? 1 : 0)` —— **在途的那条命令计入**丢弃数，而它自己的注释解释了为什么（"它的输出已经永远收不到了，用户需要知道这条命令的结果是未知的"；`abort()` 则**不**计入，那里语义不同）。但 `SessionController` 把同一批数字写成 `'--- 连接断开，$count 条**未发送**的命令已丢弃 ---'`（`lib/state/session_controller.dart:210`）：那条**已经发出去了**的命令被算进"未发送"里。用户读到的与刚发生的事不符，而且恰好错在这条消息存在的理由上。
 
     **本计划不改** —— 改的是给用户看的文案，属于 5b 的输出区。5b 定文案时要覆盖两种情形（在途命令的结果未知 vs 纯粹没发出去），或者让 `QueueDropped` 分开报这两个数。`Task 10` 的用例只断言 `contains('丢弃')`，改措辞不会碰它。
+
+13. **退出时一个正在落盘的 `LogWriter` 仍可能把异常打进已销毁的 provider。** `SessionNotifier.build()` 的 `onLogError` 是 `ref.read(issuesProvider.notifier).add(...)`（`lib/state/providers.dart:274-276`），而 `dispose()` 走的是 `_endLogSync()` ⇒ `unawaited(log?.end())`：那次 `end()` 的强制 `_flush` 可能落在 `container.dispose()` **之后**，此时 `issuesProvider` 已销毁，`ref.read` 抛 `StateError`。窗口很窄（要求退出那一刻正好有一次写盘失败），而且**没有实测过** —— 所以本计划**不加**"没实测过的防御代码"，只记在这里。
+
+    **5b 顺手可以一起收的两件事**：给 `onLogError` 加 `ref.mounted` 判断（`riverpod-3.4.3/lib/src/core/ref.dart:112` 有 `bool get mounted`），以及把 `SessionController.dispose()` 的 `_endLogSync` 换成"await 但设上限"的写法 —— 后者会影响退出耗时，需要和界面一起定。
 
 ## 后续计划
 
