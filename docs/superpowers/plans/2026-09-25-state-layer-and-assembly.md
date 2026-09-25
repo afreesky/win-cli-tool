@@ -3430,15 +3430,25 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    // 首帧之后的那次扫描是 `unawaited(...)`，provider 的建立又在几个 await
-    // 之后 —— 有界地等它落定，而不是赌一次 `pumpAndSettle` 正好够。
+    // **下面两轮 pump 实测都是空转 —— 留着是保险，不是判别力来源。**
+    //
+    // 实测（探针打印计数，跑完即删）：`pumpAndSettle()` 之后扫描就已经落定，
+    // 第一个循环**一次都没进**（它的守卫 `factory.sessions.isEmpty` 首次求值时
+    // 就已经是 false），第二个 8×25ms 的循环跑满也不改变任何东西
+    // （`sessions=1 ids=[auto]`）。原因是结构性的：`connectAutoConnectDevices`
+    // 是一个普通同步 `for` 循环，`ref.read(sessionProvider(id).notifier)` 同步
+    // 建出 notifier，而 `ConnectionManager._attemptConnect` 在**任何真异步 IO
+    // 之前**就同步走到 `factory.create(profile)` —— 所以"本该被过滤掉的那台"
+    // 若真会被连，也是在**同一波微任务**里被连，就在 `pumpAndSettle` 里面。
+    //
+    // 那它们为什么还在？因为一旦连接路径在 `create` 之前多出一个真的 `await`
+    // （5b 的指纹确认对话框就是一个），这两轮就从空转变成承重。**但别据此以为
+    // 下面那条断言靠它们**：断言真正靠的是"该连的和不该连的各一台"。实测把
+    // `session_controller.dart:278` 的 `if (!device.autoConnect) continue;` 删掉，
+    // 它红在 `hasLength(1)`，而不是红在这两个循环上。
     for (var i = 0; i < 40 && factory.sessions.isEmpty; i++) {
       await tester.pump(const Duration(milliseconds: 25));
     }
-    // **这一轮是承重的。** 上面的循环一看到有会话就停，所以"只有一台"此时
-    // 还可能只是"第二台还没轮到"。再给一段固定时间，让**本该被过滤掉**的那台
-    // 有机会连上：它要真连了，下面那条 `hasLength(1)` 立刻红。没有这一轮，
-    // 那条断言测的是调度顺序，不是过滤器。
     for (var i = 0; i < 8; i++) {
       await tester.pump(const Duration(milliseconds: 25));
     }
@@ -3887,6 +3897,10 @@ EOF
     **这一条是读代码得出的，没有实测**（Task 8 的实现者报的，他无法在不改已提交测试文件的前提下做探针）。我核对了 `lib/state/providers.dart:146-161` 与 `SessionNotifier.build()`，机制成立。
 
     **本计划有意不改**，因为"改档案该不该断开正在跑的会话"是个交互决定，不是机械修复：直接加 `invalidate` 会让用户改个名字就断线（`update` 也用于改名），而那样比现状更烦人。5b 需要决定的是：改**连接参数**时提示并断开、改**纯展示字段**（名字）时不动会话 —— 那要么拆成两个方法，要么在 `update` 里比较连接相关字段。**留给 5b，与界面一起定。**
+
+12. **断开时那句告警的措辞与它报的数字对不上。** `CommandDispatcher.onDisconnected()` 算的是 `_queue.length + (_current != null ? 1 : 0)` —— **在途的那条命令计入**丢弃数，而它自己的注释解释了为什么（"它的输出已经永远收不到了，用户需要知道这条命令的结果是未知的"；`abort()` 则**不**计入，那里语义不同）。但 `SessionController` 把同一批数字写成 `'--- 连接断开，$count 条**未发送**的命令已丢弃 ---'`（`lib/state/session_controller.dart:210`）：那条**已经发出去了**的命令被算进"未发送"里。用户读到的与刚发生的事不符，而且恰好错在这条消息存在的理由上。
+
+    **本计划不改** —— 改的是给用户看的文案，属于 5b 的输出区。5b 定文案时要覆盖两种情形（在途命令的结果未知 vs 纯粹没发出去），或者让 `QueueDropped` 分开报这两个数。`Task 10` 的用例只断言 `contains('丢弃')`，改措辞不会碰它。
 
 ## 后续计划
 
