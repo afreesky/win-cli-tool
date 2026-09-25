@@ -43,6 +43,12 @@ dependencies:
   # 断线时长。用 DateTime.now() 的话，测试里 fakeAsync.elapse() 推进的是
   # 假时钟，而 DateTime.now() 是真实时间，断线时长恒为 0，无法断言。
   clock: ^1.1.1
+  # 状态层（spec §8.5 点名 3.4.3）：按设备维度用 family provider 隔离会话、
+  # 草稿、输出。
+  flutter_riverpod: ^3.4.3
+  # 应用数据目录（NFR-P-04）：Windows 在 %APPDATA% 下，Linux 在
+  # $XDG_DATA_HOME（默认 ~/.local/share）下的应用子目录。
+  path_provider: ^2.1.6
 
 dev_dependencies:
   flutter_test:
