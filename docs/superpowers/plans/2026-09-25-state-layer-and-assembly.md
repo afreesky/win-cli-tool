@@ -1024,8 +1024,12 @@ void main() {
       expect(ansiHoldBackLength('\x1b]0;t\x1b\\'), 0);
     });
 
-    test('两字节序列完整时不留尾巴', () {
+    test('ESC 后跟的不是 [ 或 ] 时，判定已经做出，不留尾巴', () {
+      // `\x1b(B`（选择字符集）解析器刻意不剥离（既有用例钉着），但它也**不会**
+      // 因为后续输入而改判 —— ESC 处的判定只取决于下一个字符。
       expect(ansiHoldBackLength('a\x1b(B'), 0);
+      // 真正的两字节序列（ESC + `@`-`Z` / `\]^_`）同理：已经完整。
+      expect(ansiHoldBackLength('a\x1bM'), 0);
     });
 
     test('半条序列比 kMaxAnsiHoldBack 还长时不再留（免得永久卡住）', () {
@@ -1070,10 +1074,19 @@ void main() {
         twoShot.map((s) => s.text).join(),
         oneShot.map((s) => s.text).join(),
       );
-      expect(
-        twoShot.map((s) => s.style).toList(),
-        oneShot.map((s) => s.style).toList(),
-      );
+      // **按字符比样式，不按片段比。** 块边界落在同一段同样式文本中间时（这里
+      // green 被切成 'gre' + 'en'），两次调用各自在块末 `flush()`，所以片段边界
+      // 必然不同 —— `AnsiParseResult` 只带 spans + finalStyle，没有跨调用状态能把
+      // 它们并回一段，这是设计如此（渲染上相邻同色片段本来就等价）。承重的不变量
+      // 是"每个字符的样式一致"，不是"片段切法一致"。
+      //
+      // **原先这里比的是 `twoShot.map((s) => s.style).toList()`，那条断言无解**：
+      // 实测一次性喂是 3 段 `[none, green, none]`，分两块喂是 4 段
+      // `[none, green, green, none]` —— 长度都不等。Task 4 的实现者照做跑红之后
+      // 停下来报告，没有把断言改软。
+      List<AnsiStyle> perChar(Iterable<AnsiSpan> spans) =>
+          [for (final s in spans) ...List.filled(s.text.length, s.style)];
+      expect(perChar(twoShot), perChar(oneShot));
     });
 
     test('parseAnsi 就是 parseAnsiChunk 的片段那一半', () {
@@ -1174,13 +1187,17 @@ int ansiHoldBackLength(String input) {
   return 0;
 }
 
-/// 从 [i] 处的 `\x1b` 起是不是一条**已经完整**的序列（或是一个解析器会当作
-/// 普通字符留下的裸 ESC —— 那种也算"完整"，因为它不会因为后续输入而改变含义）。
+/// 从 [i] 处的 `\x1b` 起，后续输入**还能不能**改变它的含义 —— 不能就是"已经完整"。
+///
+/// 判据直接照抄 `parseAnsiChunk` 的优先级顺序（`:265-294`）：ESC 处的判定**只**
+/// 取决于下一个字符。所以三种情况：下一个字符是 `[` / `]` 时序列可能还没收完
+/// （要 `_matchCsi` / `_matchOsc` 说有才算完）；其余情况**此刻已经定死**，
+/// 后续输入改不了它 —— 包括"ESC 被当普通字符留下"这种结局。
 bool _isCompleteSequenceAt(String input, int i) {
   final next = i + 1;
   if (next >= input.length) {
-    // 末尾裸露的 ESC：解析器**可能**把它当普通字符留下，但下一块一来就可能
-    // 变成序列的开头。留。
+    // 末尾裸露的 ESC：解析器**确实**会把它当普通字符留下，但下一块一来它就可能
+    // 变成序列的开头 —— 含义**还能**变，所以是"不完整"。留 1 个字符。
     return false;
   }
   if (input.codeUnitAt(next) == 0x5b /* [ */) {
@@ -1189,7 +1206,14 @@ bool _isCompleteSequenceAt(String input, int i) {
   if (input.codeUnitAt(next) == 0x5d /* ] */) {
     return _matchOsc(input, i) != null;
   }
-  return _isTwoByteFinal(input.codeUnitAt(next));
+  // 走到这里说明下一个字符既不是 `[` 也不是 `]`。判定已经定死，于是"完整"。
+  //
+  // **这里原先写的是 `return _isTwoByteFinal(...)`，那是错的**（Task 4 的实现者
+  // 先按原文照做、跑出 `'a\x1b(B'` 得 3 而不是 0，然后停下来报告，没有擅自改）：
+  // `\x1b(` 后面跟普通字符时它判"不完整"，于是把**已经定死的字面文本**一直扣在
+  // 缓冲里 —— 设备此后不再发数据的话，那段文本要等缓冲涨过 kMaxAnsiHoldBack 才
+  // 放行，在此之前**不显示**。这不是期望写错，是实现写错。
+  return true;
 }
 ```
 
