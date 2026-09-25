@@ -98,8 +98,8 @@ void main() {
     // 读出来当基准"，那条断言**永远不会红**：`writeJsonObject` 是确定性的，把没变过
     // 的 map 重写一遍得到逐字节相同的文件（实测过 —— 把空操作改成无条件 `_persist`，
     // 用例照样绿，只有 ctime 变了）。手写一段带 `note` 的 JSON 塞进去就不一样了：
-    // 此时 `s` 的缓存里已经有记录，一旦它重写，写出来的是缓存（规范形态），
-    // 绝不会是这段手写文本。
+    // `s` 已经 load 过这个文件，而且它**每次操作都重读盘** —— 一旦它重写，
+    // 写出来的一定是它解析后的规范形态，绝不会是这段手写文本。
     const handWritten = '{"schemaVersion": 1, "hosts": [], "note": "手写"}';
     await file.writeAsString(handWritten);
     await s.remove('10.0.0.9', 22, 'ssh-ed25519');
@@ -107,12 +107,13 @@ void main() {
         reason: '空操作不该重写文件 —— 无谓的写盘会放大"写失败"的窗口');
   });
 
-  test('写盘失败时，本实例不留下"文件里没有"的记录（缓存不领先于文件）', () async {
+  test('写盘失败时，本实例不留下"文件里没有"的记录', () async {
     // 父路径是一个**普通文件**，所以写盘必定失败，且与 uid 无关（chmod 挡不住
-    // root，这个形状挡得住）。要钉的是顺序：`save` 必须先写盘、成功之后才换缓存。
-    // 反过来的话，失败之后本实例会声称这条记录存在 —— 设置界面（FR-G-01）把它
-    // 列出来，`find` 把它当已知主机放行，而重启之后它就消失了。已知主机记录
-    // **悄悄消失**正是 [FileHostKeyStore._load] 那段注释最想避免的结局。
+    // root，这个形状挡得住）。要钉的是：失败之后本实例**不能**声称这条记录存在
+    // —— 设置界面（FR-G-01）把它列出来、`find` 把它当已知主机放行，而重启之后
+    // 它就消失了。已知主机记录**悄悄消失**正是 [FileHostKeyStore._readFromDisk]
+    // 那段注释最想避免的结局。（修复前这条靠"先写盘、成功了才换缓存"的写序成立；
+    // 现在没有缓存了，它靠"每次都读盘"成立 —— 断言不变，理由变了。）
     final blocker = File('${root.path}/blocker')..writeAsStringSync('not a dir');
     final s = FileHostKeyStore(file: File('${blocker.path}/known_hosts.json'));
 
@@ -193,5 +194,51 @@ void main() {
     expect((await s.find(h.host, h.port, h.keyType))!.identity, h.identity);
     await s.remove(h.host, h.port, h.keyType);
     expect(await s.all(), isEmpty);
+  });
+
+  test('两个实例并存时，后来的 save 不会盖掉先前的记录', () async {
+    // 修复前：`save` 在**本实例的缓存**上做读-改-写，而缓存是各自 load 出来的
+    // 快照 —— a 与 b 都从空开始，a 存 ed25519、b 存 rsa，b 落盘的结果里只有
+    // rsa，a 那条**静默消失**。
+    final a = store();
+    final b = store();
+    await a.save(host(type: 'ssh-ed25519'));
+    await b.save(host(type: 'rsa-sha2-256'));
+
+    expect(
+      await store().find('10.0.0.1', 22, 'ssh-ed25519'),
+      isNotNull,
+      reason: '丢一条已知主机密钥 = 那台主机退回"首次连接"，'
+          '用户会在没被告知的情况下被重新问一次指纹',
+    );
+    expect(await store().find('10.0.0.1', 22, 'rsa-sha2-256'), isNotNull);
+  });
+
+  test('长命实例的 all() 读得到另一个实例写进去的记录（不是快照）', () async {
+    final s = store();
+    expect(await s.all(), isEmpty);
+    await store().save(host()); // 另一个实例写盘
+    expect(await s.all(), hasLength(1));
+  });
+
+  test('schemaVersion 比本程序新时抛 FormatException，不静默按当前语义读', () async {
+    await file.writeAsString(
+      jsonEncode({'schemaVersion': 2, 'hosts': <Object?>[]}),
+    );
+    expect(() => store().find('h', 22, 'k'), throwsFormatException);
+  });
+
+  test('schemaVersion 不是整数时也抛 FormatException', () async {
+    await file.writeAsString(
+      jsonEncode({'schemaVersion': '1', 'hosts': <Object?>[]}),
+    );
+    expect(() => store().find('h', 22, 'k'), throwsFormatException);
+  });
+
+  test('没有 schemaVersion 时抛 FormatException', () async {
+    // 本文件只由本程序写出，写出时一定带版本号 —— 所以"没有版本号"意味着
+    // 这是别处来的文件。本类的立场是**响亮地失败**（见 _readFromDisk）。
+    await file.writeAsString(jsonEncode({'hosts': <Object?>[]}));
+    expect(() => store().find('h', 22, 'k'), throwsFormatException);
   });
 }
