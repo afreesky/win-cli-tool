@@ -81,8 +81,20 @@ void main() {
 
     expect(c.status.state, DeviceConnectionState.disconnected);
     await c.connect();
+    // **`status` 是事件的镜像，不是 manager 自己的 `state`。** 事件走广播流，
+    // 而投递**不是**"下一个微任务"那么快：实测 `await c.connect()` 刚返回时
+    // `c.status.state` 还是 `connecting`，而 `c.state`（直接问 manager）已经是
+    // `connected`；让一轮事件循环跑完（`settle()`）两者才一致。
+    // 断言镜像就得等投递 —— 本文件读事件驱动状态的地方都这么做（见 `settle()`
+    // 的定义：它存在的理由就是这件事）。
+    //
+    // 顺带记一笔给 5b：`SessionController.state`（同步，直接问 manager）与
+    // `SessionStatus.state`（异步镜像）是**两个真相来源**，会差一个回合。
+    // 界面得**有意地**挑一个用，别混着用。
+    await settle();
     expect(c.status.state, DeviceConnectionState.connected);
     await c.disconnect();
+    await settle();
     expect(c.status.state, DeviceConnectionState.disconnected);
   });
 
@@ -149,7 +161,12 @@ void main() {
     await c.connect();
     factory.sessions.single.emit('hello\n');
     await settle();
-    await c.dispose();
+    // **这里也必须是 `disconnect()`。** `dispose()` 的 `_endLogSync` 是
+    // `unawaited(log?.end())`，读的时候磁盘上本来就可能什么都没有（下一条用例
+    // 有实测）—— 那样"没有文件"就成了**空转**：即使真的构造了 `LogWriter`，
+    // 这条也照样绿。`disconnect()` 会 `await end()`，真有 writer 就必然出现文件，
+    // 于是"空"才真的证明"没构造"。
+    await c.disconnect();
 
     expect(await _readAllLogs(logsRoot), isEmpty, reason: '没构造就不该有文件');
   });
@@ -160,7 +177,13 @@ void main() {
     await c.connect();
     factory.sessions.single.emit('a\x1b[31mred\x1b[0m\n');
     await settle();
-    await c.dispose();
+    // **逼日志落盘要用 `disconnect()`，不能用 `dispose()`。** `dispose()` 走的是
+    // `_endLogSync()`，那是 `unawaited(log?.end())` —— 读的时候写还没落下去，
+    // 而在那之前**连日期目录都还不存在**（`LogWriter._flush` 只在真正要写的那
+    // 一步才 `create(recursive: true)`）。实测：`dispose()` 之后立刻读是**空串**，
+    // 300ms 之后才有内容（内容本身是对的：含 `red`、无 ESC）。
+    // `disconnect()` 里的 `_endLog()` 是 `await log?.end()`，落盘是确定的。
+    await c.disconnect();
 
     final log = await _readAllLogs(logsRoot);
     expect(log, contains('red'));
@@ -183,8 +206,22 @@ void main() {
     addTearDown(c.dispose);
 
     await c.connect();
-    factory.sessions.single.emit('boom\n');
-    await settle();
+    // **必须喂够一次真实的写盘尝试，否则下面那条断言不可达。** `LogWriter._flush`
+    // 默认只在缓冲攒够 `flushEveryLines`（32）行时才真写；`start()` / `write()`
+    // 都**不是**强制点（唯一的强制点是 `end()`）。只喂一行的话根本不会碰磁盘，
+    // `onLogError` 无从触发 —— 实测：一行 + `settle()` ⇒ **0 次**回调。
+    //
+    // 一次喂 40 行，而且是**同一个 chunk**（于是只触发一次 `_flush`）：写盘必定
+    // 失败 ⇒ 回调一次 ⇒ `_failed` 置位，此后本类不再碰磁盘。
+    factory.sessions.single.emit('${'x\n' * 40}');
+
+    // 失败要等两个真的 IO 回合（`stat()` → `create()`）。实测：0ms 与 5ms 时还是
+    // 0 次，50ms 时是 1 次 —— 所以固定等一个 `Duration.zero` 不够。这里**轮询到
+    // 条件成立**（上限 2 秒），而不是赌一个毫秒数：等不到就是下面那条断言红，
+    // 不会变成"偶尔绿"。
+    for (var i = 0; i < 200 && errors.isEmpty; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+    }
 
     expect(errors, hasLength(1), reason: '失败只报一次');
     expect(
