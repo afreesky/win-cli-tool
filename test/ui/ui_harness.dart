@@ -47,3 +47,22 @@ Future<void> pumpUi(
   );
   await tester.pumpAndSettle();
 }
+
+/// 让**真盘 I/O** 走完：转一圈真实事件循环，再 flush 一次假时钟的微任务队列，交替若干轮。
+///
+/// **为什么不能只用其中一个**（实测）：`pump()` 只 flush 微任务、不转真实事件循环；
+/// `runAsync(delay)` 只转一次真实事件循环。而 `dart:io` 的每一步都要一次真实的轮转才
+/// 推进，`DeviceStore.save()` 至少是 `create(recursive: true)` + `writeAsString()` 两步
+/// —— 只做其中之一就停在半路，表现为"点了确认删除，设备还在"。
+///
+/// 凡是用例要观察**写盘之后**的状态（删除、拖拽排序、改设置），都用它代替
+/// `pumpAndSettle()`。
+Future<void> settleDisk(WidgetTester tester, {int rounds = 12}) async {
+  for (var i = 0; i < rounds; i++) {
+    await tester.pump(const Duration(milliseconds: 16));
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 5)),
+    );
+  }
+  await tester.pumpAndSettle();
+}

@@ -254,16 +254,28 @@ class SessionNotifier extends Notifier<SessionStatus> {
 
   final String deviceId;
 
-  late final SessionController _controller;
+  /// 设备已被删除时为 null（见 `build()`）。此时本 provider 只剩一个"未连接"的
+  /// 空状态，下面四个方法都退化成空操作 —— 已经没有界面会调它们，但也不能抛。
+  SessionController? _controller;
 
   @override
   SessionStatus build() {
     final settings = ref.read(settingsProvider);
-    final profile = ref
-        .read(devicesProvider)
-        .firstWhere((d) => d.id == deviceId);
+    final devices = ref.read(devicesProvider);
+    final index = devices.indexWhere((d) => d.id == deviceId);
+    if (index < 0) {
+      // **设备已经不在了（FR-D-04 删除），这里不能抛。**
+      //
+      // `DevicesNotifier.remove()` 会 `invalidate` 本 provider，而设备列表里那一行
+      // 此刻还在 `watch` 它（widget 要到下一帧才拆），于是 Riverpod 当场重建 ——
+      // 原来那句 `firstWhere` 找不到设备，抛 `Bad state: No element`，
+      // **删一台设备就把界面打红**（实测）。设备都没了，会话状态当然是"未连接"。
+      _controller = null;
+      return const SessionStatus();
+    }
+    final profile = devices[index];
 
-    _controller = SessionController(
+    final controller = SessionController(
       profile: profile,
       factory: ref.read(sessionFactoryProvider),
       buffer: ref.read(outputBufferProvider(deviceId)),
@@ -275,21 +287,29 @@ class SessionNotifier extends Notifier<SessionStatus> {
           .read(issuesProvider.notifier)
           .add(LoadIssue(LoadIssueKind.corruptFile, '日志写入失败：$error')),
     );
+    _controller = controller;
     // controller 的状态变化（含从 `ConnectionManager` 来的那些）推给 Riverpod。
-    _controller.onStatus = (status) => state = status;
-    ref.onDispose(_controller.dispose);
-    return _controller.status;
+    controller.onStatus = (status) => state = status;
+    ref.onDispose(controller.dispose);
+    return controller.status;
   }
 
-  Future<void> connect() => _controller.connect();
-  Future<void> disconnect() =>
-      _controller.disconnect().then((_) => state = _controller.status);
+  Future<void> connect() async {
+    await _controller?.connect();
+  }
+
+  Future<void> disconnect() async {
+    final controller = _controller;
+    if (controller == null) return;
+    await controller.disconnect();
+    state = controller.status;
+  }
 
   /// 把命令排进该设备的队列（FR-E-01）。队列在后台继续跑，切设备不影响它。
-  void enqueue(List<String> commands) => _controller.enqueue(commands);
+  void enqueue(List<String> commands) => _controller?.enqueue(commands);
 
   /// 中止队列（FR-E-13 / Esc）。
-  void abort() => _controller.abort();
+  void abort() => _controller?.abort();
 }
 
 /// 日志根目录的默认位置。由 `main()` 覆盖成应用数据目录下的 `logs/`。
@@ -336,3 +356,25 @@ void connectAutoConnectDevicesAtStartup(WidgetRef ref) {
         unawaited(ref.read(sessionProvider(deviceId).notifier).connect()),
   );
 }
+
+/// 当前选中的设备（界面的选择状态）。
+///
+/// **它在状态层而不是某个 widget 的 State 里**：设备列表、编辑区、输出区三处
+/// 都要读它，窗口级的快捷键也要读。
+///
+/// `build()` 用 `read` 取初始值，所以**删掉当前选中的设备之后它不会自动挪走**
+/// —— 处理那件事的是设备列表面板的删除路径（先 select 再 remove）。主窗口另外
+/// 还会挡一道：它只把"确实还在设备列表里"的 id 交给面板（见 `main_window.dart`
+/// 的 `_active`），所以残留的过期选中不会让面板去建一个不存在的会话。
+class SelectedDeviceNotifier extends Notifier<String?> {
+  @override
+  String? build() {
+    final devices = ref.read(devicesProvider);
+    return devices.isEmpty ? null : devices.first.id;
+  }
+
+  void select(String? id) => state = id;
+}
+
+final selectedDeviceProvider =
+    NotifierProvider<SelectedDeviceNotifier, String?>(SelectedDeviceNotifier.new);
