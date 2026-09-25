@@ -1899,8 +1899,6 @@ EOF
 ```dart
 import 'dart:async';
 
-import 'package:win_cli_tool/command/command_dispatcher.dart';
-import 'package:win_cli_tool/connection/connector.dart';
 import 'package:win_cli_tool/connection/known_host.dart';
 import 'package:win_cli_tool/connection/session.dart';
 import 'package:win_cli_tool/connection/session_factory.dart';
@@ -2237,7 +2235,11 @@ void main() {
     //
     // 一次喂 40 行，而且是**同一个 chunk**（于是只触发一次 `_flush`）：写盘必定
     // 失败 ⇒ 回调一次 ⇒ `_failed` 置位，此后本类不再碰磁盘。
-    factory.sessions.single.emit('${'x\n' * 40}');
+    //
+    // 写成 `'x\n' * 40` 而不是 `'${'x\n' * 40}'`：后者那层插值是多出来的
+    // （表达式本来就是 String），分析器判 `unnecessary_string_interpolations`，
+    // 而完成标准 1 要求 `dart analyze` 干净。
+    factory.sessions.single.emit('x\n' * 40);
 
     // 失败要等两个真的 IO 回合（`stat()` → `create()`）。实测：0ms 与 5ms 时还是
     // 0 次，50ms 时是 1 次 —— 所以固定等一个 `Duration.zero` 不够。这里**轮询到
@@ -2638,7 +2640,13 @@ import 'dart:io';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:win_cli_tool/data/load_issue.dart';
+// **是 `device_store.dart` 而不是 `load_issue.dart`。** 本文件既要 `LoadIssue` /
+// `LoadIssueKind`，又要 `DuplicateDeviceNameError`（它只定义在 device_store.dart
+// 里），而 device_store.dart **re-export 了** load_issue.dart（它自己 `:10` 那句
+// `export 'load_issue.dart';`）。所以这一条 import 同时给出三样东西；再单独写一行
+// `load_issue.dart` 会被分析器判为 `unnecessary_import` —— 而完成标准 1 要求
+// `dart analyze lib/ test/` 输出 `No issues found!`。
+import 'package:win_cli_tool/data/device_store.dart';
 import 'package:win_cli_tool/models/app_settings.dart';
 import 'package:win_cli_tool/models/device_profile.dart';
 import 'package:win_cli_tool/state/app_paths.dart';
@@ -2867,6 +2875,56 @@ void main() {
       bufferB.lines.single,
       isEmpty,
       reason: 'A 的输出不得串到 B 的缓冲里',
+    );
+  });
+
+  test('改设置不会把正在用的输出缓冲换成另一个（FR-O-09）', () async {
+    // 本用例钉的是 `outputBufferProvider` **不 watch 设置**。
+    //
+    // 若它 watch（原来的写法），`settingsProvider` 一变它就被重建，而
+    // `SessionNotifier.build()` 早把旧缓冲抓成了 `SessionController` 的 `final`
+    // 字段 —— 于是读到的缓冲和会话在写的缓冲成了两个实例：输出区当场变空，
+    // 之后设备吐的每一个字都进那个没人看的旧缓冲。
+    //
+    // **判据必须是"是不是同一个实例"**：只看内容的话，改设置后旧缓冲里的东西
+    // 还在（新缓冲是空的，可下面那条 `contains` 读的是新缓冲 —— 会红），但要
+    // 精确地钉住"分家"这件事，`identical` 才是直说的那个。
+    final factory = FakeSessionFactory();
+    final container = await boot(
+      devices: [fakeProfile(id: 'd1')],
+      factory: factory,
+    );
+
+    await container.read(sessionProvider('d1').notifier).connect();
+    factory.sessions.single.emit('改设置之前\n');
+    await Future<void>.delayed(Duration.zero);
+
+    final before = container.read(outputBufferProvider('d1'));
+    expect(before.lines.first.single.text, '改设置之前');
+
+    await container
+        .read(settingsProvider.notifier)
+        .update(const AppSettings(theme: AppTheme.dark));
+    await Future<void>.delayed(Duration.zero);
+
+    expect(
+      identical(container.read(outputBufferProvider('d1')), before),
+      isTrue,
+      reason: '改设置不得换掉正在用的缓冲 —— 换了就是一个空缓冲，输出区当场清空，'
+          '而且会话再也不会往界面看的那个缓冲里写',
+    );
+
+    // 光"还是同一个实例"不够：会话得**确实还写着它**。
+    factory.sessions.single.emit('改设置之后\n');
+    await Future<void>.delayed(Duration.zero);
+    expect(
+      container
+          .read(outputBufferProvider('d1'))
+          .lines
+          .map((line) => line.map((s) => s.text).join())
+          .join('\n'),
+      contains('改设置之后'),
+      reason: '会话没有被"离婚"到一个没人看的缓冲上',
     );
   });
 
@@ -3122,9 +3180,21 @@ class DraftNotifier extends AsyncNotifier<String> {
 
 /// 某台设备的输出缓冲。**活得比一次会话长**（FR-O-09：切走再切回来还看得到
 /// 完整过程），所以它在这里，不在 `SessionController` 里。
+///
+/// **和 `sessionProvider` 一样 `read` 而不是 `watch` 设置，理由是同一个，而且
+/// 这里更严重。** `SessionNotifier.build()` 用 `ref.read` 把这个缓冲抓成
+/// `SessionController` 的 `final` 字段；若本 provider `watch` 设置，那么**任何
+/// 一次设置写入**（改主题、改编辑器比例、改缓冲行数）都会把它重建成一个**新的
+/// 空缓冲** —— 界面从此读到那个空缓冲（输出区当场清空），而会话继续往**没人再看
+/// 的那个旧缓冲**里写。这不只是显示问题：`SessionController` 抓的是旧实例，
+/// 两者就此永久分家，FR-O-09 的"切走再切回来还看得到完整过程"在任何一次设置
+/// 改动之后都不再成立。
+///
+/// 代价与 `sessionProvider` 相同、也同样是有意接受的：`outputBufferLines`
+/// 改动在**下次会话**生效（缓冲活得和容器一样久，本 provider 不是 autoDispose）。
 final outputBufferProvider =
     Provider.family<OutputBuffer, String>((ref, deviceId) {
-  final settings = ref.watch(settingsProvider);
+  final settings = ref.read(settingsProvider);
   return OutputBuffer(maxLines: settings.outputBufferLines);
 });
 
