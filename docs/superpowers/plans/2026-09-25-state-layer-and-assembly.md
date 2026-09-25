@@ -1041,7 +1041,7 @@ void main() {
     });
 
     test('留住的长度永不超过 kMaxAnsiHoldBack', () {
-      final long = '\x1b[' + '1' * (kMaxAnsiHoldBack * 3);
+      final long = '\x1b[${'1' * (kMaxAnsiHoldBack * 3)}';
       expect(ansiHoldBackLength(long), lessThanOrEqualTo(kMaxAnsiHoldBack));
     });
   });
@@ -3881,6 +3881,12 @@ EOF
 8. **`autoConnect` 的启动扫描只在首帧后跑一次**（`app.dart`）。5b 若要让"用户新加一台 `autoConnect: true` 的设备"也立即连接，需要另加触发点 —— 本计划**有意**不做（那会让"每加一台设备都试图连接"）。
 9. **`LogWriter._flush` 的写盘失败可能报两次**，而 FR-L-06 要的是"提示**一次**"。`_failed` 只在函数入口查一次，之后要 `await` `stat()` / `create()`；两次 `_flush` 撞进这个窗口时（一次由 32 行阈值触发、一次由 `end()` 强制）会各自失败、各调一次 `onError`。实测 4/4 复现：喂 40 行再 `disconnect()` ⇒ **2 次**回调。修法是入口加一个"正在落盘"的守卫（或把 `_failed` 提到 `await` 之前）。**`LogWriter` 是计划 4 的已合并代码，本计划一个字没碰** —— Task 7 的用例因此只喂一次写盘尝试。
 10. **`SessionController.state`（同步，直接问 manager）与 `SessionStatus.state`（异步镜像）是两个真相来源**，会差一个事件回合（Task 7 的用例里实测到）。5b 的按钮颜色与状态显示必须**有意地**挑一个用，别混着用 —— 混用会出现"按钮说连上了、横幅还在转圈"这种自相矛盾的画面。
+
+11. **改一台设备的档案（host/port/用户名）不会影响它已经在跑的那次会话。** `DevicesNotifier.update` **只**换列表，不 `ref.invalidate(sessionProvider(id))`（只有 `remove` 会，那里三条都 invalidate）；而 `SessionNotifier.build()` 用 `ref.read(devicesProvider).firstWhere(...)` 把档案读进 `late final _controller`，只读一次。于是用户把 host 从 `10.0.0.1` 改成 `10.0.0.2` 之后，界面显示的是新档案，**下一次 `connect()` 仍然连旧地址**，直到重启或把设备删掉重加。
+
+    **这一条是读代码得出的，没有实测**（Task 8 的实现者报的，他无法在不改已提交测试文件的前提下做探针）。我核对了 `lib/state/providers.dart:146-161` 与 `SessionNotifier.build()`，机制成立。
+
+    **本计划有意不改**，因为"改档案该不该断开正在跑的会话"是个交互决定，不是机械修复：直接加 `invalidate` 会让用户改个名字就断线（`update` 也用于改名），而那样比现状更烦人。5b 需要决定的是：改**连接参数**时提示并断开、改**纯展示字段**（名字）时不动会话 —— 那要么拆成两个方法，要么在 `update` 里比较连接相关字段。**留给 5b，与界面一起定。**
 
 ## 后续计划
 
