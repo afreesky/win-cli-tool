@@ -3234,7 +3234,8 @@ void connectAutoConnectDevicesAtStartup(WidgetRef ref) {
 }
 ```
 
-`Ref` 由 `flutter_riverpod` 导出（已在 import 里），`unawaited` 来自 `dart:async`。
+`WidgetRef` 由 `flutter_riverpod` 导出、`unawaited` 来自 `dart:async` —— 两者都在
+`providers.dart` 已有的 import 里，不用新增。
 
 - [ ] **Step 4: 跑用例，确认全绿**
 
@@ -3324,8 +3325,14 @@ void main() {
     expect(app.themeMode, ThemeMode.dark, reason: '主题来自设置');
   });
 
-  testWidgets('启动时不给 autoConnect 的设备发起连接', (tester) async {
-    // `app.dart` 只在首帧后跑一次 FR-C-14 的那次扫描，而这里一台设备都没有。
+  testWidgets('启动时只给 autoConnect 的设备发起连接（FR-C-14）', (tester) async {
+    // **两台设备：一台 `autoConnect: true`，一台 false。**
+    //
+    // 原来的写法是"零台设备 + 断言 sessions 为空"，那条**永远不会红**：
+    // 扫描整个不跑、或者 `connectAutoConnectDevices` 里那句
+    // `if (!device.autoConnect) continue;` 被删掉，零台设备都连不出东西来，
+    // 断言照样绿。要钉的是"按 autoConnect **过滤**"，就必须同时有该连的和
+    // 不该连的 —— 只有一台时 `hasLength(1)` 与"过滤器不存在"无法区分。
     final factory = FakeSessionFactory();
     final stores = AppStores(paths: AppPaths(root));
     await tester.pumpWidget(
@@ -3333,16 +3340,42 @@ void main() {
         overrides: [
           appStoresProvider.overrideWithValue(stores),
           startupProvider.overrideWithValue(
-            const AppStartup(settings: AppSettings(), devices: []),
+            AppStartup(
+              settings: const AppSettings(),
+              devices: [
+                fakeProfile(id: 'auto', name: 'A', autoConnect: true),
+                fakeProfile(id: 'manual', name: 'B'),
+              ],
+            ),
           ),
           sessionFactoryProvider.overrideWithValue(factory),
+          // 这一条不能省：`SessionNotifier.build()` 要
+          // `Directory(settings.logDir ?? ref.read(logsDirPath))`，而
+          // `AppSettings.logDir` 默认是 null、`logsDirPath` 没覆盖就抛
+          // StateError。理由与 `providers_test.dart` 的 `boot()` 逐字相同。
+          logsDirPath.overrideWithValue('${root.path}/logs'),
         ],
         child: const WinCliToolApp(),
       ),
     );
     await tester.pumpAndSettle();
 
-    expect(factory.sessions, isEmpty);
+    // 首帧之后的那次扫描是 `unawaited(...)`，provider 的建立又在几个 await
+    // 之后 —— 有界地等它落定，而不是赌一次 `pumpAndSettle` 正好够。
+    for (var i = 0; i < 40 && factory.sessions.isEmpty; i++) {
+      await tester.pump(const Duration(milliseconds: 25));
+    }
+    // **这一轮是承重的。** 上面的循环一看到有会话就停，所以"只有一台"此时
+    // 还可能只是"第二台还没轮到"。再给一段固定时间，让**本该被过滤掉**的那台
+    // 有机会连上：它要真连了，下面那条 `hasLength(1)` 立刻红。没有这一轮，
+    // 那条断言测的是调度顺序，不是过滤器。
+    for (var i = 0; i < 8; i++) {
+      await tester.pump(const Duration(milliseconds: 25));
+    }
+
+    expect(factory.sessions, hasLength(1),
+        reason: '只有 autoConnect 的那台该被连');
+    expect(factory.sessions.single.profile.id, 'auto');
   });
 }
 ```
@@ -3621,6 +3654,16 @@ void main() {
     expect(textOf(container, b.id), isNot(contains('A 的输出')));
 
     // 6. 输出也进了日志，而且是剥干净的。
+    //
+    // **读盘之前必须先逼一次落盘，否则这一条是空转。** `LogWriter` 攒够
+    // `flushEveryLines`（32）行才写，而这上面每台只吐了一行；一行永远等不到
+    // 阈值，日期目录那时也还不存在（它是在第一次真正写盘时才建的），于是
+    // `_readAllLogs` 读回的是空串 —— 两条 `contains` 在"日志里什么都没有"时
+    // 照样绿。`end()` 是**唯一**的强制落盘点，而 `disconnect()` 会 `await`
+    // 到它；`dispose()` 不行，它的 `_endLogSync()` 是 `unawaited(log.end())`。
+    await container.read(sessionProvider(a.id).notifier).disconnect();
+    await container.read(sessionProvider(b.id).notifier).disconnect();
+
     final logs = await _readAllLogs(Directory(container.read(logsDirPath)));
     expect(logs, contains('A 的输出'));
     expect(logs, contains('B 的输出'));
