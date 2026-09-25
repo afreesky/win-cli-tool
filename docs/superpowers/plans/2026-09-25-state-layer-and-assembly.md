@@ -2422,9 +2422,22 @@ class SessionController {
 
   /// [dispose] 一开始就同步置位，此后**一个事件都不再处理**。
   ///
-  /// 它不是"纵深防御"，是 [dispose] 那个条件成立的原因：`ConnectionManager.events`
-  /// 是广播流，`connect()` 返回时事件可能还排在队列里，而 `dispose()` 里任何一次
-  /// `await` 都会把控制权让出去，让那个事件落到一个正在被拆掉的 controller 上。
+  /// 背景：`ConnectionManager.events` 是广播流，`connect()` 返回时事件可能还排在
+  /// 队列里，而 `dispose()` 里任何一次 `await` 都会把控制权让出去 —— 那个事件于是
+  /// 落到一个正在被拆掉的 controller 上（`_onSessionReady` 会重新订阅 dispatcher
+  /// 并 `_startLog()`），或在已销毁的 provider 上写 `state`。
+  ///
+  /// **它和"把 `_eventsSub.cancel()` 提到第一位"是两条各自充分的机制**，实测 2×2：
+  /// 原顺序 + 无本标志 = **红**（`Cannot use the Ref ...`）；其余三格全绿。
+  /// `cancel()` 单独就够，是因为 Dart 的 `cancel()` **同步生效** —— 已排队但尚未
+  /// 投递的事件此后不会再被投递。**所以别写成"标志承重、cancel 顺手"**：那句话是
+  /// 我原先写的，被这张表推翻了。
+  ///
+  /// 那为什么两条都留？因为本标志还挡着**另一条**路径：新顺序把
+  /// `_dispatchSub?.cancel()` 排在 `await _eventsSub.cancel()` **之后**，那次 `await`
+  /// 同样让路，所以 dispatcher 广播流里已排队的 `QueueDropped` / `CommandCompleted`
+  /// 仍可能在销毁途中被投递进来 —— 挡住它的正是 [_onDispatchEvent] 里那条守卫。
+  /// **这一格是推理，没有实测**（现有用例没有构造"已排队的 dispatcher 事件"）。
   var _disposed = false;
 
   var _status = const SessionStatus();
@@ -2476,8 +2489,9 @@ class SessionController {
   /// 计划原先给的对策（dispose 之后多等一轮 `Duration.zero`）**治的是另一头**，
   /// 实测照样红 —— 事件早就在队列里了，多等一轮只是给它机会真的炸出来。
   ///
-  /// [_disposed] 那个标志是这条件成立的原因，`cancel()` 是顺带清理；两者都要，
-  /// 因为标志不依赖 `cancel()` 的投递语义。
+  /// [_disposed] 与"`_eventsSub.cancel()` 排第一"**是两条各自充分的机制**，不是
+  /// "标志承重、cancel 顺手"（后者是我原先写的，被上面那张 2×2 表推翻）。两者都
+  /// 留的理由见 [_disposed] 的文档：它们挡的不是同一条路径。
   Future<void> dispose() async {
     _disposed = true;
     await _eventsSub.cancel();
@@ -2534,7 +2548,9 @@ class SessionController {
   }
 
   void _onDispatchEvent(DispatchEvent event) {
-    // 与 [_onEvent] 同一个理由：dispatcher 的广播流也可能有已排队的事件。
+    // dispatcher 的广播流也可能有已排队的事件，而 `_dispatchSub?.cancel()` 现在
+    // 排在 `await _eventsSub.cancel()` **之后** —— 那次 `await` 会让路给它。
+    // **这条守卫是推理出来的，没有实测**（没有用例构造"已排队的 dispatcher 事件"）。
     if (_disposed) return;
     if (event is QueueDropped) {
       _setStatus(_status.copyWith(droppedCommands: event.count));
@@ -3894,6 +3910,27 @@ SessionStatus> after it has been disposed`。原因与修法见 `SessionControll
 
 另一处真时序（与上面无关，仍要留够）：A 的重连退避第一档正好 1s，
 `Future.delayed(2s)` 必须留够。
+
+**给这次修复做反向验证时，别只注释掉 `_disposed = true;`。** 我最初就是这么交代的，
+**它不会变红** —— 因为修复里的两处改动**各自单独就够**，而"注释掉标志"隐含假设了
+"cancel 的顺序不是决定因素"，实测那个假设不成立。四格全测过（每格一次命令 1）：
+
+| `_disposed = true;` | cancel 顺序 | 结果 |
+| --- | --- | --- |
+| 无 | `_dispatchSub` 先（**原代码**） | **红** `Cannot use the Ref ...` |
+| 有 | `_dispatchSub` 先 | 绿 |
+| 无 | `_eventsSub` 先 | 绿 |
+| 有 | `_eventsSub` 先（已落地的版本） | 绿 |
+
+要让反向验证真变红，得**两处一起回退**（第一行）。`cancel()` 单独就够的机制是
+Dart 的 `cancel()` **同步生效**：已排队但尚未投递的事件此后不会再被投递 —— 所以
+"原顺序 + 无标志"那次红，靠的正是 `await _dispatchSub?.cancel()` 在
+`_dispatchSub == null` 时**只是一次纯让路**，把控制权交给了排队中的事件。
+
+`_onDispatchEvent` 里那条守卫的承重性是**推理，不是实测**（新顺序下
+`_dispatchSub?.cancel()` 排在一次 `await` 之后，dispatcher 广播流里已排队的事件
+同样有窗口）—— 现有用例没有构造那个场景。5b 若要补，构造方式是在 `dispose()`
+之前让 dispatcher 排一条 `QueueDropped`。
 
 - [ ] **Step 3: 全仓跑一遍 + 分析器**
 

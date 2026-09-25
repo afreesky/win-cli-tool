@@ -123,9 +123,22 @@ class SessionController {
 
   /// [dispose] 一开始就同步置位，此后**一个事件都不再处理**。
   ///
-  /// 它不是"纵深防御"，是 [dispose] 那个条件成立的原因：`ConnectionManager.events`
-  /// 是广播流，`connect()` 返回时事件可能还排在队列里，而 `dispose()` 里任何一次
-  /// `await` 都会把控制权让出去，让那个事件落到一个正在被拆掉的 controller 上。
+  /// 背景：`ConnectionManager.events` 是广播流，`connect()` 返回时事件可能还排在
+  /// 队列里，而 `dispose()` 里任何一次 `await` 都会把控制权让出去 —— 那个事件于是
+  /// 落到一个正在被拆掉的 controller 上（`_onSessionReady` 会重新订阅 dispatcher
+  /// 并 `_startLog()`），或在已销毁的 provider 上写 `state`。
+  ///
+  /// **它和"把 `_eventsSub.cancel()` 提到第一位"是两条各自充分的机制**，实测 2×2：
+  /// 原顺序 + 无本标志 = **红**（`Cannot use the Ref ...`）；其余三格全绿。
+  /// `cancel()` 单独就够，是因为 Dart 的 `cancel()` **同步生效** —— 已排队但尚未
+  /// 投递的事件此后不会再被投递。**所以别写成"标志承重、cancel 顺手"**：那句话是
+  /// 我原先写的，被这张表推翻了。
+  ///
+  /// 那为什么两条都留？因为本标志还挡着**另一条**路径：新顺序把
+  /// `_dispatchSub?.cancel()` 排在 `await _eventsSub.cancel()` **之后**，那次 `await`
+  /// 同样让路，所以 dispatcher 广播流里已排队的 `QueueDropped` / `CommandCompleted`
+  /// 仍可能在销毁途中被投递进来 —— 挡住它的正是 [_onDispatchEvent] 里那条守卫。
+  /// **这一格是推理，没有实测**（现有用例没有构造"已排队的 dispatcher 事件"）。
   var _disposed = false;
 
   var _status = const SessionStatus();
@@ -174,8 +187,9 @@ class SessionController {
   /// 栈就是 `_onEvent → _onSessionReady → _setStatus`，抛在 `state = status` 上
   /// （`Cannot use the Ref ... after it has been disposed`）。
   ///
-  /// [_disposed] 那个标志是这条件成立的原因，`cancel()` 是顺带清理；两者都要，
-  /// 因为标志不依赖 `cancel()` 的投递语义。
+  /// [_disposed] 与"`_eventsSub.cancel()` 排第一"**是两条各自充分的机制**，不是
+  /// "标志承重、cancel 顺手"（后者是我原先写的，被上面那张 2×2 表推翻）。两者都
+  /// 留的理由见 [_disposed] 的文档：它们挡的不是同一条路径。
   Future<void> dispose() async {
     _disposed = true;
     await _eventsSub.cancel();
@@ -231,7 +245,9 @@ class SessionController {
   }
 
   void _onDispatchEvent(DispatchEvent event) {
-    // 与 [_onEvent] 同一个理由：dispatcher 的广播流也可能有已排队的事件。
+    // dispatcher 的广播流也可能有已排队的事件，而 `_dispatchSub?.cancel()` 现在
+    // 排在 `await _eventsSub.cancel()` **之后** —— 那次 `await` 会让路给它。
+    // **这条守卫是推理出来的，没有实测**（没有用例构造"已排队的 dispatcher 事件"）。
     if (_disposed) return;
     if (event is QueueDropped) {
       _setStatus(_status.copyWith(droppedCommands: event.count));
