@@ -102,14 +102,16 @@ class FakeSessionFactory implements SessionFactory {
 DeviceProfile fakeProfile({
   String id = 'd1',
   String name = '核心交换机',
+  String host = '10.0.0.1',
+  int port = 22,
   bool autoConnect = false,
   List<String> postLogin = const [],
 }) => DeviceProfile(
   id: id,
   name: name,
   protocol: DeviceProtocol.ssh,
-  host: '10.0.0.1',
-  port: 22,
+  host: host,
+  port: port,
   username: 'admin',
   postLoginCommands: postLogin,
   autoConnect: autoConnect,
