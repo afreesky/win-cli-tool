@@ -1414,9 +1414,15 @@ void main() {
       buffer.add('cmd\n');
       logged.clear();
       buffer.addMarker('--- 连接断开 ---');
+      // **这条断言必须在下面那句 `add` 之前。** 原文把它写在最后，而 `add` 会把
+      // `'next\n'` 喂进日志（`onText` 一直是挂着的），于是 `expect(logged, isEmpty)`
+      // **永远不可能成立** —— 它钉的不是"标记不进日志"，而是"这之后什么都不许进
+      // 日志"，而后者本来就是假的。
+      expect(logged, isEmpty, reason: '日志有它自己的一套标记（LogWriter 负责）');
+
       buffer.add('next\n');
       expect(textOf(buffer.lines), 'cmd\n--- 连接断开 ---\nnext\n');
-      expect(logged, isEmpty, reason: '日志有它自己的一套标记（LogWriter 负责）');
+      expect(logged, ['next\n'], reason: '标记之后的设备输出照常进日志');
     });
 
     test('带上样式', () {
