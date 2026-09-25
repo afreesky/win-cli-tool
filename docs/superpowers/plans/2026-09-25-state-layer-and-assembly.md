@@ -635,10 +635,23 @@ EOF
 - [ ] **Step 2: 跑用例，确认它红**
 
 Run: `flutter test test/connection/connection_manager_test.dart`
-Expected: **第一条**（`连点两下 connect()...`）点名变红，失败信息是
-`Expected: an object with length of <2>` / `Actual: [...<3 items>...]` ——
-预先实测的形状是 `created=3`、`closed=[true,false,false]`，于是 `stillOpen` 是
-`[1, 2]` 而期望 `[1]`。
+Expected: **第一条**（`连点两下 connect()...`）点名变红，红的是**假告警**那条断言：
+
+```
+00:00 +26 -1: 连点两下 connect()：不留孤儿会话，也不发假告警 [E]
+  Expected: empty
+    Actual: [ConnectionFailure:ConnectionFailure(unknown): 连接失败：connect failed]
+  自己拆出来的失败不是用户的线，报了就是假告警
+```
+
+**别预期 `sessions` 长度或 `stillOpen` 先红 —— 实测它们在这里是绿的。** 默认
+`backoff` 首项是 **1s**，而用例只等 50ms：过期那次排的重连定时器**在这个窗口里
+根本不会醒**，所以 `sessions` 就是 2 条、`stillOpen` 就是 `[1]`。上面引的
+`created=3`、`closed=[true,false,false]` 来自一条**60ms 退避**的探针，形状不同，
+别把两组数字当同一件事（我第一版就是这么记错的，它把这条用例的期望写成了长度断言）。
+
+于是那两条长度断言在这里是**回归护栏**（将来谁把退避序列调短、或让过期尝试的
+定时器真的跑起来，它们会接手变红）；当下钉住这个 bug 的是那条假告警断言。
 
 **第二条（输出隔离那条）应当全绿** —— 它是钉子不是红用例（见上表）。它绿说明
 `connect()` 里的 `_teardownSession()` 还在，这一步别把它当成"没红所以写错了"。
