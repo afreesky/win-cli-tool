@@ -4477,11 +4477,11 @@ EOF
 
 **Files:** 无（只跑命令、只记录）。
 
-- [ ] **Step 1: §9.2 六条界面行为测试逐条对账**
+- [x] **Step 1: §9.2 六条界面行为测试逐条对账**
 
 | §9.2 条目 | 落在哪 | 用例名 |
 | --- | --- | --- |
-| 发送范围 | Task 4 / Task 7 | `发送选中范围覆盖到的行`（+ `send_range_test.dart` 14 条纯逻辑） |
+| 发送范围 | Task 4 / Task 7 | `发送选中范围覆盖到的行`（+ `send_range_test.dart` **17 条纯逻辑**（原写 14，已按实测改正）） |
 | 设备切换 | Task 9 | `切换设备会把编辑区与输出区都换过去`、`切换设备时草稿跟着换` |
 | 后台队列 | Task 7 | `队列执行中显示进度，发送按钮转为停止` |
 | 设备按钮状态 | Task 8 | `列出全部设备，状态点是"未连接"`、`连上之后状态点变绿` |
@@ -4491,24 +4491,24 @@ EOF
 **逐条把这个表里的用例名在测试输出里找到**。找不到的写进报告 —— 表格是承诺，
 不是描述。
 
-- [ ] **Step 2: 全仓测试**
+- [x] **Step 2: 全仓测试**
 
 Run: `flutter test`
 Expected: 全绿（5a 的 440 条 + 本计划的约 45 条）。**没有 skipped 之外的意外。**
 
-- [ ] **Step 3: 静态分析**
+- [x] **Step 3: 静态分析**
 
 Run: `dart analyze lib/ test/`
 Expected: `No issues found!`
 
-- [ ] **Step 4: 确认 5a 的完成标准没被打破**
+- [x] **Step 4: 确认 5a 的完成标准没被打破**
 
 ```bash
 grep -rn "package:flutter" lib/data lib/connection lib/command lib/render lib/models
 ```
 Expected: **无输出**（NFR-M-01：那五层是纯 Dart）。
 
-- [ ] **Step 5: 提交验收记录**
+- [x] **Step 5: 提交验收记录**
 
 把 Step 1 的对账表（含实际跑出的条数）写进
 `docs/superpowers/plans/2026-09-25-ui-main-window.md` 的末尾，然后：
@@ -4756,3 +4756,74 @@ Ctrl+N 的 SnackBar，已在 Task 9 与未决项第 2 条两处写明。
 `settleDisk`（行号栏停在"1"）、`git add` 漏了夹具。**其中"引擎每个族只认一个字体面"
 是拿四行探针量出来的**（同一个族里挂 DejaVu + Noto，汉字照样是方框；把回退族名指向
 文泉驿微米黑就出来了）。
+
+
+---
+
+## 5b-1 收尾验收记录（Task 11）
+
+**跑的时间**：2026-09-25，HEAD = `eacc847`（Task 10 的 golden 提交）。以下每条命令都是
+控制器本人在这台机器上跑出来的，不是转述。
+
+- [x] **Step 1: §9.2 六条逐条对账**
+
+九个案例名逐个用 `grep -rF` 在 `test/` 下找到了，**表格是承诺，这一列是实测**：
+
+| §9.2 条目 | 实际存在的用例名 | 落在哪个文件 |
+| --- | --- | --- |
+| 发送范围 | `发送选中范围覆盖到的行（§9.2 第 1 条）` | `test/ui/editor_panel_test.dart` |
+| 发送范围（纯逻辑） | `send_range_test.dart` **17 条**（5 个 `group`） | `test/ui/send_range_test.dart` |
+| 设备切换 | `切换设备会把编辑区与输出区都换过去（§9.2 第 2 条）`、`切换设备时草稿跟着换（FR-E-03）` | `test/ui/main_window_test.dart` |
+| 后台队列 | `队列执行中显示进度，发送按钮转为停止（§9.2 第 3 条）` | `test/ui/editor_panel_test.dart` |
+| 设备按钮状态 | `列出全部设备，状态点是"未连接"（§9.2 第 4 条）`、`连上之后状态点变绿（§9.2 第 4 条）` | `test/ui/device_list_panel_test.dart` |
+| 输出自动滚动 | `内容变长时跟到底部`、`用户滚上去之后不再被拽回底部` | `test/ui/auto_scroll_test.dart` |
+| 清屏 | `清屏只清显示内容，日志那一路分毫不动（FR-O-05 / §9.2 第 6 条）` | `test/ui/output_panel_test.dart` |
+
+**上表里有一处数字是旧的，已就地改正**：`send_range_test.dart` 是 **17 条**，不是 14。
+Task 4 的 Step 4 早就把这条修正过（"此处早先写的 14 条是残留，实测修正"），但那次修正
+**没有传导到 Task 11 这张表里** —— 差一点被当作实测数字写进验收记录。实测：17 个
+`test(`、5 个 `group(`。另外两条用例的落点也和计划正文给人的印象不同：自动滚动那两条
+在 `auto_scroll_test.dart`，不在 `output_panel_test.dart`。
+
+- [x] **Step 2: 全仓测试**
+
+```
+$ flutter test
+00:12 +510 ~3: All tests passed!
+```
+
+**510 条通过 + 3 条跳过**（跳过的是 golden，见 Task 10 的开关）。本计划 Step 2 里写的
+"5a 的 440 条 + 本计划的约 45 条"是**派发前的估算，已被实测取代**：真实总数 510。
+
+- [x] **Step 3: 静态分析**
+
+```
+$ dart analyze lib/ test/
+Analyzing lib, test...
+No issues found!
+```
+
+- [x] **Step 4: 5a 的完成标准没被打破（NFR-M-01）**
+
+```
+$ grep -rn "package:flutter" lib/data lib/connection lib/command lib/render lib/models
+（无输出）
+```
+
+- [x] **Step 5: 本条即验收记录**（本文）
+
+**golden 截图（Task 10 的交付物）**：5 个 PNG 在 `test/ui/golden/`，已随 `eacc847` 提交。
+本机**两次互相独立的生成**（控制器一次、实现者一次）**sha256 逐张相同** —— golden 在
+这台机器上是可复现的，不是碰运气。逐张亲眼看过的结论：中文是真字不是方框；图标是真图标
+（连接、拖拽把手、发送、终端、清屏）；编辑区那张的行号栏是 1..5；没有右上角 debug 红斜带；
+`Info:` 绿、`Error:` 红、`42` 黄、`不在位` 反显。
+
+**一条界面观察（不阻塞，留给 5b-2）**：1440px 的主窗口里，设备列表把设备名和地址都截断了
+——截图上是 `核心交…`、`10.0.0.25…`。成因是默认 `deviceListWidth = 240`
+（`lib/models/app_settings.dart:37`）叠加行内两处 `TextOverflow.ellipsis`
+（`lib/ui/panels/device_list_panel.dart:85-88`）。不是渲染故障，分隔条也能拖宽，所以
+**没有**在验收里改产品布局。但 240 连 `10.0.0.254:22` 都放不下，5b-2 做设备编辑对话框时
+值得一并看一眼。
+
+**仍未关闭的欠账**（状态，不展开）：① Plan 5a 的 Tasks 1–6 diff 始终没有被独立复读过
+（未决项 6 ①）；② 未决项 14 —— FR-E-04 真正的进程退出路径本机无 `DISPLAY`，验不了。
