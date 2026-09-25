@@ -1850,8 +1850,21 @@ Expected: 全部通过（6 条）。
 
 - [ ] **Step 6: 提交**
 
+**最后两个路径是 `pub add` 的副作用，别漏。** `flutter pub add` 不只会改
+`pubspec.yaml` / `pubspec.lock`：它还重写了 `linux/flutter/generated_plugins.cmake`
+与 `windows/flutter/generated_plugins.cmake`，各加一行 `jni` 到
+`FLUTTER_FFI_PLUGIN_LIST`（`jni` 是 `path_provider_android` 的传递 FFI 依赖）。
+这两个文件**是入库的**，是 `pub get` 的确定性产物 —— 不改它们，工作树就是脏的，
+而本计划的完成标准要求收尾时干净。
+
+这一条是 Task 6 的实现者发现的，我事先没料到：我用
+`flutter pub add --offline --dry-run` 量过依赖解析，可 **dry run 不写盘**，
+照不出这两个文件。首次执行时它们是通过一个补交提交入库的（约束禁止 amend）。
+
 ```bash
-git add pubspec.yaml pubspec.lock lib/state/app_paths.dart lib/state/app_stores.dart test/state/app_stores_test.dart
+git add pubspec.yaml pubspec.lock lib/state/app_paths.dart \
+  lib/state/app_stores.dart test/state/app_stores_test.dart \
+  linux/flutter/generated_plugins.cmake windows/flutter/generated_plugins.cmake
 git commit -m "$(cat <<'EOF'
 feat(state): 引入 riverpod/path_provider，并给持久化层一个唯一实例集合
 
@@ -2112,10 +2125,29 @@ void main() {
     expect(text, contains('连接断开'));
     expect(text, contains('重连成功'));
 
-    // 日志里由 LogWriter 自己插标记（§5.6 逐字规定的那几条），输出区的标记
-    // 不该混进去。
+    // **读日志之前必须先逼它落盘。** `LogWriter._flush` 默认只在攒够
+    // `flushEveryLines`（32）行时才真写，`start()` / `write()` / `disconnected()`
+    // 都**不是**强制点 —— 唯一的强制点是 `end()`。本用例到这一步只往日志里放了
+    // 四行，所以不落盘的话磁盘上**什么都没有**，下面那两条"不含"就在空串上成立。
+    //
+    // 这条原本写的是 `expect(log, isNot(contains('连接断开')))`，**它永远不会红**：
+    // ① 如上，读到的是空串；② 就算落了盘它也不成立 —— LogWriter 自己的断开标记
+    // 里就有"连接断开"这四个字（§5.6 逐字规定，见 `LogWriter.disconnected`）。
+    // 一个字段名被两边共用，"不含这个词"就不可能表达"输出区的标记没混进去"。
+    // 判据只能是各自的**记号**：输出区的以 `--- ` 开头、不带时间戳，LogWriter 的
+    // 形如 `[时间戳] !!! 连接断开 …！！！`。
+    //
+    // 用 `disconnect()` 而不是 `dispose()`：前者 `await` 了 `log.end()`，落盘是
+    // 确定的；后者的 `_endLogSync` 是 `unawaited(log?.end())`，读的时候可能还没写完。
+    await c.disconnect();
+
     final log = await _readAllLogs(logsRoot);
-    expect(log, isNot(contains('连接断开')));
+    // 这两条是下面两条的**前提**：它们证明日志确实有内容。
+    // 没有它们，"不含"两条在"日志是空的"时也会绿。
+    expect(log, contains('!!! 连接断开'), reason: 'LogWriter 自己会写断开标记（§5.6）');
+    expect(log, contains('=== 重连成功'), reason: 'LogWriter 自己会写重连标记（§5.6）');
+    expect(log, isNot(contains('--- 连接断开')), reason: '输出区的标记不进日志');
+    expect(log, isNot(contains('--- 重连成功')), reason: '输出区的标记不进日志');
   });
 
   test('丢弃数从 dispatcher.events 取（FR-C-10）', () async {
