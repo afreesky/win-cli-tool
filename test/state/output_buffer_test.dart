@@ -198,7 +198,9 @@ void main() {
     buffer.add('\x1b[');
     expect(notified, 0, reason: '只有半条序列时没有内容定型');
 
-    // 补齐后半截，`_consume` 跑到了，但解析结果里没有可见文本。
+    // 补齐后半截：这一轮有内容定型（`complete` 非空），所以通知 —— **尽管
+    // 解析结果里一个可见字符都没有**（纯 SGR 序列）。通知的条件是"有定型"，
+    // 不是"有可见文本"。
     buffer.add('31m');
     expect(notified, 1);
   });
