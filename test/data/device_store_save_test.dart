@@ -128,12 +128,10 @@ void main() {
       ],
       'devices': <Object?>[],
     }));
-    // **必须用同一个 store 实例。** `_rawJumpHosts` 是**每个 DeviceStore 各自的**
-    // 状态，只有 `load()` 会填它；而 `store()` 辅助函数每次调用都新建一个。写成
-    // `store().load()` + `store().save(...)` 就是"一个实例读、另一个实例写" ——
-    // 写的那边从没读过盘，只会写回空数组，这条用例必红（实测过，Actual: []）。
-    // 要钉的是"**读过的那个实例**写回时不丢用户手写的 jumpHosts"。
-    // 顺带记住这条设计对计划 5 的含义：别对同一个文件建两个 store，一个读一个写。
+    // 修复前这条必须用**同一个** store 实例：`_rawJumpHosts` 是每个实例各自的状态，
+    // 只有 `load()` 会填它，写成"一个实例读、另一个实例写"就会写回空数组。
+    // 修复后 `save` 每次自己读盘，所以这条不再依赖实例身份 —— 保留同实例写法只是
+    // 因为它顺手（而且它仍然覆盖"读进来的原文能原样写回去"这件事）。
     final s = store();
     final loaded = await s.load();
     await s.save(loaded.devices);
@@ -144,7 +142,28 @@ void main() {
     ]);
   });
 
-  test('没读过盘就存盘：jumpHosts 写成空数组，不是 null', () async {
+  test('另一个实例从没读过盘，存盘也不会抹掉用户手写的 jumpHosts', () async {
+    await file.writeAsString(jsonEncode({
+      'schemaVersion': 2,
+      'jumpHosts': [
+        {'id': 'j1', 'name': '堡垒机', 'host': 'h', 'port': 22, 'username': 'u'},
+      ],
+      'devices': <Object?>[],
+    }));
+    // 写的是一个**全新的**实例（`store()` 每次调用都新建），它这辈子没 load() 过。
+    // 修复前这里写回空数组：用户手写的堡垒机配置被静默抹掉，没有任何提示。
+    // 修复后存盘结果与"用哪个实例写"无关 —— `save` 自己读盘。
+    await store().save([profile('d1')]);
+
+    final raw = jsonDecode(await file.readAsString()) as Map<String, Object?>;
+    expect(
+      raw['jumpHosts'],
+      hasLength(1),
+      reason: '存盘结果不能取决于写它的那个实例读没读过盘',
+    );
+  });
+
+  test('盘上没有文件时，jumpHosts 写成空数组而不是 null', () async {
     await store().save([profile('d1')]);
     final raw = jsonDecode(await file.readAsString()) as Map<String, Object?>;
     expect(raw['jumpHosts'], isEmpty);

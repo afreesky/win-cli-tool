@@ -55,16 +55,32 @@ class DeviceStore {
   final File file;
   final CredentialStore credentials;
 
-  /// 上一次读到的 `jumpHosts` 原文，存盘时**原样写回**。
+  /// 读出盘上**当前**的 `jumpHosts` 原文，供存盘时原样写回。
   ///
   /// 跳板机已放弃（spec §10.2），V1 既不解释也不修改这个字段；留着的唯一目的是
   /// **不丢用户数据** —— 手写的 `jumpHosts` 不该被本程序的一次保存抹掉。
   ///
-  /// **但"原样写回"是有前提的，别读成无条件的**：写回的是**本实例 `load()` 记下的
-  /// 那一份**。没在本实例上 `load()` 过就直接 `save()`，这里还是初始的 `const []`，
-  /// 于是文件里手写的 `jumpHosts` **会被抹成空数组**（实测过，有测试钉着这个行为）。
-  /// 所以：**同一个文件不要建两个 store，一个读一个写** —— 计划 5 尤其注意。
-  List<Object?> _rawJumpHosts = const [];
+  /// **为什么每次都读盘，而不是拿"本实例读到的那一份"：** 后者是个静默丢数据的
+  /// 陷阱。`load()` 与 `save()` 一旦落在**不同实例**上（装配层读、界面另建一个写、
+  /// 或将来某个后台任务自己 new 一个），写回的是初始值 `const []`，文件里手写的
+  /// 堡垒机配置**被抹成空数组**，而这条路径上没有任何东西会报错 —— 用户要等到
+  /// 哪天去查跳板机配置才发现。读盘是唯一让"存盘结果与本实例无关"的做法。
+  ///
+  /// 代价是每次存盘多读一次文件。存盘是用户动作（加/改/删设备），不是热路径。
+  Future<List<Object?>> _rawJumpHostsFromDisk() async {
+    // **读不回来时退回空数组，不抛。** 这里是**存盘**路径：用户此刻正在改配置，
+    // 多半就是想修好一个坏文件，为此抛出去等于把人锁在门外。真正的损坏上报在
+    // `load()` 那边（`LoadIssueKind.corruptFile`），不在这里重复。
+    try {
+      final raw = await readJsonObject(file);
+      final jumpHosts = raw?['jumpHosts'];
+      // 与 `load()` 里同一条判法：**先查形状，不硬转**。`as List<Object?>?` 是
+      // 一次没有 try 兜着的强转，手改坏的 `"jumpHosts": "x"` 会让存盘直接抛。
+      return jumpHosts is List<Object?> ? jumpHosts : const [];
+    } catch (_) {
+      return const [];
+    }
+  }
 
   /// 读盘。
   ///
@@ -114,14 +130,6 @@ class DeviceStore {
         ),
       );
     }
-
-    // 与下面 `devices` 的判法一致：**先查形状，不硬转**。`jumpHosts` 在 V1 里
-    // 只剩"原样写回"一个用途（跳板机已放弃支持），所以形状不对时退回空数组就够了。
-    // 但**绝不能**写成 `as List<Object?>?` —— 那是一个没有任何 try 兜着的强转，
-    // 一个手改坏的 `"jumpHosts": "x"` 会让 load() 抛 _TypeError 出去：调用方拿不到
-    // DeviceLoadResult、文件也不会被留档，于是**每次启动都崩**，正是 NFR-R-03 要防的。
-    final rawJumpHosts = raw['jumpHosts'];
-    _rawJumpHosts = rawJumpHosts is List<Object?> ? rawJumpHosts : const [];
 
     final rawDevices = raw['devices'];
     if (rawDevices is! List<Object?>) {
@@ -202,7 +210,8 @@ class DeviceStore {
   /// **只校验名称唯一，不校验 id。** id 由计划 5 生成，唯一性归它管 —— 这里是
   /// **有意的留白，不是漏了**；真出现两个同 id，密钥库实现会把两者的凭据串起来。
   ///
-  /// 另见 [_rawJumpHosts]：`jumpHosts` 只对**在本实例上 load() 过**的文件才是原样写回。
+  /// 另见 [_rawJumpHostsFromDisk]：`jumpHosts` **每次存盘都从盘上现读**，
+  /// 所以存盘结果与本实例读没读过盘无关。
   Future<void> save(List<DeviceProfile> devices) async {
     final seen = <String>{};
     for (final device in devices) {
@@ -225,7 +234,7 @@ class DeviceStore {
       'schemaVersion': kDevicesSchemaVersion,
       // 原样搬运，不解释也不修改 —— 跳板机已放弃（spec §10.2），
       // 这里唯一的目的就是别把用户手写的数据抹掉。
-      'jumpHosts': _rawJumpHosts,
+      'jumpHosts': await _rawJumpHostsFromDisk(),
       'devices': encoded,
     });
   }
