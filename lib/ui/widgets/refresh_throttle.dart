@@ -40,16 +40,27 @@ class RefreshThrottle extends ChangeNotifier {
       _pending = true;
       return;
     }
-    notifyListeners();
+    // **先武装定时器，再通知 —— 顺序是承重的。** 反过来的话，监听者若在通知里
+    // **同步**回写 source，那一跳会看到 `_timer` 还是 null，于是走进上面那个
+    // "首次立刻放行"分支：当场嵌套通知第二次（违反"至多每 interval 一次"），
+    // 并武装出一个随即被下一行覆盖、此后再也 cancel 不到的定时器。
+    //
+    // 实测：把它写成"先通知后武装"，`refresh_throttle_test.dart` 的
+    // "监听者在通知里同步回写 source 时，当场不再通知第二次"红在 `Actual: <2>`。
+    // **那个失联定时器是同一形状的第二个后果，但我没能构造出让它咬人的用例**
+    // （它到点时要恰好 `_pending == true` 才会对已 dispose 的对象发通知），
+    // 所以这里只把实测到的那一条当作依据。
     _timer = Timer(interval, _onWindowClosed);
+    notifyListeners();
   }
 
   void _onWindowClosed() {
     _timer = null;
     if (!_pending) return;
     _pending = false;
-    notifyListeners();
+    // 同上：先武装再通知。
     _timer = Timer(interval, _onWindowClosed);
+    notifyListeners();
   }
 
   @override
