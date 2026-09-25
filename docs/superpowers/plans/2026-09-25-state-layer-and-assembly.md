@@ -261,10 +261,19 @@ EOF
 ```dart
   test('两个实例并存时，后来的 save 不会盖掉先前的记录', () async {
     // 修复前：`save` 在**本实例的缓存**上做读-改-写，而缓存是各自 load 出来的
-    // 快照 —— a 与 b 都从空开始，a 存 ed25519、b 存 rsa，b 落盘的结果里只有
+    // 快照 —— a 与 b 各持一份，a 存 ed25519、b 存 rsa，b 落盘的结果里只有
     // rsa，a 那条**静默消失**。
+    //
+    // **那两句 `all()` 是承重的，不是热身装饰。** 旧实现的 `_cache` 是**懒填**的
+    // （构造时不读、第一次用到才读），所以不预热的话 `b.save()` 那一刻 `b` 的缓存
+    // 还是 null，它会**真的去读盘**、读到 a 刚写进去的记录，于是两边都写、什么
+    // 都不丢 —— 这条用例在修复前也是绿的，钉不住它要钉的东西（实测过：不预热时
+    // 修复前 `+19`，即它没红）。预热之后两个实例才各持一份**自己的空快照**，
+    // 而这正是装配层的真实场景：启动时读一遍（预热），之后另一个实例再写。
     final a = store();
     final b = store();
+    await a.all();
+    await b.all();
     await a.save(host(type: 'ssh-ed25519'));
     await b.save(host(type: 'rsa-sha2-256'));
 
@@ -343,7 +352,17 @@ EOF
 - [ ] **Step 2: 跑用例，确认它红**
 
 Run: `flutter test test/data/host_key_store_test.dart`
-Expected: 前两条新用例点名变红（`两个实例并存时...` 与 `长命实例的 all()...`），三条 `schemaVersion` 用例也点名变红。
+Expected: **5 条新用例全部点名变红** —— `+18 -5`。五条都在下面的 `Failing tests:`
+清单里，逐条点名（有两条 `schemaVersion` 的失败信息长这样：
+
+```
+  Expected: throws <Instance of 'FormatException'>
+    Actual: <Closure: () => Future<KnownHost?>>
+     Which: returned a Future that emitted <null>
+```
+
+—— 因为 `expect(() => store().find(...), throwsFormatException)` 是**异步**抛出的，
+失败时 matcher 描述的是那个闭包，这是正常的，不是"没抛"）。
 
 - [ ] **Step 3: 换掉实现**
 
