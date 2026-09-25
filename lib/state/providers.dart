@@ -220,9 +220,21 @@ class DraftNotifier extends AsyncNotifier<String> {
 
 /// 某台设备的输出缓冲。**活得比一次会话长**（FR-O-09：切走再切回来还看得到
 /// 完整过程），所以它在这里，不在 `SessionController` 里。
+///
+/// **和 `sessionProvider` 一样 `read` 而不是 `watch` 设置，理由是同一个，而且
+/// 这里更严重。** `SessionNotifier.build()` 用 `ref.read` 把这个缓冲抓成
+/// `SessionController` 的 `final` 字段；若本 provider `watch` 设置，那么**任何
+/// 一次设置写入**（改主题、改编辑器比例、改缓冲行数）都会把它重建成一个**新的
+/// 空缓冲** —— 界面从此读到那个空缓冲（输出区当场清空），而会话继续往**没人再看
+/// 的那个旧缓冲**里写。这不只是显示问题：`SessionController` 抓的是旧实例，
+/// 两者就此永久分家，FR-O-09 的"切走再切回来还看得到完整过程"在任何一次设置
+/// 改动之后都不再成立。
+///
+/// 代价与 `sessionProvider` 相同、也同样是有意接受的：`outputBufferLines`
+/// 改动在**下次会话**生效（缓冲活得和容器一样久，本 provider 不是 autoDispose）。
 final outputBufferProvider =
     Provider.family<OutputBuffer, String>((ref, deviceId) {
-  final settings = ref.watch(settingsProvider);
+  final settings = ref.read(settingsProvider);
   return OutputBuffer(maxLines: settings.outputBufferLines);
 });
 

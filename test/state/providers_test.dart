@@ -235,6 +235,56 @@ void main() {
     );
   });
 
+  test('改设置不会把正在用的输出缓冲换成另一个（FR-O-09）', () async {
+    // 本用例钉的是 `outputBufferProvider` **不 watch 设置**。
+    //
+    // 若它 watch（原来的写法），`settingsProvider` 一变它就被重建，而
+    // `SessionNotifier.build()` 早把旧缓冲抓成了 `SessionController` 的 `final`
+    // 字段 —— 于是读到的缓冲和会话在写的缓冲成了两个实例：输出区当场变空，
+    // 之后设备吐的每一个字都进那个没人看的旧缓冲。
+    //
+    // **判据必须是"是不是同一个实例"**：只看内容的话，改设置后旧缓冲里的东西
+    // 还在（新缓冲是空的，可下面那条 `contains` 读的是新缓冲 —— 会红），但要
+    // 精确地钉住"分家"这件事，`identical` 才是直说的那个。
+    final factory = FakeSessionFactory();
+    final container = await boot(
+      devices: [fakeProfile(id: 'd1')],
+      factory: factory,
+    );
+
+    await container.read(sessionProvider('d1').notifier).connect();
+    factory.sessions.single.emit('改设置之前\n');
+    await Future<void>.delayed(Duration.zero);
+
+    final before = container.read(outputBufferProvider('d1'));
+    expect(before.lines.first.single.text, '改设置之前');
+
+    await container
+        .read(settingsProvider.notifier)
+        .update(const AppSettings(theme: AppTheme.dark));
+    await Future<void>.delayed(Duration.zero);
+
+    expect(
+      identical(container.read(outputBufferProvider('d1')), before),
+      isTrue,
+      reason: '改设置不得换掉正在用的缓冲 —— 换了就是一个空缓冲，输出区当场清空，'
+          '而且会话再也不会往界面看的那个缓冲里写',
+    );
+
+    // 光"还是同一个实例"不够：会话得**确实还写着它**。
+    factory.sessions.single.emit('改设置之后\n');
+    await Future<void>.delayed(Duration.zero);
+    expect(
+      container
+          .read(outputBufferProvider('d1'))
+          .lines
+          .map((line) => line.map((s) => s.text).join())
+          .join('\n'),
+      contains('改设置之后'),
+      reason: '会话没有被"离婚"到一个没人看的缓冲上',
+    );
+  });
+
   test('删掉设备时它的会话被拆掉', () async {
     final factory = FakeSessionFactory();
     final container = await boot(
