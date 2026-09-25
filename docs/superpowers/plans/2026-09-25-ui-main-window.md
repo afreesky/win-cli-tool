@@ -1270,7 +1270,7 @@ void main() {
             height: 200,
             child: ValueListenableBuilder<int>(
               valueListenable: count,
-              builder: (_, n, __) => ListView.builder(
+              builder: (_, n, _) => ListView.builder(
                 controller: controller,
                 itemCount: n,
                 itemBuilder: (_, i) => SizedBox(height: 50, child: Text('第 $i 行')),
@@ -1369,6 +1369,10 @@ void main() {
 Run: `flutter test test/ui/auto_scroll_test.dart`
 Expected: **编译失败**（`Target of URI doesn't exist: .../auto_scroll.dart`）。
 
+**那段红里还会夹一条与本步无关的编译错误**：`ui_harness.dart` 用到 `Override` 而 Step 5 的 import 块（在本步之后才写）少一行 —— 见 Step 5 的说明，那一行已经补上了。两条一起出现时按两条看，别把它当成 `AutoScroll` 的错。
+
+**`builder: (_, n, _)` 里两个下划线不是笔误**：Dart 3.7+ 的 `_` 是**非绑定通配符**，可以重复；写成 `__` 会被 `flutter_lints` 的 `unnecessary_underscores` 记一条 info，而"`dart analyze lib/ test/` 干净"是验收项。
+
 - [ ] **Step 3: 实现 `AutoScroll`**
 
 ```dart
@@ -1441,6 +1445,11 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+// **`Override` 不在 `flutter_riverpod.dart` 里。** riverpod 3.x 把它移到了次要
+// 入口：主入口的 show 列表没有它，`misc.dart` 才有（实测 flutter_riverpod
+// 3.4.3）。少这一行，本文件红在 `non_type_as_type_argument`，而它连带把
+// 所有 `import 'ui_harness.dart';` 的测试文件一起拖红。
+import 'package:flutter_riverpod/misc.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:win_cli_tool/models/app_settings.dart';
 import 'package:win_cli_tool/models/device_profile.dart';
@@ -1484,6 +1493,10 @@ Future<void> pumpUi(
 ```
 
 **`ScrollController.dispose` 的注意**：`pumpUi` 里的 `MaterialApp` 会让布局稳定下来；面板测试若需要固定高度，把 `child` 包进 `SizedBox(height: ...)` 再传进来。
+
+**`import 'package:flutter_riverpod/misc.dart';` 那一行是承重的，别"清理"掉。** riverpod 3.x 把 `Override` 移出了主入口 —— 实测 3.4.3 的 `flutter_riverpod.dart` 是个 `show` 列表，**不含 `Override`**；`misc.dart` 才导出它。少那一行，本文件红在 `non_type_as_type_argument`（`The name 'Override' isn't a type`），而且因为是共享夹具，它会**把每一个 `import 'ui_harness.dart';` 的测试文件一起拖红**。
+
+**`extra` 目前零调用者**（Task 6/7/8/9 的 `pumpUi` 调用都只传具名参数），留着是给后续面板测试当逃生口的 —— 那时才需要 `extra:`，但要 override 的东西恰好都在主入口里，所以这个参数能一直用到 5b-2。
 
 - [ ] **Step 6: 写输出面板的失败测试**
 
