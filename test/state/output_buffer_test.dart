@@ -169,4 +169,37 @@ void main() {
       expect(marker.style.foreground, const AnsiBasic(3));
     });
   });
+
+  test('变动会通知监听者（界面据此重绘）', () {
+    final buffer = OutputBuffer(maxLines: 100);
+    var notified = 0;
+    buffer.addListener(() => notified++);
+
+    buffer.add('hello');
+    expect(notified, 1, reason: '一次喂进应当通知一次');
+
+    buffer.addMarker('--- 连接断开 ---');
+    expect(notified, 2);
+
+    buffer.clear();
+    expect(notified, 3);
+  });
+
+  test('没有真正改变内容时不通知', () {
+    final buffer = OutputBuffer(maxLines: 100);
+    var notified = 0;
+    buffer.addListener(() => notified++);
+
+    // 空串：`add` 开头就返回了，`_lines` 没动。
+    buffer.add('');
+    expect(notified, 0, reason: '空块不该触发重绘');
+
+    // 半条控制序列：全被留住，`complete` 是空串，`_lines` 没动。
+    buffer.add('\x1b[');
+    expect(notified, 0, reason: '只有半条序列时没有内容定型');
+
+    // 补齐后半截，`_consume` 跑到了，但解析结果里没有可见文本。
+    buffer.add('31m');
+    expect(notified, 1);
+  });
 }

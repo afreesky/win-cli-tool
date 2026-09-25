@@ -1,5 +1,7 @@
 import 'dart:collection';
 
+import 'package:flutter/foundation.dart';
+
 import '../render/ansi_parser.dart';
 
 /// 一台设备的输出缓冲：把流式到达的块攒成**按行分组**的样式片段。
@@ -12,7 +14,22 @@ import '../render/ansi_parser.dart';
 /// 生命周期：活得比一次会话长。FR-O-09 要求切换设备后切回来还能看到完整的输出，
 /// 而 `ConnectionManager` 会在重连时换掉整个会话 —— 所以它由状态层持有，
 /// 会话只往里灌数据。
-class OutputBuffer {
+///
+/// **它同时是个 [ChangeNotifier]**：界面靠它知道"该重绘了"。这是 5a 有意留下的
+/// 接缝 —— provider 返回的是本对象，`buffer.add(...)` 不会让任何 provider 失效，
+/// 界面若没有这条通知就只能轮询。
+///
+/// **通知是"变了"，不是"可以重绘了"。** NFR-F-02 要求输出渲染节流到约 60ms
+/// 一次，而这里**每次喂进都通知**（设备可以 200 行/秒地吐，见 NFR-F-03）——
+/// 节流是订阅方的事，见 `lib/ui/widgets/refresh_throttle.dart`。把节流做进本类
+/// 会让它拥有一个定时器，而 `clear()` / `addMarker()` 这种**用户操作**必须即时
+/// 生效，两者混在一起会把"谁负责及时"搞乱。
+///
+/// **本类不 `dispose()`。** 它由 `outputBufferProvider` 持有，那个 provider 不是
+/// `autoDispose`（缓冲要活得和容器一样久），所以 `ref.onDispose` 只在容器整体
+/// 销毁时才跑 —— 而那时 `SessionController` 可能仍持有它。不加 `dispose` 的代价
+/// 是进程退出时留下几十字节的监听者列表，收益是不去赌两条销毁路径的先后。
+class OutputBuffer extends ChangeNotifier {
   OutputBuffer({required this.maxLines});
 
   /// 保留的最大行数（FR-O-07，取 `AppSettings.outputBufferLines`，默认 5000）。
@@ -49,6 +66,7 @@ class OutputBuffer {
     _pending = input.substring(input.length - hold);
     if (complete.isEmpty) return;
     _consume(complete);
+    notifyListeners();
   }
 
   /// 放出残留的尾巴。会话结束/断开时调用。
@@ -60,6 +78,7 @@ class OutputBuffer {
     if (rest.isEmpty) return;
     _pending = '';
     _consume(rest);
+    notifyListeners();
   }
 
   /// 往输出区插一段**不由会话产生**的文本（断开/重连标记、命令超时告警行）。
@@ -79,6 +98,7 @@ class OutputBuffer {
     // 标记之后另起一行，后续输出不会接在它后面。
     _lines.add(<AnsiSpan>[]);
     _trim();
+    notifyListeners();
   }
 
   /// 清屏（FR-O-05）：**只清显示内容**。
@@ -90,6 +110,7 @@ class OutputBuffer {
     _lines
       ..clear()
       ..add(<AnsiSpan>[]);
+    notifyListeners();
   }
 
   void _consume(String complete) {
