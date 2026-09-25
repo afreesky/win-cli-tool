@@ -81,15 +81,25 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    // 首帧之后的那次扫描是 `unawaited(...)`，provider 的建立又在几个 await
-    // 之后 —— 有界地等它落定，而不是赌一次 `pumpAndSettle` 正好够。
+    // **下面两轮 pump 实测都是空转 —— 留着是保险，不是判别力来源。**
+    //
+    // 实测（探针打印计数，跑完即删）：`pumpAndSettle()` 之后扫描就已经落定，
+    // 第一个循环**一次都没进**（它的守卫 `factory.sessions.isEmpty` 首次求值时
+    // 就已经是 false），第二个 8×25ms 的循环跑满也不改变任何东西
+    // （`sessions=1 ids=[auto]`）。原因是结构性的：`connectAutoConnectDevices`
+    // 是一个普通同步 `for` 循环，`ref.read(sessionProvider(id).notifier)` 同步
+    // 建出 notifier，而 `ConnectionManager._attemptConnect` 在**任何真异步 IO
+    // 之前**就同步走到 `factory.create(profile)` —— 所以"本该被过滤掉的那台"
+    // 若真会被连，也是在**同一波微任务**里被连，就在 `pumpAndSettle` 里面。
+    //
+    // 那它们为什么还在？因为一旦连接路径在 `create` 之前多出一个真的 `await`
+    // （5b 的指纹确认对话框就是一个），这两轮就从空转变成承重。**但别据此以为
+    // 下面那条断言靠它们**：断言真正靠的是"该连的和不该连的各一台"。实测把
+    // `session_controller.dart` 的 `if (!device.autoConnect) continue;` 删掉，
+    // 它红在 `hasLength(1)`，而不是红在这两个循环上。
     for (var i = 0; i < 40 && factory.sessions.isEmpty; i++) {
       await tester.pump(const Duration(milliseconds: 25));
     }
-    // **这一轮是承重的。** 上面的循环一看到有会话就停，所以"只有一台"此时
-    // 还可能只是"第二台还没轮到"。再给一段固定时间，让**本该被过滤掉**的那台
-    // 有机会连上：它要真连了，下面那条 `hasLength(1)` 立刻红。没有这一轮，
-    // 那条断言测的是调度顺序，不是过滤器。
     for (var i = 0; i < 8; i++) {
       await tester.pump(const Duration(milliseconds: 25));
     }
