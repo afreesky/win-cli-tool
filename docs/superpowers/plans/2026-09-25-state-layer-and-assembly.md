@@ -2105,8 +2105,20 @@ void main() {
 
     expect(c.status.state, DeviceConnectionState.disconnected);
     await c.connect();
+    // **`status` 是事件的镜像，不是 manager 自己的 `state`。** 事件走广播流，
+    // 而投递**不是**"下一个微任务"那么快：实测 `await c.connect()` 刚返回时
+    // `c.status.state` 还是 `connecting`，而 `c.state`（直接问 manager）已经是
+    // `connected`；让一轮事件循环跑完（`settle()`）两者才一致。
+    // 断言镜像就得等投递 —— 本文件读事件驱动状态的地方都这么做（见 `settle()`
+    // 的定义：它存在的理由就是这件事）。
+    //
+    // 顺带记一笔给 5b：`SessionController.state`（同步，直接问 manager）与
+    // `SessionStatus.state`（异步镜像）是**两个真相来源**，会差一个回合。
+    // 界面得**有意地**挑一个用，别混着用。
+    await settle();
     expect(c.status.state, DeviceConnectionState.connected);
     await c.disconnect();
+    await settle();
     expect(c.status.state, DeviceConnectionState.disconnected);
   });
 
@@ -2173,7 +2185,12 @@ void main() {
     await c.connect();
     factory.sessions.single.emit('hello\n');
     await settle();
-    await c.dispose();
+    // **这里也必须是 `disconnect()`。** `dispose()` 的 `_endLogSync` 是
+    // `unawaited(log?.end())`，读的时候磁盘上本来就可能什么都没有（下一条用例
+    // 有实测）—— 那样"没有文件"就成了**空转**：即使真的构造了 `LogWriter`，
+    // 这条也照样绿。`disconnect()` 会 `await end()`，真有 writer 就必然出现文件，
+    // 于是"空"才真的证明"没构造"。
+    await c.disconnect();
 
     expect(await _readAllLogs(logsRoot), isEmpty, reason: '没构造就不该有文件');
   });
@@ -2184,7 +2201,13 @@ void main() {
     await c.connect();
     factory.sessions.single.emit('a\x1b[31mred\x1b[0m\n');
     await settle();
-    await c.dispose();
+    // **逼日志落盘要用 `disconnect()`，不能用 `dispose()`。** `dispose()` 走的是
+    // `_endLogSync()`，那是 `unawaited(log?.end())` —— 读的时候写还没落下去，
+    // 而在那之前**连日期目录都还不存在**（`LogWriter._flush` 只在真正要写的那
+    // 一步才 `create(recursive: true)`）。实测：`dispose()` 之后立刻读是**空串**，
+    // 300ms 之后才有内容（内容本身是对的：含 `red`、无 ESC）。
+    // `disconnect()` 里的 `_endLog()` 是 `await log?.end()`，落盘是确定的。
+    await c.disconnect();
 
     final log = await _readAllLogs(logsRoot);
     expect(log, contains('red'));
@@ -2207,8 +2230,22 @@ void main() {
     addTearDown(c.dispose);
 
     await c.connect();
-    factory.sessions.single.emit('boom\n');
-    await settle();
+    // **必须喂够一次真实的写盘尝试，否则下面那条断言不可达。** `LogWriter._flush`
+    // 默认只在缓冲攒够 `flushEveryLines`（32）行时才真写；`start()` / `write()`
+    // 都**不是**强制点（唯一的强制点是 `end()`）。只喂一行的话根本不会碰磁盘，
+    // `onLogError` 无从触发 —— 实测：一行 + `settle()` ⇒ **0 次**回调。
+    //
+    // 一次喂 40 行，而且是**同一个 chunk**（于是只触发一次 `_flush`）：写盘必定
+    // 失败 ⇒ 回调一次 ⇒ `_failed` 置位，此后本类不再碰磁盘。
+    factory.sessions.single.emit('${'x\n' * 40}');
+
+    // 失败要等两个真的 IO 回合（`stat()` → `create()`）。实测：0ms 与 5ms 时还是
+    // 0 次，50ms 时是 1 次 —— 所以固定等一个 `Duration.zero` 不够。这里**轮询到
+    // 条件成立**（上限 2 秒），而不是赌一个毫秒数：等不到就是下面那条断言红，
+    // 不会变成"偶尔绿"。
+    for (var i = 0; i < 200 && errors.isEmpty; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+    }
 
     expect(errors, hasLength(1), reason: '失败只报一次');
     expect(
@@ -2549,6 +2586,18 @@ Run: `flutter test test/state/session_controller_test.dart`
 Expected: 全部通过（9 条）。
 
 **如果 `重连之后输出仍然接着来` 超时或红**，先确认 `FakeSession.close()` **没有**关闭 `_output`（夹具里刻意如此，与真实实现不同）—— manager 会自己取消订阅，所以不需要靠关流来挡住旧数据。
+
+**首次实跑时上面有三条是红的 —— 已按实测改正（别再改回去）：**
+
+1. `状态跟着 ConnectionManager 走`：`status` 镜像比 manager 的 `state` 慢一个回合
+   （实测：`await c.connect()` 返回时 `status=connecting` 而 `state=connected`，
+   再跑一轮事件循环才一致）。断言镜像之前要 `settle()`。
+2. `日志写在 logs/ 下的日期目录里，内容与输出区同源`：`dispose()` 的
+   `_endLogSync` 是 `unawaited(log?.end())`，读到时磁盘上**什么都没有**（实测读到
+   空串，300ms 之后才有内容）。改用 `disconnect()`（它 `await` 了 `end()`）。
+3. `日志写盘失败时回调一次，且不拖垮会话`：只喂一行永远到不了 32 行的落盘阈值，
+   `onLogError` 无从触发（实测 0 次）。改喂 40 行（**同一个 chunk**，只触发一次
+   `_flush`），并轮询等待失败落定（实测 5ms 时仍是 0 次、50ms 时是 1 次）。
 
 - [ ] **Step 6: 提交**
 
@@ -3169,7 +3218,14 @@ String newDeviceId() {
 ///
 /// 由 `app.dart` 在首帧之后调用一次。**只调一次** —— 它不是"设备列表一变就连"，
 /// 那会在用户每加一台设备时都试图连接（见 `app.dart` 的说明）。
-void connectAutoConnectDevicesAtStartup(Ref ref) {
+///
+/// **参数类型是 `WidgetRef` 而不是 `Ref`，这不是随手写的。** 调用点在
+/// `ConsumerState` 里，那里的 `ref` 是 `WidgetRef`；而 `Ref` 是 **sealed**
+/// （riverpod 的 `core/ref.dart`），`WidgetRef` 只 implements `BaseWidgetRef`
+/// —— 两者**没有**子类型关系，写成 `Ref` 编译不过（"The argument type
+/// 'WidgetRef' can't be assigned to the parameter type 'Ref'"）。本函数唯一的
+/// 用途就是给 widget 层调，所以取 widget 那一侧的 ref 才是诚实的类型。
+void connectAutoConnectDevicesAtStartup(WidgetRef ref) {
   connectAutoConnectDevices(
     devices: ref.read(devicesProvider),
     connect: (deviceId) =>
@@ -3710,6 +3766,8 @@ EOF
 6. **`TelnetSession.connect()` 没有入口守卫**（守卫在 `connector.open(...)` 之后，与 `SshSession` 不一致），以及 `Session` 契约没写「`connect()` 抛了之后仍需 `close()`」—— 计划 3 取消后这两条"顺手项"没有归属。本计划**没碰** `telnet_session.dart`。
 7. **`connection_manager.dart:280` 的 `onError: (Object _) {}`** 是静默吞掉的保险。评审结论是"留着"；真触发时没有事件、没有日志、**别指望它报信**。
 8. **`autoConnect` 的启动扫描只在首帧后跑一次**（`app.dart`）。5b 若要让"用户新加一台 `autoConnect: true` 的设备"也立即连接，需要另加触发点 —— 本计划**有意**不做（那会让"每加一台设备都试图连接"）。
+9. **`LogWriter._flush` 的写盘失败可能报两次**，而 FR-L-06 要的是"提示**一次**"。`_failed` 只在函数入口查一次，之后要 `await` `stat()` / `create()`；两次 `_flush` 撞进这个窗口时（一次由 32 行阈值触发、一次由 `end()` 强制）会各自失败、各调一次 `onError`。实测 4/4 复现：喂 40 行再 `disconnect()` ⇒ **2 次**回调。修法是入口加一个"正在落盘"的守卫（或把 `_failed` 提到 `await` 之前）。**`LogWriter` 是计划 4 的已合并代码，本计划一个字没碰** —— Task 7 的用例因此只喂一次写盘尝试。
+10. **`SessionController.state`（同步，直接问 manager）与 `SessionStatus.state`（异步镜像）是两个真相来源**，会差一个事件回合（Task 7 的用例里实测到）。5b 的按钮颜色与状态显示必须**有意地**挑一个用，别混着用 —— 混用会出现"按钮说连上了、横幅还在转圈"这种自相矛盾的画面。
 
 ## 后续计划
 
