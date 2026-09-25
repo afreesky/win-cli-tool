@@ -2628,6 +2628,18 @@ void main() {
           ),
         ),
         sessionFactoryProvider.overrideWithValue(factory ?? FakeSessionFactory()),
+        // **这一条不能省。** `logsDirPath` 是"必须由 main() 覆盖"的 provider
+        // （没有默认值可给：应用数据目录只有 main() 知道），读它会抛
+        // `StateError('logsDirPath 必须由 main() 覆盖')`。而
+        // `SessionNotifier.build()` 造 controller 时就要用它 ——
+        // `Directory(settings.logDir ?? ref.read(logsDirPath))`，而
+        // `AppSettings.logDir` 默认是 **null**。不覆盖的话，凡是碰
+        // `sessionProvider` 的用例都会在建 controller 时抛 StateError
+        // （`_controller` 是 `late final`，抛了之后连 `LateInitializationError`
+        // 都只是第二现场）。
+        //
+        // `main()` 正是这么做的（见 lib/main.dart 的 overrides），这里与它一致。
+        logsDirPath.overrideWithValue('${root.path}/logs'),
       ],
     );
     return container;
@@ -2752,6 +2764,15 @@ void main() {
   test('草稿：读得到、写得进，且真的落盘了', () async {
     final container = await boot();
     final notifier = container.read(draftProvider('d1').notifier);
+    // **`build()` 是异步的，断言之前必须先等它落定。** `DraftStore.read` 返回
+    // Future，而异步 build 在 future 完成之前状态是 `AsyncLoading`；
+    // `AsyncValue.value` 此时是 **null**（`_value` 只在 data/error 落定时才填，
+    // 见 riverpod 的 async_value.dart）——不等就是 `expect(null, '')`，必红。
+    //
+    // 等 `.future` 而不是 `Future.delayed(Duration.zero)`：前者拿到的就是
+    // **这一次 build 的那个 future**，确定性；后者赌"一轮事件循环够不够"，
+    // 而这里面是真文件 IO（`exists()` → `readAsBytes()`）。
+    await container.read(draftProvider('d1').future);
     expect(container.read(draftProvider('d1')).value, '', reason: '没写过就是空串');
 
     await notifier.save('show version\n');
@@ -2788,7 +2809,16 @@ void main() {
     final bufferA = container.read(outputBufferProvider('a'));
     final bufferB = container.read(outputBufferProvider('b'));
     expect(bufferA.lines.first.single.text, '来自 A');
-    expect(bufferB.lines, hasLength(1), reason: 'A 的输出不得串到 B 的缓冲里');
+    // **判据必须是内容，不能是行数。** `OutputBuffer._lines` 初始就带着一条空的
+    // "进行中"行（`final List<List<AnsiSpan>> _lines = [<AnsiSpan>[]];`），所以 B
+    // 从没收到东西时 `lines` 也已经有 1 条 —— 而 A 的输出真串进 B 时 B **同样**
+    // 只有 1 条（那一条里装着 A 的文本）。`hasLength(1)` 在两种情况下都绿，
+    // 恰好对这条用例要抓的那种错误视而不见。
+    expect(
+      bufferB.lines.single,
+      isEmpty,
+      reason: 'A 的输出不得串到 B 的缓冲里',
+    );
   });
 
   test('删掉设备时它的会话被拆掉', () async {
