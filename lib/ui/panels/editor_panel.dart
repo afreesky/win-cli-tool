@@ -31,8 +31,21 @@ class EditorPanelState extends ConsumerState<EditorPanel> {
   final ScrollController _gutter = ScrollController();
   final ScrollController _editor = ScrollController();
 
-  late final DraftAutosave _autosave = DraftAutosave(
-    save: (text) => ref.read(draftProvider(widget.deviceId).notifier).save(text),
+  /// 当前设备的草稿 notifier。**攒在字段里，不现 `ref.read`。**
+  ///
+  /// `dispose()` 里那一次 flush（FR-E-04 的退出兜底）发生时元素正在被拆 ——
+  /// 那一刻碰 `ref` 会被 riverpod 判成 unsafe 并抛 `StateError`（实测：面板带着
+  /// 未落盘的防抖被卸载时必现，异常从 `finalizeTree` 里冒出来）。riverpod 给的
+  /// 出路就是这句：把 provider 的状态留在 State 的字段里。
+  ///
+  /// `draftProvider` 不是 autoDispose，notifier 活得比面板长，所以攒下来是安全的。
+  late DraftNotifier _drafts;
+
+  /// 落盘节流。**换设备时整份换新** —— 见 [didUpdateWidget]。
+  late DraftAutosave _autosave = _newAutosave();
+
+  DraftAutosave _newAutosave() => DraftAutosave(
+    save: (text) => _drafts.save(text),
     onError: (_) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -48,6 +61,8 @@ class EditorPanelState extends ConsumerState<EditorPanel> {
   @override
   void initState() {
     super.initState();
+    // **必须在任何人读 `_autosave` 之前**：它的 `save` 闭包用的是 `_drafts`。
+    _drafts = ref.read(draftProvider(widget.deviceId).notifier);
     _text.addListener(_onTextChanged);
     _editor.addListener(_syncGutter);
     _loadDraft();
@@ -57,13 +72,25 @@ class EditorPanelState extends ConsumerState<EditorPanel> {
   void didUpdateWidget(EditorPanel oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.deviceId == widget.deviceId) return;
-    // 换设备：先把上一台的草稿落盘（不能等防抖），再清空载入新的。
+    // 换设备。**下面几步的顺序是承重的** —— 两条走错都会丢数据，都实测过：
+    //
+    // 1. `flush()` 必须在 `_drafts` 还指着**旧**设备时调。否则旧设备那段还没落盘
+    //    的文本会被写进**新设备**的草稿文件（实测：切走那一刻打的字出现在另一台
+    //    的草稿里，而原设备那份是空的）。
+    // 2. 换完落点要换一份**新的** `_autosave`：`dispose()` 之后旧实例永久失效
+    //    （`_disposed = true` 让 `schedule` 直接返回），实测表现为"切过一次设备
+    //    之后草稿再也不会落盘"。新实例的 `_lastSaved` 一并清空 —— 否则新设备的
+    //    第一次编辑若与旧设备末次内容相同，会被判成重复写而跳过。
     _autosave.flush();
     _autosave.dispose();
+    _drafts = ref.read(draftProvider(widget.deviceId).notifier);
+    _autosave = _newAutosave();
+    // **先关 `_seeded` 再清文本**：清空会触发 `_onTextChanged`，它一旦认为"已就绪"
+    // 就会把空串排进落盘队列。
+    _seeded = false;
     _text
       ..sentLines.clear()
       ..text = '';
-    _seeded = false;
     _loadDraft();
   }
 

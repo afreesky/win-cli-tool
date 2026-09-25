@@ -83,6 +83,48 @@ void main() {
     expect(find.text('sys'), findsOneWidget, reason: '切回来草稿还在');
   });
 
+  testWidgets('切设备时草稿落在原设备上，不串到新设备（FR-E-03）', (tester) async {
+    await pumpWindow(tester);
+
+    // **防抖还没到就切走** —— 这一刻压在节流里的那段文本属于 d1。
+    await tester.enterText(find.byType(TextField), 'AAA');
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.tap(find.text('边界防火墙'));
+    await settleDisk(tester);
+
+    expect(File('${root.path}/drafts/d1.txt').readAsStringSync(), 'AAA',
+        reason: '切走那一刻的文本要落到原设备');
+    final d2 = File('${root.path}/drafts/d2.txt');
+    expect(d2.existsSync() ? d2.readAsStringSync() : '', isNot(contains('AAA')),
+        reason: '不能写进新设备的草稿文件');
+  });
+
+  testWidgets('切过一次设备之后草稿仍然会落盘（FR-E-03）', (tester) async {
+    await pumpWindow(tester);
+    await tester.tap(find.text('边界防火墙'));
+    await settleDisk(tester);
+
+    await tester.enterText(find.byType(TextField), 'BBB');
+    await tester.pump(const Duration(milliseconds: 600));
+    await settleDisk(tester);
+
+    expect(File('${root.path}/drafts/d2.txt').readAsStringSync(), 'BBB');
+  });
+
+  testWidgets('带着未落盘的编辑被卸载：不抛，且草稿要写下去（FR-E-04）', (tester) async {
+    await pumpWindow(tester);
+    await tester.enterText(find.byType(TextField), 'last');
+    await tester.pump(const Duration(milliseconds: 100));
+
+    // 把编辑区从树上摘掉。真机上对应两种情形：把设备删光（窗口切到空状态）、
+    // 以及退出时整棵树被拆。
+    await pumpUi(tester, root: root, child: const SizedBox());
+    expect(tester.takeException(), isNull);
+    await settleDisk(tester);
+
+    expect(File('${root.path}/drafts/d1.txt').readAsStringSync(), 'last');
+  });
+
   testWidgets('Ctrl+L 清屏（§4.8）', (tester) async {
     final factory = FakeSessionFactory();
     await pumpWindow(tester, factory: factory);
