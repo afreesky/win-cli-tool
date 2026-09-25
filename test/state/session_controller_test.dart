@@ -213,7 +213,11 @@ void main() {
     //
     // 一次喂 40 行，而且是**同一个 chunk**（于是只触发一次 `_flush`）：写盘必定
     // 失败 ⇒ 回调一次 ⇒ `_failed` 置位，此后本类不再碰磁盘。
-    factory.sessions.single.emit('${'x\n' * 40}');
+    //
+    // 写成 `'x\n' * 40` 而不是 `'${'x\n' * 40}'`：后者那层插值是多出来的
+    // （表达式本来就是 String），分析器判 `unnecessary_string_interpolations`，
+    // 而完成标准 1 要求 `dart analyze` 干净。
+    factory.sessions.single.emit('x\n' * 40);
 
     // 失败要等两个真的 IO 回合（`stat()` → `create()`）。实测：0ms 与 5ms 时还是
     // 0 次，50ms 时是 1 次 —— 所以固定等一个 `Duration.zero` 不够。这里**轮询到

@@ -2,8 +2,13 @@ import 'dart:io';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+// **是 `device_store.dart` 而不是 `load_issue.dart`。** 本文件既要 `LoadIssue` /
+// `LoadIssueKind`，又要 `DuplicateDeviceNameError`（它只定义在 device_store.dart
+// 里），而 device_store.dart **re-export 了** load_issue.dart（它自己 `:10` 那句
+// `export 'load_issue.dart';`）。所以这一条 import 同时给出三样东西；再单独写一行
+// `load_issue.dart` 会被分析器判为 `unnecessary_import` —— 而完成标准 1 要求
+// `dart analyze lib/ test/` 输出 `No issues found!`。
 import 'package:win_cli_tool/data/device_store.dart';
-import 'package:win_cli_tool/data/load_issue.dart';
 import 'package:win_cli_tool/models/app_settings.dart';
 import 'package:win_cli_tool/models/device_profile.dart';
 import 'package:win_cli_tool/state/app_paths.dart';

@@ -1,7 +1,5 @@
 import 'dart:async';
 
-import 'package:win_cli_tool/command/command_dispatcher.dart';
-import 'package:win_cli_tool/connection/connector.dart';
 import 'package:win_cli_tool/connection/known_host.dart';
 import 'package:win_cli_tool/connection/session.dart';
 import 'package:win_cli_tool/connection/session_factory.dart';

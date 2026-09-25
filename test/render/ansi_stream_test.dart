@@ -50,7 +50,7 @@ void main() {
     });
 
     test('留住的长度永不超过 kMaxAnsiHoldBack', () {
-      final long = '\x1b[' + '1' * (kMaxAnsiHoldBack * 3);
+      final long = '\x1b[${'1' * (kMaxAnsiHoldBack * 3)}';
       expect(ansiHoldBackLength(long), lessThanOrEqualTo(kMaxAnsiHoldBack));
     });
   });
