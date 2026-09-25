@@ -2191,6 +2191,11 @@ Expected: **编译失败**（`Target of URI doesn't exist: .../editor_panel.dart
 
 - [ ] **Step 7: 实现编辑区**
 
+**本步的三段片段是同一个文件的三截**（import + 状态类 / `build` / 行号栏与工具栏），
+按顺序拼接：**片段之间留一个空行**，文件末尾是单个 `}\n`（最后一段的类收尾 `}`
+就是文件的最后一行）。实测：片段之间不留空行、或末尾多一个空行，都会让"与计划
+逐字节一致"这条自查对不上（两种都仍能编译，但那条自查就没意义了）。
+
 ```dart
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -2517,6 +2522,9 @@ EOF
 **Files:**
 - Create: `lib/ui/widgets/status_dot.dart`
 - Create: `lib/ui/panels/device_list_panel.dart`
+- Modify: `lib/state/providers.dart`（加 `selectedDeviceProvider`；并让
+  `SessionNotifier.build()` 容忍已删除的设备）
+- Modify: `test/ui/ui_harness.dart`（加 `settleDisk`）
 - Test: `test/ui/device_list_panel_test.dart`
 
 **本任务不含"编辑设备"入口。** 设备编辑对话框属 5b-2，所以右键菜单只有 连接 /
@@ -2528,6 +2536,7 @@ EOF
 ```dart
 import 'dart:io';
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -2630,7 +2639,9 @@ void main() {
     await tester.tap(find.text('删除'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('确认删除'));
-    await tester.pumpAndSettle();
+    // **这里不能用 `pumpAndSettle()`**：删除要写盘，而假时钟里真盘 I/O 走不完
+    // （理由见 `settleDisk` 的文档）—— 表现是"点了确认，设备还在"。
+    await settleDisk(tester);
 
     expect(container.read(devicesProvider).map((d) => d.id), ['d1']);
   });
@@ -2648,17 +2659,23 @@ void main() {
 
     final gesture = await tester.startGesture(from);
     await tester.pump(const Duration(milliseconds: 200));
-    await gesture.moveTo(Offset(from.dx, to.dy + 20));
+    // **落点必须越过第二项的底边。** `to.dy + 20` 落在框架的死区里（`_insertIndex`
+    // 会等于被拖项的原地下标，`onReorderItem` 一次都不调）—— 三种落点的实测见 Step 6。
+    await gesture.moveTo(Offset(from.dx, to.dy + 90));
     await tester.pump(const Duration(milliseconds: 200));
     await gesture.up();
-    await tester.pumpAndSettle();
+    // 排序也要写盘，理由同上面删除那条。
+    await settleDisk(tester);
 
     expect(container.read(devicesProvider).map((d) => d.id), ['d2', 'd1']);
   });
 }
 ```
 
-**`kSecondaryButton` 来自 `package:flutter/gestures.dart`** —— 若分析器报未定义，加那行 import。
+**`kSecondaryButton` 来自 `package:flutter/gestures.dart`** —— 实测这个 SDK 版本里
+`material.dart` 与 `widgets.dart` **都没有** re-export 它（在 `/home/lwliu/flutter/packages/flutter/lib/`
+的两个入口里 grep `package:flutter/gestures.dart` 都空手而归，定义在
+`src/gestures/events.dart`），所以上面那行 import 是**承重的**，别当无用 import 删掉。
 
 **测试里 `tester.tap(find.byTooltip('连接 核心交换机'))` 的 tooltip 名字是约定**：每台设备的按钮 tooltip 必须带上设备名，否则两台设备的按钮在测试里无法区分 —— 而"区分彼此"正是 §9.2 第 4 条要验的东西。
 
@@ -2666,6 +2683,10 @@ void main() {
 
 Run: `flutter test test/ui/device_list_panel_test.dart`
 Expected: **编译失败**（`Target of URI doesn't exist: .../device_list_panel.dart`）。
+
+**此刻 `selectedDeviceProvider` 也还不存在**（它在 Step 4 才加），所以这条红里
+还会带一条 `Undefined name 'selectedDeviceProvider'`；测试里用到的 `settleDisk`
+要到 Step 5 才加进 `ui_harness.dart`，同样会带一条 —— 三条都对，别以为是自己写错了。
 
 - [ ] **Step 3: 实现状态点**
 
@@ -2720,12 +2741,138 @@ class DeviceStatusDot extends StatelessWidget {
 }
 ```
 
-- [ ] **Step 4: 实现设备列表面板**
+- [ ] **Step 4: 加 `selectedDeviceProvider`、修 `SessionNotifier.build()`，并实现设备列表面板**
+
+**这个 provider 原本写在 Task 9 里，现在挪到本任务** —— 第一个用到它的是设备列表，
+而任务是**按顺序执行**的：留在 Task 9，本任务就先编译不过（Task 9 的那一步已改成
+只做核对）。加在 `lib/state/providers.dart` 的**末尾**：
+
+```dart
+/// 当前选中的设备（界面的选择状态）。
+///
+/// **它在状态层而不是某个 widget 的 State 里**：设备列表、编辑区、输出区三处
+/// 都要读它，窗口级的快捷键也要读。
+///
+/// `build()` 用 `read` 取初始值，所以**删掉当前选中的设备之后它不会自动挪走**
+/// —— 处理那件事的是设备列表面板的删除路径（先 select 再 remove）。主窗口另外
+/// 还会挡一道：它只把"确实还在设备列表里"的 id 交给面板（见 `main_window.dart`
+/// 的 `_active`），所以残留的过期选中不会让面板去建一个不存在的会话。
+class SelectedDeviceNotifier extends Notifier<String?> {
+  @override
+  String? build() {
+    final devices = ref.read(devicesProvider);
+    return devices.isEmpty ? null : devices.first.id;
+  }
+
+  void select(String? id) => state = id;
+}
+
+final selectedDeviceProvider =
+    NotifierProvider<SelectedDeviceNotifier, String?>(SelectedDeviceNotifier.new);
+```
+
+**接着修同一个文件里的 `SessionNotifier.build()` —— 这是本任务实测出来的一处真机崩溃，
+不是测试的毛病。** 设备列表里每一行的 `_DeviceTile` 都
+`ref.watch(sessionProvider(device.id))`，而 `DevicesNotifier.remove()` 会
+`ref.invalidate(sessionProvider(id))`；被删的那一行**此刻还在树上**（widget 要到下一帧
+才拆），Riverpod 于是在同一帧的 `_performRefresh` 里重建它 —— `build()` 里那句
+`firstWhere` 找不到设备，抛 `Bad state: No element`。实测：**删掉一台设备，界面直接打红。**
+
+把 `_controller` 改成可空，并在 `build()` 里早返回一个"未连接"的空状态。先是字段与
+`build()` 开头这两处：
+
+```dart
+  /// 设备已被删除时为 null（见 `build()`）。此时本 provider 只剩一个"未连接"的
+  /// 空状态，下面四个方法都退化成空操作 —— 已经没有界面会调它们，但也不能抛。
+  SessionController? _controller;
+
+  @override
+  SessionStatus build() {
+    final settings = ref.read(settingsProvider);
+    final devices = ref.read(devicesProvider);
+    final index = devices.indexWhere((d) => d.id == deviceId);
+    if (index < 0) {
+      // **设备已经不在了（FR-D-04 删除），这里不能抛。**
+      //
+      // `DevicesNotifier.remove()` 会 `invalidate` 本 provider，而设备列表里那一行
+      // 此刻还在 `watch` 它（widget 要到下一帧才拆），于是 Riverpod 当场重建 ——
+      // 原来那句 `firstWhere` 找不到设备，抛 `Bad state: No element`，
+      // **删一台设备就把界面打红**（实测）。设备都没了，会话状态当然是"未连接"。
+      _controller = null;
+      return const SessionStatus();
+    }
+    final profile = devices[index];
+```
+
+**具体是删掉下面这几行、换成上面那一段**（其余不动）：
+
+```dart
+  late final SessionController _controller;
+
+  @override
+  SessionStatus build() {
+    final settings = ref.read(settingsProvider);
+    final profile = ref
+        .read(devicesProvider)
+        .firstWhere((d) => d.id == deviceId);
+```
+
+**还有 `build()` 里造 controller 的那一段** —— 可空字段不会被类型提升，所以要先落进
+一个局部变量、再用它：
+
+```dart
+    final controller = SessionController(
+      profile: profile,
+      factory: ref.read(sessionFactoryProvider),
+      buffer: ref.read(outputBufferProvider(deviceId)),
+      // FR-L-02：设置里给了就用设置里的，否则用应用数据目录下的 logs/
+      // （`logsDirPath` 是 `Provider<String>`，由 `main()` 覆盖）。
+      logsDir: Directory(settings.logDir ?? ref.read(logsDirPath)),
+      logEnabled: settings.logEnabled,
+      onLogError: (error) => ref
+          .read(issuesProvider.notifier)
+          .add(LoadIssue(LoadIssueKind.corruptFile, '日志写入失败：$error')),
+    );
+    _controller = controller;
+    // controller 的状态变化（含从 `ConnectionManager` 来的那些）推给 Riverpod。
+    controller.onStatus = (status) => state = status;
+    ref.onDispose(controller.dispose);
+    return controller.status;
+```
+
+（原来是 `_controller = SessionController(` 打头，末尾三行写的是
+`_controller.onStatus` / `ref.onDispose(_controller.dispose)` / `return _controller.status`。）
+
+再是类末尾那四个方法 —— 都要容忍 `_controller` 为空：
+
+```dart
+  Future<void> connect() async {
+    await _controller?.connect();
+  }
+
+  Future<void> disconnect() async {
+    final controller = _controller;
+    if (controller == null) return;
+    await controller.disconnect();
+    state = controller.status;
+  }
+
+  /// 把命令排进该设备的队列（FR-E-01）。队列在后台继续跑，切设备不影响它。
+  void enqueue(List<String> commands) => _controller?.enqueue(commands);
+
+  /// 中止队列（FR-E-13 / Esc）。
+  void abort() => _controller?.abort();
+```
+
+然后是面板本身：
 
 ```dart
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+// **`DeviceConnectionState` 只能从这里来**：Dart 的 import **不传递**，
+// `providers.dart` 虽然 import 了它，却不会转手导出给本文件。
+import '../../connection/connection_manager.dart';
 import '../../models/device_profile.dart';
 import '../../state/providers.dart';
 import '../widgets/status_dot.dart';
@@ -2754,11 +2901,14 @@ class DeviceListPanel extends ConsumerWidget {
 
     return ReorderableListView.builder(
       itemCount: devices.length,
-      onReorder: (oldIndex, newIndex) {
-        // **`ReorderableListView` 的 `newIndex` 是"插入到删除之前的哪个位置"**，
-        // 所以往后拖时要减一。少了这一步的表现是"往下拖一格没反应、拖两格只
-        // 动一格"。
-        if (newIndex > oldIndex) newIndex -= 1;
+      // **`onReorderItem` 的 `newIndex` 已经是"移除之后该插到哪个下标"** ——
+      // 框架替你调好了（SDK 文档原话："remove the manual adjustment of newIndex"）。
+      // 旧的 `onReorder` 才要求自己 `if (newIndex > oldIndex) newIndex -= 1;`，
+      // 而它在这版 SDK（3.44.4）里**已废弃**（"after v3.41.0-0.0.pre"），
+      // `deprecated_member_use` 又只是条 info —— 正好会打掉"`dart analyze` 干净"
+      // 这条验收项，所以必须换。**换了之后别把那个 `-= 1` 一起搬过来**：
+      // 再减一次的表现是"往下拖一格没反应、拖两格只动一格"。
+      onReorderItem: (oldIndex, newIndex) {
         final ids = devices.map((d) => d.id).toList();
         final moved = ids.removeAt(oldIndex);
         ids.insert(newIndex, moved);
@@ -2857,7 +3007,11 @@ class _DeviceTile extends ConsumerWidget {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('确认删除'),
+        // **标题不能也叫"确认删除"。** 用例既断言 `find.textContaining('确认删除')`
+        // 只有一个、又用 `find.text('确认删除')` 去点按钮：两处字符串一样的话，
+        // 两者都会匹配到 2 个 widget（标题那个 Text + 按钮里的那个 Text），
+        // `findsOneWidget` 与 `tap` 会双双失败。这条是实测出来的，别"顺手统一"。
+        title: const Text('删除设备'),
         content: Text('删除「${device.name}」？它的命令库与草稿会一并删除，此操作不可撤销。'),
         actions: [
           TextButton(
@@ -2892,28 +3046,95 @@ class _DeviceTile extends ConsumerWidget {
 
 **`sessionProvider` 的订阅会不会建出一个不该建的会话？** 会 —— `ref.watch(sessionProvider(device.id))` 会给**每一台**设备建一个 controller。那是设计如此：`ConnectionManager` 在没有 `connect()` 时不开任何连接，而列表需要每台设备的状态点。**它不会自动连**（`autoConnect` 的扫描只在启动时跑一次，见 `connectAutoConnectDevices`）。
 
-- [ ] **Step 5: 跑测试确认绿**
+- [ ] **Step 5: 给 `ui_harness.dart` 加 `settleDisk`**
+
+**这是本任务实测出来的第二件事：在 `testWidgets` 里，真盘 I/O 不会自己走完。**
+
+`testWidgets` 的整段测试体跑在假时钟（`FakeAsync`）里：`pump()` 只 flush 微任务队列、
+**不转真实事件循环**（`AutomatedTestWidgetsFlutterBinding.pump` 里就是
+`_currentFakeAsync!.flushMicrotasks()`），而 `dart:io` 的每一步都要一次真实事件循环的轮转
+才会推进。`DeviceStore.save()` 内部至少是 `create(recursive: true)` + `writeAsString()`
+两步，于是两条路都停在半路：
+
+- 只 `pumpAndSettle()`：写完第一步就停住 —— 表现为"**点了确认删除，设备还在**"；
+- 只 `runAsync(() => Future.delayed(...))`：转了一次真实事件循环，但假队列里排下的续体
+  没人 flush —— 同样停住（实测：`save()` 之后连文件都没建出来）。
+
+**两者交替**才走得完。在 `test/ui/ui_harness.dart` 的**末尾**加：
+
+```dart
+/// 让**真盘 I/O** 走完：转一圈真实事件循环，再 flush 一次假时钟的微任务队列，交替若干轮。
+///
+/// **为什么不能只用其中一个**（实测）：`pump()` 只 flush 微任务、不转真实事件循环；
+/// `runAsync(delay)` 只转一次真实事件循环。而 `dart:io` 的每一步都要一次真实的轮转才
+/// 推进，`DeviceStore.save()` 至少是 `create(recursive: true)` + `writeAsString()` 两步
+/// —— 只做其中之一就停在半路，表现为"点了确认删除，设备还在"。
+///
+/// 凡是用例要观察**写盘之后**的状态（删除、拖拽排序、改设置），都用它代替
+/// `pumpAndSettle()`。
+Future<void> settleDisk(WidgetTester tester, {int rounds = 12}) async {
+  for (var i = 0; i < rounds; i++) {
+    await tester.pump(const Duration(milliseconds: 16));
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 5)),
+    );
+  }
+  await tester.pumpAndSettle();
+}
+```
+
+- [ ] **Step 6: 跑测试确认绿**
 
 Run: `flutter test test/ui/device_list_panel_test.dart`
 Expected: 5 条全绿。
 
-**若拖拽那条红了**：先确认 `kSecondaryButton` 的 import 在不在，再看 `moveTo` 的落点是否越过了第二项的**中线** —— `ReorderableListView` 按中线决定插入位置，拖到刚过一点是不够的。按 `to.dy + 20` 仍不过中线时把它调大，但**要在报告里说明调整了什么、为什么**。
+**拖拽那条的落点是实测出来的，别按直觉改。** `ReorderableListView` 判定插入位置用的是
+**被拖那一项的矩形**（`_dragUpdateItems`：`proxyItemStart = 指针 y − 抓取点偏移`），
+看它与第二项的重叠关系 —— **不是"指针过没过中线"**。两行各 56 高、抓在第一行正中
+（偏移 28）时，指针 y 与结果的关系是：
 
-- [ ] **Step 6: 提交**
+| 指针 y | 结果 |
+|---|---|
+| 84–112（第二项**下半**） | `_insertIndex = 1`，去掉被拖项后正好等于原地 → **`onReorderItem` 一次都不调** |
+| 56–84（第二项**上半**） | `_insertIndex = 2` → 真的下移一格 |
+| > 140（越过第二项底边再加 28） | `_insertIndex = 2` → 真的下移一格 |
+
+`to.dy + 20` = 104 正落在**死区**里（`to.dy` 是第二项文字的中心，= 84）。三种落点都实测过：
+`to.dy - 10` ✓、`to.dy + 90` ✓、`to.dy + 20` ✗。所以计划里写的是 `to.dy + 90`。
+
+**若还是红**：先确认 `kSecondaryButton` 的 import 在不在（`material.dart` 与 `widgets.dart`
+都不 re-export `package:flutter/gestures.dart`）；再确认 `find.byIcon(Icons.drag_handle).first`
+拿到的是面板自己那个把手 —— 测试平台上框架不会插第二个 `Icons.drag_handle`
+（实测：2 项 → `Icons.drag_handle` 2 个、`ReorderableDragStartListener` 2 个）。
+
+- [ ] **Step 7: 提交**
 
 ```bash
-git add lib/ui/widgets/status_dot.dart lib/ui/panels/device_list_panel.dart test/ui/device_list_panel_test.dart
+git add lib/ui/widgets/status_dot.dart lib/ui/panels/device_list_panel.dart lib/state/providers.dart test/ui/ui_harness.dart test/ui/device_list_panel_test.dart
 git commit -m "$(cat <<'EOF'
 feat(ui): 设备列表（状态点 / 连接断开 / 拖拽排序 / 删除）
 
 状态点的颜色与文案由 state 一处决定，不在别处再写第二份 switch —— 两处各写
 一份的下场是加了新状态之后其中一处悄悄落进 default。
 
-ReorderableListView 的 newIndex 是"插入到删除之前的哪个位置"，往后拖要减一；
-少了这一步的表现是"往下拖一格没反应、拖两格只动一格"。
+ReorderableListView 用 onReorderItem 而不是已废弃的 onReorder：旧回调的 newIndex
+要自己减一，新回调由框架调好，再减一次就是"往下拖一格没反应、拖两格只动一格"；
+而 deprecated_member_use 只是条 info，正好会打掉"dart analyze 干净"这条验收。
 
 删除前先挪走选中：顺序反了的话 sessionProvider(已删除的 id) 会先被建一次，
 而 SessionNotifier.build() 要从设备列表 firstWhere，那个 id 已经不在了。
+
+SessionNotifier.build() 改成容忍已删除的设备：DevicesNotifier.remove() 会 invalidate
+它，而被删的那一行此刻还在 watch 它（widget 下一帧才拆），原来的 firstWhere 当场抛
+Bad state: No element —— 删一台设备就把界面打红（实测）。设备都没了，会话状态就是
+"未连接"，四个方法一并退化成空操作。
+
+ui_harness 加 settleDisk：假时钟里 pump() 不转真实事件循环、runAsync 不 flush 假队列，
+而 dart:io 的每一步都要一次真实轮转，save() 至少两步 —— 两者交替才走得完。删除与拖拽
+这两条用例要观察写盘之后的状态，所以不能只 pumpAndSettle()。
+
+选中状态放在状态层（selectedDeviceProvider）而不是某个 widget 的 State 里：
+设备列表、编辑区、输出区与窗口级快捷键四处都要读它。
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>
 EOF
@@ -2932,37 +3153,19 @@ State 类**公开**并各留一个动作方法，供窗口级快捷键调用。
 **Files:**
 - Modify: `lib/ui/panels/editor_panel.dart`（State 类公开 + `send()` 公开）
 - Modify: `lib/ui/panels/output_panel.dart`（State 类公开 + `clearOutput()` 公开）
-- Modify: `lib/state/providers.dart`（加 `selectedDeviceProvider`）
+- Modify: `lib/models/app_settings.dart`（加 `deviceListWidth`）
 - Create: `lib/ui/widgets/splitter.dart`
 - Create: `lib/ui/main_window.dart`
 - Modify: `lib/app.dart`（`home` 换成 `MainWindow`）
 - Test: `test/ui/main_window_test.dart`
 
-- [ ] **Step 1: 在 `providers.dart` 末尾加选中设备**
+- [ ] **Step 1: 核对 `selectedDeviceProvider` 已经在 Task 8 加过（本步不要再添加）**
 
-```dart
-/// 当前选中的设备（界面的选择状态）。
-///
-/// **它在状态层而不是某个 widget 的 State 里**：设备列表、编辑区、输出区三处
-/// 都要读它，窗口级的快捷键也要读。
-///
-/// `build()` 用 `read` 取初始值，所以**删掉当前选中的设备之后它不会自动挪走**
-/// —— 处理那件事的是设备列表面板的删除路径（先 select 再 remove）。主窗口另外
-/// 还会挡一道：它只把"确实还在设备列表里"的 id 交给面板（见 `main_window.dart`
-/// 的 `_active`），所以残留的过期选中不会让面板去建一个不存在的会话。
-class SelectedDeviceNotifier extends Notifier<String?> {
-  @override
-  String? build() {
-    final devices = ref.read(devicesProvider);
-    return devices.isEmpty ? null : devices.first.id;
-  }
-
-  void select(String? id) => state = id;
-}
-
-final selectedDeviceProvider =
-    NotifierProvider<SelectedDeviceNotifier, String?>(SelectedDeviceNotifier.new);
-```
+它**原本写在本步，现在移到了 Task 8 的 Step 4** —— 第一个用到它的是设备列表，
+而任务是按顺序执行的：留在本任务，Task 8 就先编译不过。
+**这一段留着只是给你核对**：打开 `lib/state/providers.dart` 确认末尾有
+`selectedDeviceProvider` 与 `SelectedDeviceNotifier` 即可。**不要重复添加**
+（重复定义会红在 `already_declared`）。定义与理由见 Task 8 Step 4。
 
 - [ ] **Step 2: 把那两个 State 类公开**
 
@@ -3375,6 +3578,11 @@ class _MainWindowState extends ConsumerState<MainWindow> {
 默认值、`copyWith`、`fromJson`（`(json['deviceListWidth'] as num?)?.toDouble() ?? 240`）
 与 `toJson`。**照抄 `editorSplitRatio` 那一套**（它的默认值是 0.4）。
 
+**同时在 `test/models/app_settings_test.dart` 里照 `editorSplitRatio` 的写法补三处**
+（默认值 `240` / round-trip 之后仍是写入的那个值 / 旧 JSON 里没有这个字段时回落
+`240`）—— 否则 Step 10 的 `git add` 里那个路径是个空动作，而这个新字段最容易在
+`fromJson` 上写漏（漏了就是"每次启动列表宽度都弹回默认"）。
+
 - [ ] **Step 7: 把主窗口接进 `app.dart`**
 
 ```dart
@@ -3405,7 +3613,7 @@ Expected: 全绿。
 - [ ] **Step 10: 提交**
 
 ```bash
-git add lib/ui/main_window.dart lib/ui/widgets/splitter.dart lib/ui/panels/editor_panel.dart lib/ui/panels/output_panel.dart lib/state/providers.dart lib/models/app_settings.dart lib/app.dart test/ui/main_window_test.dart test/state/providers_test.dart test/models/app_settings_test.dart
+git add lib/ui/main_window.dart lib/ui/widgets/splitter.dart lib/ui/panels/editor_panel.dart lib/ui/panels/output_panel.dart lib/models/app_settings.dart lib/app.dart test/ui/main_window_test.dart test/models/app_settings_test.dart
 git commit -m "$(cat <<'EOF'
 feat(ui): 主窗口、分隔条与四个快捷键（§4.8 / §7.1）
 
@@ -3871,6 +4079,21 @@ EOF
    能在同一行多次发送时不乱），不是缺陷；真要修得给每次发送留一个内容指纹。
    Task 7 那条高亮用例**只验了"标记落在对的行上"**，没有验这个场景 —— 名字已
    按实测范围改准。
+10. **同一个画面里的多次拖拽会各自从同一个基准算起。** 分隔条的 `onDrag` 用的是
+    `build` 时捕获的 `settings`，而 `SettingsNotifier.update` 是"**写盘成功之后**
+    才改内存状态"（`providers.dart:100`）—— 所以一帧里到达的多个 pointer move
+    都从同一个旧值算起，**只有最后一个的 delta 生效**。真机上一次拖动多半是一
+    move 一帧，影响被摊薄；行为用例只断言"变大了"，验不到。真要修得在分隔条
+    内部累积（`onDragStart` 记基准），而不是每次重算。
+11. **拖动分隔条是"一次 pointer move 写一次 `settings.json`"** —— `update` 里没有
+    防抖，而 `SettingsStore.save` 每次都是原子写（临时文件 + rename）。拖两秒
+    可能写上百次盘。功能上没错（需求没规定频率），但值得在 5b-2 或以后加个短防抖。
+12. **`settleDisk` 的轮数是拍的**（12 轮 × 5ms 真实时间 + 16ms 假时间）。它够用是因为
+    `save()` 的 I/O 链就两三步；**哪天 `DeviceStore` 的写入步数变多，这个数字就可能
+    不够**，表现是用例偶发红在"状态没变"—— 而那个现象看着像断言写错了（Task 8 第 2 条
+    就是这么骗了一次）。真要收紧，正确做法不是把轮数继续加大，而是给 store 开一个
+    测试用的完成钩子（或在 `pumpUi` 里换成内存 store）。**在有人加轮数之前，先看一眼
+    这条。**
 
 ---
 
@@ -3930,3 +4153,46 @@ Ctrl+N 的 SnackBar，已在 Task 9 与未决项第 2 条两处写明。
 5. **Step 5 的 import 块里两处 `unused_import`**（`flutter_riverpod` 与
    `state/providers.dart`：两者都由 `ui_harness.dart` 代劳）已删 —— 它们会让
    "`dart analyze lib/ test/` 干净"这条验收项挂掉。
+
+**实现期在 Task 8 又抓到六处，其中第 1 条是**真机缺陷**（删一台设备就把界面打红，
+不是测试的毛病）** —— 1–3 是照计划的代码实测 `flutter test test/ui/device_list_panel_test.dart`
+时红的，4–6 是**派发前**照计划把代码摆出来跑的时候抓到的。改完实测：该用例文件
+**5/5 绿**、全仓 `flutter test` = **501 条全绿**、`dart analyze lib/ test/` = `No issues found!`。
+
+1. **删设备时 `SessionNotifier.build()` 抛 `Bad state: No element`（真机缺陷）**：
+   设备列表里每一行都 `ref.watch(sessionProvider(device.id))`，而
+   `DevicesNotifier.remove()` 会 `ref.invalidate(sessionProvider(id))` —— 被删的
+   那一行**要到下一帧才拆**，Riverpod 于是在同一帧的 `_performRefresh` 里重建它，
+   原来那句 `firstWhere` 找不到设备就抛。**计划里原本没有这一处改动**，是删除那条
+   用例红出来的。已给 `SessionNotifier` 补"设备已删 → 返回空状态"的早返回，
+   `_controller` 改成可空、四个方法一并容忍（Step 4）。注意 `build()` 里造 controller
+   的那一段也得跟着改（可空字段不会被类型提升），所以是**三处**替换、不是一个。
+2. **"`pumpAndSettle()` 之后状态没变"不是断言写错了，是假时钟里真盘 I/O 走不完**：
+   `DeviceStore.save()` 至少是 `create(recursive: true)` + `writeAsString()` 两步，
+   而 `pump()` 只 flush 微任务、**不转真实事件循环**；`runAsync(delay)` 只转一次真实
+   轮转、**不 flush 假队列**。两条路都实测过：`save()` 之后连文件都没建出来
+   （`existsSync()` 是 false）。所以新增 `settleDisk()`（两者交替若干轮，Step 5），
+   删除与拖拽两条用例改用它。
+   **这两条用例的名字仍然站得住**：`_save` 是先落盘、成功了才改内存状态
+   （`await ...save(next); state = next;`），所以"状态变了"就蕴含"盘写成了"——
+   断言内存状态并不比断言文件内容弱。
+3. **拖拽那条的落点原本落在框架的死区里**：计划原写 `to.dy + 20`（= 104）。框架判
+   插入位置看的是**被拖那一项的矩形**与第二项的重叠关系（`_dragUpdateItems`），
+   指针落在第二项**下半**（84–112）时 `_insertIndex` 等于被拖项的原地下标，
+   去掉被拖项后正好是原地 —— **`onReorderItem` 一次都不调**。三种落点都实测过：
+   `to.dy - 10` ✓、`to.dy + 90` ✓、`to.dy + 20` ✗。已改成 `to.dy + 90`，并把原先
+   那句"`ReorderableListView` 按中线决定插入位置"（**错的**）换成了实测表格。
+4. **`onReorder` 在这版 SDK 已废弃，且 `newIndex` 的语义跟着变了**：
+   `deprecated_member_use` 只是条 info，正好打掉"`dart analyze` 干净"这条验收；
+   换成 `onReorderItem` 的同时**必须删掉** `if (newIndex > oldIndex) newIndex -= 1;`
+   —— 框架已经替你调好了（SDK 原话："remove the manual adjustment of newIndex"），
+   再减一次的表现是"往下拖一格没反应、拖两格只动一格"，而拖拽用例的
+   `['d2', 'd1']` 会永远不成立。
+5. **删除确认对话框的标题不能也叫"确认删除"**：用例既用
+   `find.textContaining('确认删除')` 断言只有一个、又用 `find.text('确认删除')` 去点
+   按钮 —— 两处字符串一样的话，标题那个 `Text` 与按钮里那个 `Text` 会被双双匹配到，
+   `findsOneWidget` 与 `tap` 一起失败。已把标题改成 `删除设备`，并在代码里写明了
+   别"顺手统一"。
+6. **`selectedDeviceProvider` 原本定义在 Task 9，却第一个被 Task 8 用到**：任务按顺序
+   执行，照原计划 Task 8 连编译都过不去（`Undefined name 'selectedDeviceProvider'`）。
+   已把那个块**整体挪到 Task 8 Step 4**，Task 9 的那一步改成只做核对（"本步不要再添加"）。
