@@ -911,8 +911,10 @@ List<int> linesToSend(String text, TextSelection selection) {
 
   final lines = text.split('\n');
 
-  // 每一行的起始字符偏移。长度是 lines.length + 1，最后一项是文本总长，
-  // 用来把"行号"换算回字符区间。
+  // 每一行的起始字符偏移，长度 lines.length + 1。最后一项**恒为文本总长 + 1**
+  // （最后一行并不真的有换行符，这一项却按有算了），而 `lineOf` 的搜索上界是
+  // `lines.length - 1`，所以**它从不被读到**。留着只是让 `starts` 对每一行的
+  // 起点都有定义 —— 别把它当成"文本总长"用。
   final starts = <int>[];
   var offset = 0;
   for (final line in lines) {
@@ -959,8 +961,6 @@ List<int> linesToSend(String text, TextSelection selection) {
 ```
 
 **为什么 `trim()` 顺带处理了 CRLF**：`trim()` 去的是首尾**空白**，而 `\r` 正是空白字符之一，所以 `'quit\r'` 会被修成 `'quit'`。这就是 CRLF 那条用例不需要额外分支的原因。
-
-**为什么 `line.trim()` 能顺带处理 CRLF**：`trim()` 去的是首尾**空白**，而 `\r` 正是空白字符之一，所以 `'quit\r'` 会被修成 `'quit'`。这就是 CRLF 那条用例不需要额外分支的原因。
 
 - [ ] **Step 4: 跑测试确认绿**
 
