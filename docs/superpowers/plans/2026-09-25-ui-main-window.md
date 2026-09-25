@@ -53,7 +53,7 @@ lib/ui/
   draft_autosave.dart           草稿防抖落盘 + 退出兜底（FR-E-03/04）
 ```
 
-**改动既有文件**：`lib/state/output_buffer.dart`（加变更通知）、`lib/app.dart`（`home` 换成 `MainWindow`）、`pubspec.yaml`（若 golden 需要）。
+**改动既有文件**：`lib/state/output_buffer.dart`（加变更通知）、`lib/app.dart`（`home` 换成 `MainWindow`）、`test/fixtures/fake_session.dart`（`fakeProfile` 加 `host` / `port`，只为让三台设备在 golden 里彼此可辨）、`pubspec.yaml`（若 golden 需要 —— 实测**不需要**，`FontLoader` 来自 `flutter/services`）。
 
 **测试**：
 
@@ -69,7 +69,7 @@ test/ui/
   main_window_test.dart         widget 测试（§9.2 第 2、3 条）
   golden/                       产出的 PNG（Task 10）
   golden_harness.dart           golden 夹具（字体 / 窗口尺寸 / 主题）
-  main_window_golden_test.dart  带 `@Tags(['golden'])`
+  main_window_golden_test.dart  golden 用例（开关是 `WCT_GOLDEN`，**不用标签**）
 ```
 
 ---
@@ -3811,6 +3811,215 @@ EOF
 
 ---
 
+## Task 9b: 草稿的生命周期 —— Task 10 炸出来的三条实测缺陷
+
+**为什么插在这里**：Task 10 的第三条 golden 用例会在同一个 `testWidgets` 里换三次树 ——
+第二次装的是编辑区，第三次换掉它。那一次卸载拆的是一块**带着未落盘草稿**的编辑区，
+于是已提交的代码当场红在：
+
+```
+Bad state: Using "ref" when a widget is about to or has been unmounted is unsafe.
+  #2 EditorPanelState._autosave.<anonymous closure> (editor_panel.dart:35)
+  #3 DraftAutosave._write (draft_autosave.dart:71)
+  #5 EditorPanelState.dispose (editor_panel.dart:73)
+```
+
+顺着这条异常量下去，同一条生命周期里还有两处**静默丢数据**。三条都在 FR-E-03 / FR-E-04
+的正面，所以先修它们，再拍 golden。
+
+**实测记录**（探针：起主窗口 → 在 d1 上打 `AAA` → **在防抖内**切到 d2 → 再打 `BBB`）：
+
+| 现象 | 未修时的实测 |
+| --- | --- |
+| 切走那一刻的文本落在哪 | `drafts/d1.txt` **不存在**；`drafts/d2.txt` 是 `AAA` |
+| 切过设备之后还存不存 | 在 d2 打完并等过防抖，`drafts/d2.txt` 仍是 `AAA` |
+| 卸载时的退出兜底 | 抛 `StateError`，草稿根本没写下去 |
+
+三条的根因各不同，但都在同一段代码里，一起修：
+
+1. **`ref` 在 `dispose()` 里不能用。** 退出兜底那次 flush 发生在元素正被拆的时候，
+   riverpod 直接抛（它给的出路就是本步的做法：把 provider 的状态攒进 State 的字段）。
+   后果是 FR-E-04 的"退出时落盘"**一次都没生效过**，只是平时看不出 —— 防抖（500ms）
+   已经把绝大多数编辑写下去了。
+2. **`DraftAutosave.dispose()` 之后旧实例永久失效**（`_disposed = true` 让 `schedule`
+   直接返回），而 `didUpdateWidget` 里正好把它 `dispose()` 了 —— 于是**切过一次设备
+   之后，草稿再也不会落盘**。丢弃的是用户以为已经存好的东西。
+3. **`flush()` 在 `widget` 已经换成新设备之后才调**，落点自然是新设备 —— 旧设备那段
+   还没到点的文本被写进了**另一台**的草稿文件，而原设备那份是空的。同一处还有半个
+   问题：`_lastSaved` 不清，新设备的第一次编辑若与旧设备末次内容相同会被判成"重复写"
+   而跳过。
+
+**Files:**
+- Modify: `lib/ui/panels/editor_panel.dart`（notifier 攒进字段；换设备时换一份新的 autosave；三步的顺序）
+- Modify: `test/ui/main_window_test.dart`（三条用例，插在"切换设备时草稿跟着换"之后）
+
+- [ ] **Step 1: 写三条失败测试**
+
+在 `test/ui/main_window_test.dart` 里，**紧接在** `切换设备时草稿跟着换（FR-E-03）` 那条
+之后插入：
+
+```dart
+  testWidgets('切设备时草稿落在原设备上，不串到新设备（FR-E-03）', (tester) async {
+    await pumpWindow(tester);
+
+    // **防抖还没到就切走** —— 这一刻压在节流里的那段文本属于 d1。
+    await tester.enterText(find.byType(TextField), 'AAA');
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.tap(find.text('边界防火墙'));
+    await settleDisk(tester);
+
+    expect(File('${root.path}/drafts/d1.txt').readAsStringSync(), 'AAA',
+        reason: '切走那一刻的文本要落到原设备');
+    final d2 = File('${root.path}/drafts/d2.txt');
+    expect(d2.existsSync() ? d2.readAsStringSync() : '', isNot(contains('AAA')),
+        reason: '不能写进新设备的草稿文件');
+  });
+
+  testWidgets('切过一次设备之后草稿仍然会落盘（FR-E-03）', (tester) async {
+    await pumpWindow(tester);
+    await tester.tap(find.text('边界防火墙'));
+    await settleDisk(tester);
+
+    await tester.enterText(find.byType(TextField), 'BBB');
+    await tester.pump(const Duration(milliseconds: 600));
+    await settleDisk(tester);
+
+    expect(File('${root.path}/drafts/d2.txt').readAsStringSync(), 'BBB');
+  });
+
+  testWidgets('带着未落盘的编辑被卸载：不抛，且草稿要写下去（FR-E-04）', (tester) async {
+    await pumpWindow(tester);
+    await tester.enterText(find.byType(TextField), 'last');
+    await tester.pump(const Duration(milliseconds: 100));
+
+    // 把编辑区从树上摘掉。真机上对应两种情形：把设备删光（窗口切到空状态）、
+    // 以及退出时整棵树被拆。
+    await pumpUi(tester, root: root, child: const SizedBox());
+    expect(tester.takeException(), isNull);
+    await settleDisk(tester);
+
+    expect(File('${root.path}/drafts/d1.txt').readAsStringSync(), 'last');
+  });
+```
+
+- [ ] **Step 2: 跑测试确认红**
+
+Run: `flutter test test/ui/main_window_test.dart`
+Expected: 这三条 `[E]`（实测 `+3 -3`，另外两条也会连带红）。**红的是用例名，不是文件路径。**
+
+- [ ] **Step 3: 修 `editor_panel.dart`**
+
+把 `EditorPanelState` 里从草稿 notifier 起的这一段换成：
+
+```dart
+  /// 当前设备的草稿 notifier。**攒在字段里，不现 `ref.read`。**
+  ///
+  /// `dispose()` 里那一次 flush（FR-E-04 的退出兜底）发生时元素正在被拆 ——
+  /// 那一刻碰 `ref` 会被 riverpod 判成 unsafe 并抛 `StateError`（实测：面板带着
+  /// 未落盘的防抖被卸载时必现，异常从 `finalizeTree` 里冒出来）。riverpod 给的
+  /// 出路就是这句：把 provider 的状态留在 State 的字段里。
+  ///
+  /// `draftProvider` 不是 autoDispose，notifier 活得比面板长，所以攒下来是安全的。
+  late DraftNotifier _drafts;
+
+  /// 落盘节流。**换设备时整份换新** —— 见 [didUpdateWidget]。
+  late DraftAutosave _autosave = _newAutosave();
+
+  DraftAutosave _newAutosave() => DraftAutosave(
+    save: (text) => _drafts.save(text),
+    onError: (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('草稿未能保存')),
+      );
+    },
+  );
+
+  /// 草稿是否已经灌进控制器。**每换一台设备要重置** —— 否则切到 B 设备后，
+  /// A 的文本会一直留在编辑区里。
+  bool _seeded = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // **必须在任何人读 `_autosave` 之前**：它的 `save` 闭包用的是 `_drafts`。
+    _drafts = ref.read(draftProvider(widget.deviceId).notifier);
+    _text.addListener(_onTextChanged);
+    _editor.addListener(_syncGutter);
+    _loadDraft();
+  }
+
+  @override
+  void didUpdateWidget(EditorPanel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.deviceId == widget.deviceId) return;
+    // 换设备。**下面几步的顺序是承重的** —— 两条走错都会丢数据，都实测过：
+    //
+    // 1. `flush()` 必须在 `_drafts` 还指着**旧**设备时调。否则旧设备那段还没落盘
+    //    的文本会被写进**新设备**的草稿文件（实测：切走那一刻打的字出现在另一台
+    //    的草稿里，而原设备那份是空的）。
+    // 2. 换完落点要换一份**新的** `_autosave`：`dispose()` 之后旧实例永久失效
+    //    （`_disposed = true` 让 `schedule` 直接返回），实测表现为"切过一次设备
+    //    之后草稿再也不会落盘"。新实例的 `_lastSaved` 一并清空 —— 否则新设备的
+    //    第一次编辑若与旧设备末次内容相同，会被判成重复写而跳过。
+    _autosave.flush();
+    _autosave.dispose();
+    _drafts = ref.read(draftProvider(widget.deviceId).notifier);
+    _autosave = _newAutosave();
+    // **先关 `_seeded` 再清文本**：清空会触发 `_onTextChanged`，它一旦认为"已就绪"
+    // 就会把空串排进落盘队列。
+    _seeded = false;
+    _text
+      ..sentLines.clear()
+      ..text = '';
+    _loadDraft();
+  }
+```
+
+**三处改动各自承重，改动顺序也承重**（注释里逐条写了理由）：`flush()` 必须在 `_drafts`
+还指着旧设备时调；换完落点必须换一份**新的** `_autosave`（旧的已经永久失效）；清空文本
+之前先把 `_seeded` 关掉，否则空串会被排进落盘队列。
+
+- [ ] **Step 4: 跑测试确认绿**
+
+Run: `flutter test test/ui/main_window_test.dart`
+Expected: 9 条全绿。
+
+- [ ] **Step 5: 跑全仓与静态检查**
+
+Run: `flutter test` → Expected: `+510`（Task 9 的 507 + 这 3 条），**没有任何 golden 参与**。
+Run: `dart analyze lib/ test/` → Expected: `No issues found!`
+
+- [ ] **Step 6: 提交**
+
+```bash
+git add lib/ui/panels/editor_panel.dart test/ui/main_window_test.dart
+git commit -m "$(cat <<'EOF'
+fix(ui): 草稿生命周期的三条实测缺陷（FR-E-03 / FR-E-04）
+
+Task 10 的 golden 在同一个用例里换树三次，第三次卸载了一块带着未落盘草稿的编辑区，
+当场炸出 riverpod 的 "Using ref when a widget is about to or has been unmounted is
+unsafe"。顺着量下去，同一条生命周期里还有两处静默丢数据，都在 FR-E-03 / FR-E-04
+的正面：
+
+1. dispose() 里的退出兜底用 ref，必抛 —— FR-E-04 的"退出时落盘"一次都没生效过。
+   改为把 notifier 攒进 State 的字段（riverpod 异常信息自己给的出路）。
+2. didUpdateWidget 里 dispose() 了 autosave，而它一旦 dispose 就永久失效 ——
+   切过一次设备之后草稿再也不会落盘。
+3. flush() 在 widget 已经换成新设备之后才调 —— 旧设备没到点的文本写进了新设备的
+   草稿文件，原设备那份是空的。同时换一份新的 autosave 清掉 _lastSaved，否则新
+   设备的第一次编辑会因"与旧设备末次内容相同"被判成重复写而跳过。
+
+探针实测（d1 打字 → 防抖内切到 d2 → 再打字）：d1.txt 不存在 / d2.txt = AAA /
+之后再打字不落盘。修完三条用例全绿。
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+EOF
+)"
+```
+
+---
+
 ## Task 10: golden 截图
 
 **为什么做**：用户看不到界面 —— 这台机器 `DISPLAY` 是空的、Xvfb 没装，GUI 起不来。
@@ -3820,21 +4029,68 @@ golden PNG 是**唯一**能让用户看到"界面长什么样"的东西（2026-0
 界面改样子时要重新生成。所以它们**默认不跑**（见下面的开关），不会让 `flutter test`
 在别的机器上变红。
 
+**下面两个文件是跑过的版本**（`WCT_GOLDEN=1 flutter test test/ui/main_window_golden_test.dart
+--update-goldens` → 3 条通过、5 个 PNG；不带 `--update-goldens` 再跑一遍仍然 3 条通过，
+即 golden 在本机是稳定的）。原稿有六处错，都在本步改掉了，**照着写，不要"修回去"**：
+
+| 原稿 | 为什么不对 |
+| --- | --- |
+| 算了 `skip` 却从没传给 `testWidgets` | 分析器报 `unused_local_variable`，而且 golden **默认就会跑** —— 正好是这段文档说要避免的事 |
+| `@Tags(['golden'])` | 每次默认跑都吐一行 `Warning: A tag was used that wasn't specified in dart_test.yaml`；开关本来就是 `WCT_GOLDEN`，标签只带来噪音 |
+| 只注册了主题字体 | 编辑区/输出区的正文写死了 `fontFamily: 'monospace'`，图标族名是 `MaterialIcons` —— 两个族不注册就是**满屏方框**（实测：输出区整片黑块，一个字都读不出来） |
+| `seedOutput` 里写死 `find.byType(MainWindow)` | 面板那一条里根本没有 `MainWindow` |
+| 编辑区 golden 直接 `enterText` | 草稿那次读还没回来（`settleDisk`），`_seeded` 是 false，`_onTextChanged` 不 `setState` —— 行号栏停在"1"，而编辑区里是五行字 |
+| `git add` 里漏了 `test/fixtures/fake_session.dart` | `fakeProfile` 本任务要加 `host`/`port`，漏了它这条路径就是空动作，且下一次提交会把它扫进去 |
+
 **Files:**
 - Create: `test/ui/golden_harness.dart`
 - Create: `test/ui/main_window_golden_test.dart`
 - Create: `test/ui/golden/*.png`（生成物，**要提交**）
-- Modify: `test/ui/ui_harness.dart`（`pumpUi` 加 `theme` 与 `debugShowCheckedModeBanner`）
+- Modify: `test/fixtures/fake_session.dart`（`fakeProfile` 加 `host` / `port`）
 
-- [ ] **Step 1: 探针测过的三件事，写代码时必须照做**
+**`test/ui/ui_harness.dart` 只被 import，不修改** —— 它的 `pumpUi` 套了 `Scaffold`、
+也没法关 debug 横幅，所以 golden 另起一个同源的夹具。
+
+- [ ] **Step 1: 探针测过的五件事，写代码时必须照做**
 
 | 结论 | 做法 |
 | --- | --- |
 | `FontLoader` 能加载 `.ttc` 字体集合，中文真渲染 | 加载 `NotoSansCJK-Regular.ttc`，family 名叫 `Noto Sans CJK SC` |
 | **不指定 `fontFamily` 的文字渲染成豆腐块** | golden 的主题必须显式设 `fontFamily` |
+| **引擎每个族只认一个字体面**，缺字形时只往下一个族找，不会在同一个族里翻第二个字体 | 给 `monospace` 挂 DejaVu（ASCII 等宽），再把 `DejaVu Sans Mono` **这个名字**指向一个有汉字的等宽字体（文泉驿微米黑）；这就是真机上 fontconfig 干的事 |
+| 图标族 `MaterialIcons` 要自己注册 | 从 `$FLUTTER_ROOT/bin/cache/artifacts/material_fonts/` 取，SDK 位置由 `FLUTTER_ROOT` 或进程可执行文件倒推 |
 | 默认画布 800×600 @DPR 3.0，且 `MaterialApp` 带 debug 横幅 | 显式设 `physicalSize` + `devicePixelRatio: 1.0`，并 `debugShowCheckedModeBanner: false` |
 
-- [ ] **Step 2: 写 golden 夹具**
+- [ ] **Step 2: 给夹具加 `host` / `port`**
+
+三台设备在 golden 里要彼此可辨：都写 `10.0.0.1:22` 的截图看不出列表在渲染什么。
+把 `test/fixtures/fake_session.dart` 末尾那个 `fakeProfile` 换成：
+
+```dart
+/// 一台测试设备。默认 `postLoginCommands` 为空 —— 状态层测试不关心 FR-C-08，
+/// 让它空着才不会把"自动下发的命令"混进 `written` 的断言里。
+DeviceProfile fakeProfile({
+  String id = 'd1',
+  String name = '核心交换机',
+  String host = '10.0.0.1',
+  int port = 22,
+  bool autoConnect = false,
+  List<String> postLogin = const [],
+}) => DeviceProfile(
+  id: id,
+  name: name,
+  protocol: DeviceProtocol.ssh,
+  host: host,
+  port: port,
+  username: 'admin',
+  postLoginCommands: postLogin,
+  autoConnect: autoConnect,
+);
+```
+
+**只改夹具，不改产品代码。**
+
+- [ ] **Step 3: 写 golden 夹具**
 
 ```dart
 import 'dart:io';
@@ -3855,13 +4111,23 @@ import '../fixtures/fake_session.dart';
 bool get goldensEnabled => Platform.environment['WCT_GOLDEN'] == '1';
 
 const _cjkFamily = 'Noto Sans CJK SC';
-const _monoFamily = 'DejaVu Sans Mono';
 
 /// 把中文字体与等宽字体装进测试进程。
 ///
 /// **字体族名必须与 [goldenTheme] 里写的 `fontFamily` 逐字相同** —— 实测过：
 /// 不指定 `fontFamily` 的文字会渲染成豆腐块（一排方框），而不是回退到某个能
 /// 显示中文的字体。
+///
+/// 除了主题那一个族，还要补**两处产品代码里写死的族名**，否则 golden 里它们的
+/// 字全是方框。两条都是实测出来的：
+///
+/// 1. 编辑区与输出区的正文写着 `fontFamily: 'monospace'` +
+///    `fontFamilyFallback: ['DejaVu Sans Mono']`，而测试进程里没有 fontconfig：
+///    'monospace' 谁也不认识，引擎就退回测试自带的那个"每个字都是一个实心方框"
+///    的字体。症状与"中文是豆腐块"不同 —— 这个是**连 ASCII 都是黑块**，输出区
+///    整片读不出来。
+/// 2. `IconData` 的族名是 `MaterialIcons`，SDK 里那个 otf 不注册的话，所有
+///    IconButton 都画成空心方框（工具栏、列表每行的两个按钮、清屏按钮）。
 Future<void> loadTestFonts() async {
   Future<void> load(String family, String path) async {
     final file = File(path);
@@ -3872,8 +4138,58 @@ Future<void> loadTestFonts() async {
   }
 
   // NotoSansCJK-Regular.ttc 是一个**字体集合**，`FontLoader` 收得下（实测）。
-  await load(_cjkFamily, '/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc');
-  await load(_monoFamily, '/usr/share/fonts/dejavu/DejaVuSansMono.ttf');
+  await load(_cjkFamily, _cjkFontPath);
+  await load('monospace', _dejavuMonoPath);
+
+  // **回退族名要指向一个真有汉字的字体。**
+  //
+  // 实测结论（探针：四行同样的 `display version 中文 42`）：**引擎每个族只认一个
+  // 字体面，缺字形时只往下一个族找，不会在同一个族里翻第二个字体**。所以给
+  // 'monospace' 同时挂 DejaVu 与 Noto 是没用的 —— 汉字照样是方框；而把
+  // `DejaVu Sans Mono` 这个名字指向一个"有汉字的等宽字体"，汉字就出来了，
+  // ASCII 仍由 'monospace' 那份 DejaVu 出（等宽，表格对齐不变）。
+  //
+  // 拿文泉驿微米黑顶这个名字：它本身就是**等宽**的中文字体，而且它是产品代码里
+  // 唯一声明过的回退族名。真实机器上这一步是 fontconfig 干的（'monospace' 解到
+  // DejaVu、汉字由系统的中文回退补上），测试进程里没有 fontconfig，只能这样
+  // 手工复现。**产品代码一个字都不用改** —— golden 不该为了自己好看去动它。
+  await load('DejaVu Sans Mono', _wqyMonoPath);
+
+  final iconFont = _materialIconsPath();
+  if (iconFont != null) await load('MaterialIcons', iconFont);
+}
+
+const _cjkFontPath = '/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc';
+const _dejavuMonoPath = '/usr/share/fonts/dejavu/DejaVuSansMono.ttf';
+const _wqyMonoPath = '/usr/share/fonts/wqy-microhei/wqy-microhei.ttc';
+
+/// SDK 里的 `MaterialIcons-Regular.otf`。
+///
+/// 它不在系统字体目录里，而在 `$FLUTTER_ROOT/bin/cache/artifacts/material_fonts/`。
+/// 先看环境变量，再从**当前进程的可执行文件**倒推 —— `flutter test` 就是拿
+/// `$FLUTTER_ROOT/bin/cache/dart-sdk/bin/dart` 跑测试的，往上四层就是 SDK 根。
+/// 两条都落空就返回 null（图标变方框，但不失败）：换台机器、SDK 布局不同
+/// 都不该让 golden 红。
+String? _materialIconsPath() {
+  const tail = 'bin/cache/artifacts/material_fonts/MaterialIcons-Regular.otf';
+  final roots = <String>[
+    if (Platform.environment['FLUTTER_ROOT'] case final r? when r.isNotEmpty) r,
+    _flutterRootFromExecutable() ?? '',
+  ];
+  for (final root in roots) {
+    if (root.isEmpty) continue;
+    final path = '$root/$tail';
+    if (File(path).existsSync()) return path;
+  }
+  return null;
+}
+
+String? _flutterRootFromExecutable() {
+  var dir = File(Platform.resolvedExecutable).parent; // bin/cache/dart-sdk/bin
+  for (var i = 0; i < 4; i++) {
+    dir = dir.parent;
+  }
+  return dir.path;
 }
 
 /// 本机缺少 golden 需要的字体时，**跳过而不是失败**。
@@ -3881,7 +4197,7 @@ Future<void> loadTestFonts() async {
 /// 换一台机器（或换个发行版的字体包）就没有这些文件，而那不是本项目的回归。
 /// 报成红的只会训练人忽略红的。
 bool get fontsAvailable =>
-    File('/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc').existsSync();
+    File(_cjkFontPath).existsSync() && File(_wqyMonoPath).existsSync();
 
 ThemeData goldenTheme(Brightness brightness) => ThemeData(
   colorScheme: ColorScheme.fromSeed(
@@ -3935,12 +4251,9 @@ Future<void> pumpForGolden(
 }
 ```
 
-- [ ] **Step 3: 写 golden 用例**
+- [ ] **Step 4: 写 golden 用例**
 
 ```dart
-@Tags(['golden'])
-library;
-
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -3955,6 +4268,7 @@ import 'package:win_cli_tool/ui/panels/output_panel.dart';
 
 import '../fixtures/fake_session.dart';
 import 'golden_harness.dart';
+import 'ui_harness.dart';
 
 /// golden 的开关：**默认跳过**。
 ///
@@ -3971,9 +4285,9 @@ import 'golden_harness.dart';
 /// 换字体版本、换 Flutter 版本都会变 —— 而那不是回归。默认跑的下场是
 /// `flutter test` 在别人机器上变红，然后所有人学会忽略红。
 void main() {
-  final skip = !goldensEnabled
-      ? 'golden 默认不跑（设 WCT_GOLDEN=1 开启）'
-      : (!fontsAvailable ? '本机缺少 golden 需要的中文字体' : null);
+  // **跳过而不是失败** —— 理由见上面那段说明。两个条件都写在这里：
+  // 没设 `WCT_GOLDEN=1`，或者本机没有 golden 需要的中文字体。
+  final skip = !goldensEnabled || !fontsAvailable;
 
   late Directory root;
 
@@ -3985,21 +4299,6 @@ void main() {
     if (root.existsSync()) await root.delete(recursive: true);
   });
 
-  // **`fakeProfile` 目前不接受 `host`**（已核实：只有 `id` / `name` /
-  // `autoConnect` / `postLogin`）。给它加两个可选参数，让每台设备的副标题在
-  // golden 里彼此不同 —— 三台都写 `10.0.0.1:22` 的截图看不出列表在渲染什么：
-  //
-  //   DeviceProfile fakeProfile({
-  //     String id = 'd1',
-  //     String name = '核心交换机',
-  //     String host = '10.0.0.1',
-  //     int port = 22,
-  //     bool autoConnect = false,
-  //     List<String> postLogin = const [],
-  //   }) => DeviceProfile(
-  //     ... host: host, port: port, ...
-  //   );
-  //
   // **只改夹具，不改产品代码。**
   final devices = [
     fakeProfile(id: 'd1', name: '核心交换机-01', host: '10.0.0.1'),
@@ -4008,10 +4307,8 @@ void main() {
   ];
 
   /// 往缓冲里灌一段**带颜色**的、像真设备回显的输出。
-  void seedOutput(WidgetTester tester, String deviceId) {
-    final container = ProviderScope.containerOf(
-      tester.element(find.byType(MainWindow)),
-    );
+  void seedOutput(WidgetTester tester, Finder host, String deviceId) {
+    final container = ProviderScope.containerOf(tester.element(host));
     final buffer = container.read(outputBufferProvider(deviceId));
     buffer.add('\x1b[1m<Huawei>display version\x1b[0m\n');
     buffer.add('Huawei Versatile Routing Platform Software\n');
@@ -4031,7 +4328,7 @@ void main() {
       devices: devices,
       child: const MainWindow(),
     );
-    seedOutput(tester, 'd1');
+    seedOutput(tester, find.byType(MainWindow), 'd1');
     await tester.pump(const Duration(milliseconds: 70));
     await tester.pump();
 
@@ -4039,7 +4336,7 @@ void main() {
       find.byType(MainWindow),
       matchesGoldenFile('golden/main_window_light.png'),
     );
-  });
+  }, skip: skip);
 
   testWidgets('主窗口 —— 深色', (tester) async {
     await loadTestFonts();
@@ -4052,7 +4349,7 @@ void main() {
       devices: devices,
       child: const MainWindow(),
     );
-    seedOutput(tester, 'd1');
+    seedOutput(tester, find.byType(MainWindow), 'd1');
     await tester.pump(const Duration(milliseconds: 70));
     await tester.pump();
 
@@ -4060,7 +4357,7 @@ void main() {
       find.byType(MainWindow),
       matchesGoldenFile('golden/main_window_dark.png'),
     );
-  });
+  }, skip: skip);
 
   testWidgets('面板 —— 设备列表 / 编辑区 / 输出区', (tester) async {
     await loadTestFonts();
@@ -4085,6 +4382,12 @@ void main() {
       devices: devices,
       child: const Scaffold(body: EditorPanel(deviceId: 'd1')),
     );
+    // **先让草稿读出来（`settleDisk`），再打字。** 那次读是**真盘 I/O**，
+    // 假时钟里走不完 —— 读不完 `_seeded` 就是 false，而 `_onTextChanged` 在
+    // `_seeded` 为 false 时直接返回、**不 `setState`**。后果是行号栏停在
+    // "1"：编辑区里五行字，行号却只有一个（实测）。真机上草稿读得完，不会有
+    // 这个现象，所以这里要把它等出来，否则 golden 拍的是一个假状态。
+    await settleDisk(tester);
     await tester.enterText(
       find.byType(TextField),
       'sys\ninterface GE0/0/1\n description 上行链路\ndisplay version\nquit',
@@ -4102,52 +4405,52 @@ void main() {
       devices: devices,
       child: const Scaffold(body: OutputPanel(deviceId: 'd1')),
     );
-    seedOutput(tester, 'd1');
+    seedOutput(tester, find.byType(OutputPanel), 'd1');
     await tester.pump(const Duration(milliseconds: 70));
     await tester.pump();
     await expectLater(
       find.byType(OutputPanel),
       matchesGoldenFile('golden/output_panel.png'),
     );
-  });
+  }, skip: skip);
 }
 ```
 
-**`seedOutput` 用 `find.byType(MainWindow)` 取容器** —— 面板那一条里没有
-`MainWindow`，所以面板那部分要另取（用 `find.byType(OutputPanel)`）。执行者按实际
-结构取，**只要拿到同一个容器即可**；取不到就换一个能找到的 widget 类型。
-
-- [ ] **Step 4: 生成 PNG**
+- [ ] **Step 5: 生成 PNG**
 
 ```bash
 WCT_GOLDEN=1 flutter test test/ui/main_window_golden_test.dart --update-goldens
 ```
 Expected: 3 条通过，`test/ui/golden/` 下出现 5 个 PNG。
 
-- [ ] **Step 5: 亲眼看一遍**
+- [ ] **Step 6: 亲眼看一遍**
 
 ```bash
 ls -la test/ui/golden/
 ```
 
 用 Read 工具逐个打开那 5 张图，确认：
+
 - 中文是**真字**，不是一排方框；
+- **图标是真图标**（加号、连接/断开/发送、终端、清屏），不是空心方框；
+- 编辑区那张的**行号栏是 1..5**，不是只有一个"1"；
 - 没有右上角的 debug 红斜带；
-- 输出区那几张里 `Info:` 是绿的、`Error:` 是红的、`不在位` 是反显的。
+- 输出区那几张里 `Info:` 是绿的、`Error:` 是红的、`42` 是黄的、`不在位` 是反显的。
 
 **任何一条不符就先修，再提交。** 这一步不能跳 —— golden 的价值全在"人能看到"。
 
-- [ ] **Step 6: 确认默认跑仍然是绿的**
+- [ ] **Step 7: 确认默认跑是跳过，不是失败**
 
 ```bash
 flutter test test/ui/main_window_golden_test.dart
 ```
-Expected: `+0 ~3: All tests skipped` 之类 —— **跳过，不是失败**。
+Expected: `+0 ~3: All tests skipped.`（**跳过**）。再跑一次全仓 `flutter test`，
+Expected: `+510 ~3` —— 那 3 条被跳过，且**没有** tag 警告。
 
-- [ ] **Step 7: 提交**
+- [ ] **Step 8: 提交**
 
 ```bash
-git add test/ui/golden_harness.dart test/ui/main_window_golden_test.dart test/ui/golden/ test/ui/ui_harness.dart
+git add test/ui/golden_harness.dart test/ui/main_window_golden_test.dart test/ui/golden/ test/fixtures/fake_session.dart
 git commit -m "$(cat <<'EOF'
 test(ui): golden 截图（主窗口浅色/深色 + 三个面板）
 
@@ -4158,8 +4461,10 @@ test(ui): golden 截图（主窗口浅色/深色 + 三个面板）
 换机器/换字体版本/换 Flutter 都会变，而那不是回归。默认跑的下场是 flutter
 test 在别人机器上变红，然后所有人学会忽略红。
 
-夹具里有三条实测结论必须照做：FontLoader 能加载 .ttc（中文真渲染）、不指定
-fontFamily 的文字是豆腐块、MaterialApp 默认带 debug 红斜带。
+夹具里有五条实测结论必须照做：FontLoader 能加载 .ttc（中文真渲染）、不指定
+fontFamily 的文字是豆腐块、引擎每个族只认一个字体面所以要给回退族名一个有
+汉字的等宽字体、图标族 MaterialIcons 要自己注册、MaterialApp 默认带 debug
+红斜带。
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>
 EOF
@@ -4283,6 +4588,15 @@ EOF
     就是这么骗了一次）。真要收紧，正确做法不是把轮数继续加大，而是给 store 开一个
     测试用的完成钩子（或在 `pumpUi` 里换成内存 store）。**在有人加轮数之前，先看一眼
     这条。**
+14. **FR-E-04 的"退出时落盘"只覆盖"树被拆掉"这一条路，而且它是"发了就不等"的。**
+    Task 9b 把 `dispose()` 里那次 flush 修成真的能写下去了，但**触发点仍然是 widget 的
+    `dispose`**。桌面端关窗口是**进程直接结束**：框架不一定把树拆一遍，那时这次 flush
+    根本不会发生；就算发生了，写盘是异步的，进程可能在写完之前就没了。受影响的窗口是
+    **防抖那 500ms 之内打的字**（防抖到点就已经写下去了），所以不是"编辑全丢"，而是
+    "最后半秒丢"。要真正兜住得挂 `AppLifecycleListener(onExitRequested:)`（或
+    `WidgetsBindingObserver.didRequestAppExit`）并在那里同步等一下落盘 —— 而**这条在
+    本机验不了**（`DISPLAY` 是空的，GUI 起不来，见 Task 10 开头），所以这一版没做。
+    在真机上跑起来的人：先确认关窗口时草稿还在不在，再决定要不要挂那个钩子。
 
 ---
 
@@ -4413,3 +4727,32 @@ Ctrl+N 的 SnackBar，已在 Task 9 与未决项第 2 条两处写明。
    是私有的），公开后 `dart analyze lib/ test/` 输出 1 条
    `avoid_renaming_method_parameters`。info 会打掉"analyze 干净"这条验收，所以参数名
    要一起改成 `oldWidget`（Step 2 第 3 处）。
+
+**Task 10 又炸出三条**（都不是 Task 10 自己的错，是它把已提交的编辑区摆进了一个此前没
+有过的场景 —— 在同一个用例里换三次树，第三次卸载的是一块**带着未落盘草稿**的编辑区）。
+三条都实测过、都修了，独立成 **Task 9b** 放在 Task 10 前面。改完实测：`main_window_test.dart`
+**9/9 绿**、全仓 `flutter test` = **510 条通过 + 3 条跳过**（golden 默认跳过）、
+`dart analyze lib/ test/` = `No issues found!`；golden 本体 `WCT_GOLDEN=1 ... --update-goldens`
+= **3/3 绿、5 个 PNG**，不带 `--update-goldens` 再跑一遍仍然 3/3（本机稳定）。三条新用例
+在**未修**的代码上逐条复跑确认过是红的（`[E]` + 用例名，不是编译红）。
+
+1. **`ref` 在 `State.dispose()` 里会抛**（真机缺陷）：退出兜底那次 flush 发生在元素正被
+   拆的时候，riverpod 报 `Bad state: Using "ref" when a widget is about to or has been
+   unmounted is unsafe` —— 于是 FR-E-04 的"退出时落盘"**一次都没生效过**（防抖掩盖了它）。
+   已把 notifier 攒进 `_drafts` 字段。
+2. **`DraftAutosave.dispose()` 之后旧实例永久失效**（真机缺陷）：`didUpdateWidget` 里
+   `dispose()` 掉它之后，`schedule` 直接早返回 —— **切过一次设备，草稿就再也不会落盘**。
+   探针实测：在 d2 打完字等过防抖，`drafts/d2.txt` 仍是切过来时那个 `AAA`。
+3. **换设备时旧文本的落点错了**（真机缺陷）：`flush()` 在 `widget` 已经换成新设备之后才
+   调，于是旧设备没到点的文本写进了**新设备**的草稿文件，而原设备那份**根本不存在**
+   （探针：`d1.txt` 不存在、`d2.txt` = `AAA`）。同时 `_lastSaved` 要一起清，否则新设备
+   的第一次编辑与旧设备末次内容相同时会被判成重复写而跳过。**这三条的改动顺序都承重**，
+   注释里逐条写了。
+
+**Task 10 的原稿有六处错，都在派发前改掉并已跑绿**（见 Task 10 开头那张表）：`skip` 算了
+却没传给 `testWidgets`（golden **默认会跑**，正是它自己的文档说要避免的）、`@Tags` 带来
+每次默认跑都吐一行警告、字体只注册了主题那一个族（`monospace` 与 `MaterialIcons` 都是
+满屏方框）、`seedOutput` 写死 `MainWindow`（面板那一条里没有它）、编辑区 golden 少了
+`settleDisk`（行号栏停在"1"）、`git add` 漏了夹具。**其中"引擎每个族只认一个字体面"
+是拿四行探针量出来的**（同一个族里挂 DejaVu + Noto，汉字照样是方框；把回退族名指向
+文泉驿微米黑就出来了）。
