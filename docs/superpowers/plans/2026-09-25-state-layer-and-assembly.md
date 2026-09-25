@@ -1615,8 +1615,23 @@ EOF
 
 - [ ] **Step 1: 加依赖**
 
-Run: `flutter pub add flutter_riverpod path_provider`
-Expected: 解析出 `flutter_riverpod 3.4.3` 与 `path_provider 2.1.6`（两者都能在本地 pub 缓存里找到，不需要联网）。`pubspec.yaml` 的 `dependencies:` 段落里会出现这两行。
+Run: `flutter pub add --offline flutter_riverpod path_provider`
+
+**`--offline` 不是可选项，是量出来的。** 不加它，pub 要向 pub.dev 取版本列表，
+而这台机器的网络不可靠（仓库连 git remote 都没有配）。加了它 pub 只从本地缓存
+解析，而这条命令**已经实测成功**：`flutter pub add --offline --dry-run
+flutter_riverpod path_provider` 退出码 0，"Would change 29 dependencies"，
+其中 `path_provider 2.1.6`、`path_provider_linux 2.2.2`、
+`path_provider_windows 2.3.0`、`path_provider_platform_interface 2.1.3`、
+`xdg_directories 1.1.0`、`plugin_platform_interface 2.1.8`、`riverpod 3.4.3`
+都是缓存里现成的。
+
+顺带它还**正合规格**：spec §8.5 点名 3.4.3 与 2.1.6，联网解析有可能拿到更新的
+版本，反而偏离了规格（本计划里所有 riverpod 的 API 结论都是照着 3.4.3 核的）。
+
+Expected: 解析出 `flutter_riverpod 3.4.3` 与 `path_provider 2.1.6`。`pubspec.yaml`
+的 `dependencies:` 段落里会出现这两行；`pubspec.lock` 会一并变化 —— **它也要提交**
+（Step 6 的 `git add` 里已经带了）。
 
 然后**手工**给它们各配一行说明（本仓库的惯例：每个直接依赖都写清为什么）：
 
