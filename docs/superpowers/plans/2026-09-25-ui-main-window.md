@@ -1493,9 +1493,11 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:win_cli_tool/state/output_buffer.dart';
 import 'package:win_cli_tool/state/providers.dart';
 import 'package:win_cli_tool/ui/panels/output_panel.dart';
 
+import '../fixtures/fake_session.dart';
 import 'ui_harness.dart';
 
 void main() {
@@ -1608,7 +1610,9 @@ void main() {
 }
 ```
 
-**`find.textContaining` 与 `TextSpan` 树**：`SelectableText.rich` 的 `find.textContaining` 会匹配到整棵树的纯文本，所以这些断言是有效的。若某条查不到，**先确认面板确实用了 `SelectableText.rich` 而不是 `RichText`** —— `RichText` 不参与 `find.text*` 的语义树。
+**`find.textContaining` 与 `TextSpan` 树**：`SelectableText.rich` 的 `find.textContaining` 会匹配到整棵树的纯文本，所以这些断言是有效的。**实测依据**：`SelectableText.rich` 内部建的是 `_TextSpanEditingController`，其构造器 `super(text: textSpan.toPlainText(...))`，而 `_MatchTextFinder` 对 `EditableText` 取的就是 `widget.controller.text` —— 两边接得上。若某条查不到，**先确认面板确实用了 `SelectableText.rich` 而不是 `RichText`** —— `RichText` 默认不参与 `find.text*`（要 `findRichText: true`）。
+
+**那两条 import 不是多余的**（`output_buffer.dart` 与 `../fixtures/fake_session.dart`）：`OutputBuffer` 是 `bufferOf` 的返回类型，`fakeProfile` 来自夹具文件 —— 而 **Dart 的 import 不传递**，`ui_harness.dart` 里 import 了它们不等于本文件能用它们的名字。
 
 - [ ] **Step 7: 跑测试确认红**
 
@@ -1701,8 +1705,15 @@ class _OutputPanelState extends ConsumerState<OutputPanel> {
             children: [
               NotificationListener<UserScrollNotification>(
                 // 用户自己滚动时重新判定跟不跟底。**用 UserScrollNotification
-                // 而不是 ScrollNotification**：后者连程序化的跟底那一跳也会报，
-                // 那会把"刚变长还没跳"的一瞬间判成离底，从此永久停跟。
+                // 而不是 ScrollNotification**：前者只在**滚动方向变化**时报
+                // （`updateUserScrollDirection`），也就是拖拽、以及 goIdle /
+                // goBallistic 把方向改回 idle 时。
+                //
+                // **这只是稳健性偏好，不是承重。** 程序化跟底那一跳确实**可能**
+                // 报（`jumpTo` → `goIdle()` → `beginActivity` 见到非滚动活动就
+                // 把方向置回 idle，若此前是 forward/reverse 就会报一次），但那一
+                // 刻 pixels 已经在底部、`extentAfter` ≈ 0，`onUserScroll` 判出来
+                // 的结论相同 —— 见 [AutoScroll.onUserScroll] 的文档。
                 onNotification: (_) {
                   _auto.onUserScroll();
                   setState(() {});
