@@ -156,6 +156,15 @@ class ConnectionManager {
   var _disposed = false;
   var _userClosed = false;
 
+  /// **尝试代际。** 每次 [connect] / [disconnect] / [dispose] 让它前进，任何越过
+  /// `await` 之后醒来的代码先核对它 —— 代号变了就说明自己**已经过期**。
+  ///
+  /// 存在的唯一理由是 [connect] 的重叠调用不安全（详见那里的说明）。过期的一方
+  /// **只关掉自己建的那条会话**：它既不碰 `_session` / `_outputSub` / `_dispatcher`
+  /// （那些现在很可能已经是后来者的），也不发事件、不排重连 —— 否则用户会看到一条
+  /// 他从没掉过的线的告警。
+  var _generation = 0;
+
   Stream<ConnectionEvent> get events => _events.stream;
 
   /// 该设备的合并输出流。跨重连连续 —— 界面只订阅这一个。
@@ -177,25 +186,24 @@ class ConnectionManager {
   /// **本方法拥有它替换掉的那条会话。** 会话是在这里被换掉的，所以拆掉旧的
   /// 也是这里的责任：直接建新会话再覆写 `_session` / `_outputSub` / `_dispatcher`，
   /// 旧的既没人 `close()`、订阅也再没人取消 —— 泄漏的不是内存，而是**一条仍插在
-  /// 设备上的 SSH 连接**（设备侧那个 vty 一直占着，直到它自己超时）。重连那条路
-  /// 不需要这段：`_onSessionDone` 与失败分支都会在排程之前先把字段**同步**清空，
-  /// 定时器醒来时手里已经没有旧会话了。
+  /// 设备上的 SSH 连接**（设备侧那个 vty 一直占着，直到它自己超时）。
+  /// 重连那条路不需要这段：`_onSessionDone` 与失败分支都会在排程之前先把字段
+  /// **同步**清空，定时器醒来时手里已经没有旧会话了。
   ///
-  /// **仍未解决（记录在案，本轮不改）**：两次**重叠**的 [connect]（用户连点两下，
-  /// 或手动连接与重连定时器同时落下）依然不安全。真正的机制**不是**"两次拆除互相
-  /// 拆台"（曾经这样记过，实测**是错的**），而是**漏拆**：输掉的那次尝试走进 catch
-  /// 时，字段早已被对手清空，于是它那句 `unawaited(_teardownSession())` 是**空操作**；
-  /// 它接着发 `ConnectionFailed`、调 `_scheduleRetry()` —— 在前一条会话**还活着**的
-  /// 时候武装一个重连定时器。那个定时器的回调直接调 `_attemptConnect()`，**不经任何
-  /// 拆除**，于是把 `_session` / `_outputSub` / `_dispatcher` 静默覆写，前一条会话
-  /// 从此没人关。
+  /// **重叠调用由代际令牌挡住**（`_generation`，见字段的文档）。曾经的形状是
+  /// **漏拆**，别按"两次拆除互相拆台"去推理（那是我记错过的版本，实测**是错的**）：
+  /// 输掉的那次尝试走进 `catch` 时字段早已被对手清空，于是它那句
+  /// `unawaited(_teardownSession())` 是**空操作**；它接着发 `ConnectionFailed`、
+  /// 调 `_scheduleRetry()` —— 在前一条会话**还活着**的时候武装一个重连定时器，
+  /// 那个回调直接调 `_attemptConnect()`、**不经任何拆除**，把
+  /// `_session` / `_outputSub` / `_dispatcher` 静默覆写，前一条会话从此没人关。
   ///
   /// 实测（真实 async，gate 型夹具，握手中途 `close()` ⇒ `connect()` 抛错，60ms 退避）：
-  /// 连点两下的探针给出 `created=3`、`closed=[true,false,false]` —— `sessions[2]` 是
-  /// 当下那条，`sessions[1]` 成了**孤儿**（一个被占住的 vty）；再从每条会话各 emit
-  /// 一次，`received=[out1,out2]`，也就是**两条**会话同时往 `mgr.output` 里灌。
-  /// 同一次还多发了一个**假告警**（`ConnectionFailed` + `ReconnectScheduled`）和一个
-  /// `Reconnected` 横幅 —— 用户其实从没掉线。
+  /// 修复前连点两下的探针给出 `created=3`、`closed=[true,false,false]` ——
+  /// `sessions[2]` 是当下那条，`sessions[1]` 成了**孤儿**（一个被占住的 vty）；
+  /// 再从每条会话各 emit 一次，`received=[out1,out2]`，也就是**两条**会话同时往
+  /// `mgr.output` 里灌。同一次还多发了一个**假告警**（`ConnectionFailed` +
+  /// `ReconnectScheduled`）和一个 `Reconnected` 横幅 —— 用户其实从没掉线。
   /// "重连尝试在途时手动 connect()"的探针给出 `created=4`、
   /// `closed=[true,true,false,false]`，同样一个孤儿。
   ///
@@ -207,10 +215,6 @@ class ConnectionManager {
   /// `received=[out0,out1]`。所以 I5 的修复**不是**这次泄漏的来源（重叠一次就漏
   /// 一条，修之前也漏），也**没有**堵上这个洞；新出现的是那个假 `ConnectionFailed`
   /// 加 `Reconnected` 横幅。
-  ///
-  /// 根治要给每次尝试配一个代号（generation），让拆除只认自己的会话。本轮**只记
-  /// 注释、不实现令牌**；但它必须在**任何界面从用户手势驱动 `connect()`** 之前落地。
-  /// 今天这个类里没有任何东西阻止重叠：没有"尝试在途"的闸门，也没有代际令牌。
   Future<void> connect() async {
     if (_disposed) return;
     _userClosed = false;
@@ -219,6 +223,9 @@ class ConnectionManager {
     // 的这条顶掉（`_session` 被覆写，这条就再也没人关了）。
     _retryTimer?.cancel();
     _retryTimer = null;
+    // **作废所有在途的尝试。** 代际一旦前进，先前那些还挂在 await 上的
+    // `_attemptConnect` 醒来时就会发现代号对不上，于是它们只关掉自己建的那条会话。
+    final gen = ++_generation;
     // 已经连着时，先把旧会话拆干净再建新的，见上面的所有权说明。
     // 这个保证**只在前一次拆除没有在途时才成立**：`_teardownSession()` 在任何
     // await 之前就把字段取走并置空，所以第二次拆除对着已被清空的字段是**空操作**，
@@ -231,11 +238,14 @@ class ConnectionManager {
     // 这里 `await` 是安全的：按契约 `Session.close()` **不会**触发
     // `done`（session.dart），所以旧会话不会在拆除途中反过来走一趟 `_onSessionDone`。
     await _teardownSession();
-    await _attemptConnect();
+    // 拆除期间又有人调了 connect()/disconnect()/dispose()：本次已经过期，
+    // 交出去，别再往下建会话。
+    if (gen != _generation) return;
+    await _attemptConnect(gen);
   }
 
-  Future<void> _attemptConnect() async {
-    if (_disposed || _userClosed) return;
+  Future<void> _attemptConnect(int gen) async {
+    if (_disposed || _userClosed || gen != _generation) return;
 
     _setState(
       _attempt == 0
@@ -250,23 +260,34 @@ class ConnectionManager {
       await session.connect();
     } catch (e) {
       if (_disposed) return;
+      // **本次尝试已被后一次取代**（用户又点了一下，或重连定时器与手动连接撞上）。
+      // 只关自己这一条：`_teardownSession()` 拆的是**字段里**的会话，而字段现在
+      // 很可能已经是后来者的了 —— 那正是这条路径当初的洞（输掉的一方把赢的一方
+      // 拆掉，或者谁都没拆而留下一条占着 vty 的孤儿）。
+      if (gen != _generation) {
+        unawaited(session.close());
+        return;
+      }
       // 不 await：拆除是清理，不能挡住重连排程。_teardownSession 会在任何
       // await 之前同步清空 _session/_outputSub 等状态，所以 fire-and-forget
       // 不会与随后的重连串到一起去。
       unawaited(_teardownSession());
       // 用户已断开或应用已退出：这次失败是我们自己关掉 socket 造成的。
       // 报给用户就是假告警，改状态则会让按钮从灰变红（§5.4 要求是灰的）。
-      if (_disposed || _userClosed) return;
+      if (_userClosed) return;
       if (!_events.isClosed) {
         _events.add(ConnectionFailed(classifyConnectionFailure(e)));
       }
-      _scheduleRetry();
+      _scheduleRetry(gen);
       return;
     }
 
-    if (_disposed || _userClosed) {
-      // 建连期间用户已经断开或应用已退出：直接关掉，不进入已连接状态。
-      await _teardownSession();
+    if (_disposed || _userClosed || gen != _generation) {
+      // 建连期间用户断开/退出/又有人连了：关掉**自己这条**，不进入已连接状态。
+      // 同样不能走 `_teardownSession()`（理由见上）。`identical` 那一句是必须的：
+      // 字段可能已经被后来者填上了它自己的会话，那不是我们的。
+      await session.close();
+      if (identical(_session, session)) _session = null;
       return;
     }
 
@@ -290,7 +311,8 @@ class ConnectionManager {
     // 这儿传下去的"，比没有更糟。原因走 [Session.lastError]：`done` 完成之后再读，
     // 此时它一定已经写好（两个实现的 `_onDisconnected` 都是先存再 `complete()`，
     // spec §13.12 / §13.20）。
-    session.done.then((_) => _onSessionDone(session.lastError));
+    // 代号随会话一起捕获：这条会话的落幕只对它自己那一代有效。
+    session.done.then((_) => _onSessionDone(gen, session.lastError));
 
     final wasReconnect = _attempt > 0;
     if (wasReconnect) {
@@ -317,8 +339,12 @@ class ConnectionManager {
   /// [error] 只有一个来源：`session.done` 完成之后读到的 `session.lastError`。
   /// 形参**不再是可选的** —— 可选会让人以为还有别的调用点（原先那条 `onError:`
   /// 已经删掉，见上面注册处）。
-  void _onSessionDone(Object? error) {
-    if (_disposed || _userClosed) return;
+  ///
+  /// [gen] 是那条会话所属的代际。**代号对不上就直接返回**：这次落幕属于一条
+  /// 已经被取代的会话（用户在它还活着的时候又连了一次），既不该拆字段里的会话，
+  /// 也不该发 `SessionLost` —— 那会让用户看到一条他从没掉过的线。
+  void _onSessionDone(int gen, Object? error) {
+    if (_disposed || _userClosed || gen != _generation) return;
     _disconnectedAt = clock.now();
 
     // FR-C-10：未发出的命令一律丢弃，不自动重放。
@@ -331,13 +357,14 @@ class ConnectionManager {
         SessionLost(error == null ? null : classifyConnectionFailure(error)),
       );
     }
-    _scheduleRetry();
+    _scheduleRetry(gen);
   }
 
-  void _scheduleRetry() {
+  void _scheduleRetry(int gen) {
     // 用户主动断开或应用退出：状态已由 disconnect()/dispose() 定好，
     // 这里再改一次就会把按钮从灰刷成红（§5.4 要求灰色）。
-    if (_disposed || _userClosed) return;
+    // 代号对不上同理：这次失败属于一条已被取代的尝试，它无权安排下一次。
+    if (_disposed || _userClosed || gen != _generation) return;
 
     if (!autoReconnect) {
       _setState(DeviceConnectionState.failed);
@@ -357,14 +384,20 @@ class ConnectionManager {
 
     _retryTimer?.cancel();
     _retryTimer = Timer(delay, () {
-      if (_disposed || _userClosed) return;
-      unawaited(_attemptConnect());
+      // 定时器醒来时代号仍要核对：`connect()` / `disconnect()` / `dispose()`
+      // 都会取消它，但"取消"与"已经排在事件队列里"之间没有原子性 —— 多核这一
+      // 行是廉价的。
+      if (_disposed || _userClosed || gen != _generation) return;
+      unawaited(_attemptConnect(gen));
     });
   }
 
   /// 用户主动断开（FR-C-05）。停止重连，按钮变灰（§5.4）。
   Future<void> disconnect() async {
     _userClosed = true;
+    // **作废在途的尝试与已排程的重连。** 它们醒来时会发现代号对不上，于是只关掉
+    // 自己建的那条会话 —— 不会再改状态、不会再发事件、也不会再建新会话。
+    _generation++;
     _retryTimer?.cancel();
     _retryTimer = null;
     _attempt = 0;
@@ -383,6 +416,9 @@ class ConnectionManager {
     if (_disposed) return;
     _disposed = true;
     _userClosed = true;
+    // `_disposed` 已经能挡住所有路径，这一行是纵深防御：将来若有谁把在途尝试的
+    // 守卫写成只看 `_userClosed`，代际仍然兜得住。
+    _generation++;
     _retryTimer?.cancel();
     _retryTimer = null;
     await _teardownSession();

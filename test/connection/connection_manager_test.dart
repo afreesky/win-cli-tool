@@ -1072,4 +1072,84 @@ void main() {
       async.flushMicrotasks();
     });
   });
+
+  test('连点两下 connect()：不留孤儿会话，也不发假告警', () async {
+    // 真实 async（不是 fakeAsync）：这条要等第一次 connect() 被 close() 打回来。
+    final sessions = <_FakeSession>[];
+    final mgr = ConnectionManager(
+      profile: _profile(),
+      factory: _FakeFactory(sessions, failConnect: true, gate: true),
+    );
+    addTearDown(mgr.dispose);
+
+    final failures = <ConnectionFailure>[];
+    final reconnected = <Reconnected>[];
+    mgr.events.listen((e) {
+      if (e is ConnectionFailed) failures.add(e.failure);
+      if (e is Reconnected) reconnected.add(e);
+    });
+
+    // 用户连点两下。第一次挂在握手中途；第二次的 connect() 会把第一条拆掉，
+    // 于是第一条的 connect() 抛错 —— 而它**已经过期**，那条失败不是用户的线。
+    final first = mgr.connect();
+    await Future<void>.delayed(Duration.zero);
+    final second = mgr.connect();
+    unawaited(second); // 见下：这一条**故意不等**
+
+    // 只有**第一次**能等到：它建的会话已经被第二次的 `_teardownSession()` 关掉，
+    // 于是它的 connect() 抛错返回。
+    await first;
+    // 留一点时间给"万一存在的"重连定时器与在途拆除。
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+
+    // **不要 `await second`**：`gate: true` + `failConnect: true` 下，第二次建的
+    // 那条会话挂在握手中途，而**没有任何东西会去关它**（它就是当下那条）。等它
+    // 等于等一个永远不会到来的 gate —— 整个文件会挂到超时，而不是点名变红。
+    // 夹具的 gate 只由 `close()` 打开，所以"它还开着"正是"它是当下的会话"。
+
+    // 修复前实际是 3 条：过期那次失败还会 `_scheduleRetry()`，
+    // 于是一个我们控制不了的定时器又建了第三条。
+    expect(sessions, hasLength(2), reason: '两次点击只该建两条会话');
+
+    // 断言写成"只有最后一条可以还开着"，不要写成 `closed` 全为 true —— 后者会被
+    // 末尾那次 `mgr.dispose()` 的拆除变成**恒真**，看不出孤儿。
+    final stillOpen = [
+      for (var i = 0; i < sessions.length; i++)
+        if (!sessions[i].closed) i,
+    ];
+    expect(
+      stillOpen,
+      [sessions.length - 1],
+      reason: '只有当下那条可以还开着；其余都是占着设备侧一个 vty 的孤儿',
+    );
+    expect(failures, isEmpty, reason: '自己拆出来的失败不是用户的线，报了就是假告警');
+    expect(reconnected, isEmpty, reason: '用户从没掉过线，不该有重连横幅');
+  });
+
+  test('被取代的会话不得再往 mgr.output 里灌数据', () async {
+    // 不 gate、不 fail：两条会话都真的连上，于是两条都注册过 output 订阅 ——
+    // 这才是"旧订阅有没有被摘掉"唯一能被看见的形状。
+    final sessions = <_FakeSession>[];
+    final mgr = ConnectionManager(
+      profile: _profile(),
+      factory: _FakeFactory(sessions),
+    );
+    addTearDown(mgr.dispose);
+
+    final received = <String>[];
+    mgr.output.listen(received.add);
+
+    await mgr.connect();
+    await mgr.connect(); // 取代第一条
+    await Future<void>.delayed(Duration.zero);
+    expect(sessions, hasLength(2));
+
+    // 每条会话各吐一次。夹具的 close() 刻意不关 _output，所以旧会话**还能** emit，
+    // 到不到得了 mgr.output 完全取决于订阅有没有被取消。
+    sessions[0].emit('out0');
+    sessions[1].emit('out1');
+    await Future<void>.delayed(Duration.zero);
+
+    expect(received, ['out1'], reason: '旧会话的订阅必须已经被摘掉');
+  });
 }
