@@ -1919,12 +1919,21 @@ void main() {
     );
 
     // 走的是父类实现 —— 组字下划线由此保留。
+    //
+    // **下划线不在根节点上。** `TextEditingController.buildTextSpan`（实测
+    // SDK 源码）返回的是 `TextSpan(style: style, children: [前, 组字段, 后])`，
+    // 根节点的 style 就是传进来的 `style`（这里是 `TextStyle(fontSize: 14)`，
+    // 没有 decoration），**带下划线的是中间那个子节点**。所以断言必须落在
+    // 那个子节点上 —— 写成 `expect(span.style?.decoration, ...)` 会**恒红**。
     expect(span.toPlainText(), 'zhong');
-    expect(span.style?.decoration, TextDecoration.underline,
+    final composing = span.children!
+        .cast<TextSpan>()
+        .firstWhere((s) => s.text == 'zhong');
+    expect(composing.style?.decoration, TextDecoration.underline,
         reason: '组字下划线必须还在，否则中文输入法的候选提示会没有锚点');
   });
 
-  testWidgets('行数变了之后旧的行号标记不会串到别的行上', (tester) async {
+  testWidgets('标记按行号落在对应的行上', (tester) async {
     final controller = SentLineController()..text = 'a\nb\nc';
     addTearDown(controller.dispose);
     controller.sentLines
@@ -1937,6 +1946,8 @@ void main() {
   });
 }
 ```
+
+**这条用例原来的名字是"行数变了之后旧的行号标记不会串到别的行上"**，但它从头到尾没有改过 `text` —— 名字声称的场景没被跑到。改成现在这个名字（与它真正断言的事一致）。**"行号会变旧"这件事本身是真的**：`sentLines` 只在 `_send()` 里 `clear()+addAll()`，用户手工增删行时它不动，于是被标暗的可能不再是当初发出去的那一行。这是 FR-E-10 的语义取舍（"已发送的行"按行号记），不是缺陷，记在计划末尾的未决项里。
 
 - [ ] **Step 2: 跑测试确认红**
 
@@ -2104,7 +2115,13 @@ void main() {
 
   testWidgets('未连接时发送按钮不可用（§9.2 第 4 条的一半）', (tester) async {
     await pumpEditor(tester);
-    final button = tester.widget<IconButton>(find.byTooltip('发送'));
+    // **不能用 `tester.widget<IconButton>(find.byTooltip('发送'))`。**
+    // `find.byTooltip` 匹配的是 `Tooltip` / `RawTooltip` 组件本身（实测
+    // SDK 源码），不是那个 `IconButton` —— 取 widget 会红在类型转换上。
+    // 要按图标定位按钮：`IconButton` 是 `Icon` 的祖先。
+    final button = tester.widget<IconButton>(
+      find.widgetWithIcon(IconButton, Icons.send),
+    );
     expect(button.onPressed, isNull, reason: '没有会话时发出去的命令会掉进空处');
   });
 
@@ -3810,6 +3827,13 @@ EOF
 8. **`ui_harness.pumpUi` 里 `MaterialApp` 的 `Scaffold` 是共享的。** 面板 golden
    用的是 `pumpForGolden`（不套 Scaffold），两份夹具长得像但用途不同 —— 若哪天
    要加第三个夹具，先想想是不是该合并。
+9. **"已发送的行"高亮会变旧。** `SentLineController.sentLines` 只在 `_send()` 里
+   `clear() + addAll(linesToSend(...))`，**用户手工增删行时它不动**。所以发完
+   `a\nb` 再在上面插入一行，被标暗的仍是行号 0/1 —— 而那两行已经不是当初发出去
+   的内容了。这是 FR-E-10 按**行号**记的语义取舍（按"行号"而不是按"内容"记才
+   能在同一行多次发送时不乱），不是缺陷；真要修得给每次发送留一个内容指纹。
+   Task 7 那条高亮用例**只验了"标记落在对的行上"**，没有验这个场景 —— 名字已
+   按实测范围改准。
 
 ---
 
