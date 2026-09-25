@@ -483,9 +483,11 @@ EOF
 
 ## Task 3: `ansi_text.dart` —— ANSI 到 Flutter 的映射
 
-**为什么它是纯函数**：`AnsiStyle` / `AnsiColor` 是 `lib/render/` 的产物（纯 Dart，NFR-M-01），把它们映射成 Flutter 的 `Color` 与 `TextSpan` 是**纯计算**，不需要渲染任何东西就能验。颜色映射最容易写错（xterm 256 色的立方与灰阶），所以它值得有自己的用例。
+**为什么它是纯函数**：`AnsiStyle` / `AnsiColor` 是 `lib/render/` 的产物（纯 Dart，NFR-M-01），把它们映射成 Flutter 的 `Color` 与 `TextSpan` 是**纯计算**，不需要渲染任何东西就能验。
 
-**`_basicRgb` 是私有的**：`lib/render/ansi_parser.dart` 里的 16 色表是 `const List<(int,int,int)> _basicRgb`（前导下划线 = 库私有）。**不要去改它的可见性**——那会动到已冻结的 `render/` 层。本文件自己带一份表，并写明这份重复的理由。
+**颜色换算一律走 `AnsiColor.rgb`，本文件不做任何换算。** 那个 getter 是**公开的**（在 `lib/render/ansi_parser.dart` 的 `sealed class AnsiColor` 上），文档明写「换算放在这一层，**不留给调用方**」—— 16 色表、256 色的 6×6×6 立方与 24 级灰阶都已经在那里实现、也已经在那里被测（`test/render/ansi_parser_test.dart:173-189` 逐条钉着 `AnsiBasic(1)` / `Ansi256(196)` / `Ansi256(240)` / `AnsiRgb` 的值）。
+
+**所以本文件一行颜色数学都不该有。** 我最初写这一节时复制了一份 16 色表并重写了立方/灰阶公式，理由是"那份 `_basicRgb` 是库私有的"——**那个理由是错的**：私有的是那张表，公开的是 `rgb` getter。复制表的代价不是多写二十行，而是**制造第二个真相**：我抄的那份在 4 号色上就抄错了（写成 `0xCD` 即 205，真实是 `238`），而两处的差异不会有任何用例去发现。
 
 **Files:**
 - Create: `lib/ui/widgets/ansi_text.dart`
@@ -500,40 +502,32 @@ import 'package:win_cli_tool/render/ansi_parser.dart';
 import 'package:win_cli_tool/ui/widgets/ansi_text.dart';
 
 void main() {
-  group('颜色映射', () {
-    test('16 色：前 8 个是标准色，8~15 是亮色', () {
-      expect(ansiColorOf(const AnsiBasic(0)), const Color(0xFF000000));
+  group('颜色：一律委托给 AnsiColor.rgb', () {
+    test('没有颜色时给 null（调用方据此用主题默认色，而不是硬编码黑白）', () {
+      expect(ansiColorOf(null), isNull);
+    });
+
+    test('16 色走 rgb getter —— 用 4 号色钉住"没有第二份表"', () {
+      // **4 号色是这一节存在的理由。** 我最初那版在这里自己维护了一份 16 色表，
+      // 而它把 4 号色抄成了 205（真实是 238）。下面第一行断言的是 render 层的
+      // 事实，第二行断言的是本文件确实**委托**给了它 —— 一旦有人再抄一份表，
+      // 露馅的第一个就是这一格。
+      expect(const AnsiBasic(4).rgb, (0, 0, 238), reason: '前提：render 层的值');
+      expect(ansiColorOf(const AnsiBasic(4)), const Color(0xFF0000EE));
       expect(ansiColorOf(const AnsiBasic(1)), const Color(0xFFCD0000));
-      expect(ansiColorOf(const AnsiBasic(7)), const Color(0xFFE5E5E5));
-      expect(ansiColorOf(const AnsiBasic(8)), const Color(0xFF7F7F7F));
       expect(ansiColorOf(const AnsiBasic(15)), const Color(0xFFFFFFFF));
     });
 
-    test('256 色：0~15 与 16 色表一致', () {
-      expect(ansiColorOf(const Ansi256(0)), ansiColorOf(const AnsiBasic(0)));
-      expect(ansiColorOf(const Ansi256(9)), ansiColorOf(const AnsiBasic(9)));
-    });
-
-    test('256 色：16~231 是 6×6×6 立方，取值为 0/95/135/175/215/255', () {
-      // 16 是立方体的原点 (0,0,0)。
-      expect(ansiColorOf(const Ansi256(16)), const Color(0xFF000000));
-      // 17 是 (0,0,1) —— 蓝通道取第一档 95。
-      expect(ansiColorOf(const Ansi256(17)), const Color(0xFF00005F));
-      // 231 是 (5,5,5) —— 三通道都取最高档 255。
-      expect(ansiColorOf(const Ansi256(231)), const Color(0xFFFFFFFF));
-    });
-
-    test('256 色：232~255 是 24 级灰阶', () {
-      expect(ansiColorOf(const Ansi256(232)), const Color(0xFF080808));
-      expect(ansiColorOf(const Ansi256(255)), const Color(0xFFEEEEEE));
-    });
-
-    test('真彩色直接取三通道', () {
+    test('256 色与真彩色同样走 rgb', () {
+      expect(ansiColorOf(const Ansi256(196)), const Color(0xFFFF0000));
+      expect(ansiColorOf(const Ansi256(240)), const Color(0xFF585858));
       expect(ansiColorOf(const AnsiRgb(0x12, 0x34, 0x56)), const Color(0xFF123456));
     });
 
-    test('没有颜色时给 null（调用方据此用主题默认色，而不是硬编码黑白）', () {
-      expect(ansiColorOf(null), isNull);
+    test('256 个索引逐个走一遍都不抛（把 rgb 的断言暴露出来）', () {
+      for (var i = 0; i < 256; i++) {
+        expect(ansiColorOf(Ansi256(i)), isNotNull);
+      }
     });
   });
 
@@ -543,7 +537,8 @@ void main() {
         const AnsiSpan('x', AnsiStyle(foreground: AnsiBasic(1), background: AnsiBasic(4))),
       );
       expect(span.style!.color, const Color(0xFFCD0000));
-      expect(span.style!.backgroundColor, const Color(0xFF0000CD));
+      expect(span.style!.backgroundColor, const Color(0xFF0000EE),
+          reason: '4 号色的真实值 —— 抄错表的那一版会在这里红');
     });
 
     test('bold 与 underline 落到字重与装饰', () {
@@ -610,69 +605,23 @@ import 'package:flutter/material.dart';
 
 import '../../render/ansi_parser.dart';
 
-/// 16 色（xterm 标准调色板）。
-///
-/// **这份表与 `lib/render/ansi_parser.dart` 里那份 `_basicRgb` 是重复的，这是
-/// 有意接受的。** 那一份是库私有的（前导下划线），且 `render/` 层的职责是"解析
-/// 控制序列"，把 Flutter 的 `Color` 塞进去会让一个纯 Dart 模块（NFR-M-01）
-/// 依赖 Flutter。重复的是 16 行常量，换来的是两层各自的边界不被打穿。
-/// **若哪天要改颜色，两处都要改** —— 所以本文件与 `ansi_parser.dart` 各有一条
-/// 用例钉着第 1、4、7、8、15 号色。
-const List<(int, int, int)> _basicRgb = [
-  (0x00, 0x00, 0x00), // 0 黑
-  (0xCD, 0x00, 0x00), // 1 红
-  (0x00, 0xCD, 0x00), // 2 绿
-  (0xCD, 0xCD, 0x00), // 3 黄
-  (0x00, 0x00, 0xCD), // 4 蓝
-  (0xCD, 0x00, 0xCD), // 5 品红
-  (0x00, 0xCD, 0xCD), // 6 青
-  (0xE5, 0xE5, 0xE5), // 7 白
-  (0x7F, 0x7F, 0x7F), // 8 亮黑
-  (0xFF, 0x00, 0x00), // 9 亮红
-  (0x00, 0xFF, 0x00), // 10 亮绿
-  (0xFF, 0xFF, 0x00), // 11 亮黄
-  (0x5C, 0x5C, 0xFF), // 12 亮蓝
-  (0xFF, 0x00, 0xFF), // 13 亮品红
-  (0x00, 0xFF, 0xFF), // 14 亮青
-  (0xFF, 0xFF, 0xFF), // 15 亮白
-];
-
-/// xterm 256 色里 6×6×6 立方体的六个取值档。
-const List<int> _cubeSteps = [0, 95, 135, 175, 215, 255];
-
 /// [AnsiColor] → Flutter 的 [Color]；`null` 给 `null`。
 ///
 /// **`null` 不是"黑色"，是"没有指定"**——调用方据此用主题的前景色/背景色，
 /// 这样深色主题下不带颜色的输出才是可读的。硬编码成黑白会让深色主题下的
 /// 普通输出变成黑底黑字。
-Color? ansiColorOf(AnsiColor? color) => switch (color) {
-  null => null,
-  AnsiBasic(:final index) => _fromBasic(index),
-  // 256 色：0~15 复用 16 色表，16~231 是 6×6×6 立方，232~255 是 24 级灰阶。
-  Ansi256(:final index) => switch (index) {
-    < 16 => _fromBasic(index),
-    < 232 => _fromCube(index - 16),
-    _ => _fromGray(index - 232),
-  },
-  AnsiRgb(:final r, :final g, :final b) => Color.fromARGB(255, r, g, b),
-};
-
-Color _fromBasic(int index) {
-  final (r, g, b) = _basicRgb[index];
+///
+/// **换算本身一行都不在这里。** [AnsiColor.rgb] 是公开的，而且 `render/` 层的
+/// 文档明写「换算放在这一层，不留给调用方」—— 16 色表、256 色的 6×6×6 立方与
+/// 24 级灰阶都已经在那里实现、也已在那里被测。这里只是把那个三元组包成
+/// Flutter 的 [Color]。
+///
+/// **别在这里加表或公式。** 那会制造第二个真相，而两处的差异不会有任何用例
+/// 去发现 —— 本文件的第一版就是这样，把 4 号色抄成了 205（真实是 238）。
+Color? ansiColorOf(AnsiColor? color) {
+  if (color == null) return null;
+  final (r, g, b) = color.rgb;
   return Color.fromARGB(255, r, g, b);
-}
-
-Color _fromCube(int offset) => Color.fromARGB(
-  255,
-  _cubeSteps[(offset ~/ 36) % 6],
-  _cubeSteps[(offset ~/ 6) % 6],
-  _cubeSteps[offset % 6],
-);
-
-/// 灰阶 232~255 是 `8 + 10 * n`（n 从 0 到 23）。
-Color _fromGray(int n) {
-  final v = 8 + 10 * n;
-  return Color.fromARGB(255, v, v, v);
 }
 
 /// 反转视频时用的默认前景。取暗灰而不是纯黑：纯黑在很多主题里就是背景色，
@@ -737,6 +686,8 @@ Expected: 全绿。
 
 **注意"空缓冲"那条**：`ansiLinesToTextSpan([<AnsiSpan>[]])` 的输入长度是 1（`OutputBuffer` 的 `_lines` 永远至少有一项），循环进去 0 个片段、也不加 `\n`，所以 `children` 是空的——断言 `root.children` 为空成立。若实现里把"空 children"改成"给个空串"，那条会红，**不要改断言去迁就**。
 
+**这一节里没有 16 色表、没有立方公式、没有灰阶公式，这是对的。** 如果你觉得"总得有个地方把 `AnsiColor` 变成 `Color`"，那就是 `ansiColorOf` 那个三行函数，而值来自 `AnsiColor.rgb`。计划的前一版在这里放了一份复制的表和一套重写的公式，被推翻了 —— 理由与修正见上面的说明。
+
 - [ ] **Step 5: 提交**
 
 ```bash
@@ -744,11 +695,16 @@ git add lib/ui/widgets/ansi_text.dart test/ui/ansi_text_test.dart
 git commit -m "$(cat <<'EOF'
 feat(ui): ANSI 到 Flutter 的颜色与 TextSpan 映射
 
-16 色 / 256 色的立方与灰阶 / 真彩色各有用例钉着。无颜色的字段一律留 null，
-让主题决定 —— 硬编码黑白会让深色主题下的普通输出变成黑底黑字。
+颜色换算一行都不在本文件：AnsiColor.rgb 是公开的，render/ 层的文档明写"换算
+放在这一层，不留给调用方"，16 色表与 256 色的立方/灰阶都已经在那边实现并测过。
 
-16 色表与 render/ansi_parser.dart 里那份是重复的，这是有意接受的：那份是
-库私有，而把 Color 塞进 render/ 会让纯 Dart 模块（NFR-M-01）依赖 Flutter。
+计划初稿在这里复制了一份 16 色表，理由是"那份 _basicRgb 是库私有的" —— 理由
+是错的（私有的是表，公开的是 getter），代价是制造第二个真相：抄的那份在 4 号
+色上就抄错了（205 vs 真实 238），而差异不会有用例发现。用例里用 4 号色钉住
+"没有第二份表"。
+
+无颜色的字段一律留 null，让主题决定 —— 硬编码黑白会让深色主题下的普通输出
+变成黑底黑字。
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>
 EOF
