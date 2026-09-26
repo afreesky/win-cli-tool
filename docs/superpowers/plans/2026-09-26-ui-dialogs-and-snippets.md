@@ -6137,8 +6137,13 @@ Expected: 无输出（5b-1 收尾时也是无输出）。
 本计划的 Task 3（编辑区 +命令库）、Task 7（编辑区 +导入文件）、Task 8（编辑区 +同步到另一台）与 Task 9（主窗口 AppBar +设置）都改了像素，**每一步当时都已经重生成了**（Task 3 的 Step 9b、Task 7 的 Step 8b、Task 8 的 Step 7b、Task 9 的 Step 6）。这一步是最后一遍确认：**没有一张漏在中间**。若有哪张的 mtime 早于它对应的那次改动，说明那一步被跳过了 —— 补上。
 
 Run: `WCT_GOLDEN=1 flutter test test/ui/main_window_golden_test.dart --update-goldens`
-Expected: **5 条全跑（不是跳过）且 PASS，并且 `git status --short` 在 `test/ui/golden/`
+Expected: **3 条全跑（不是跳过）且 PASS，并且 `git status --short` 在 `test/ui/golden/`
 下必须没有输出。**
+
+**⚠ 条数是 3 不是 5 —— 这处初稿写错了，执行时由实施者指出并改正。** 该文件有
+**3 个 `testWidgets`**，第 3 条（「面板 —— 设备列表 / 编辑区 / 输出区」）一次
+比 **3 张** PNG，加上前两条各 1 张，**合计 5 张图 / 3 条用例**。所以跑全的指纹是
+`+3`（无 `~`），跳过时是 `~3`。
 
 ⚠ **这一行原先写的是"Expected: … 且 `git status` 显示改动"，方向是反的，已改正。**
 `--update-goldens` **无条件重写全部五张 PNG**，而 5b-1 已经证明这条流水线是
@@ -6154,8 +6159,8 @@ Step 4 存在的全部意义就是抓它。
 **还有一道静默的坑**：`golden_harness.dart` 在本机缺字体时会把整组**跳过**
 （`fontsAvailable`）。已确认本机两个字体文件都在
 （`/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc`、
-`/usr/share/fonts/wqy-microhei/wqy-microhei.ttc`），所以应当看到 **5 条通过**。
-看到 `~5` 就是字体没了 —— 那不是验收通过，是没跑。
+`/usr/share/fonts/wqy-microhei/wqy-microhei.ttc`），所以应当看到 **3 条通过
+（`+3`）**。看到 `~3` 就是字体没了 —— 那不是验收通过，是没跑。
 
 **逐张开图确认**（这是这一步的全部价值）：
 
@@ -6335,3 +6340,178 @@ Expected：PNG 是 1280x720 的真图（不是 586 字节、2 色的空白图）
 ⚠ **15 个任务一个都没实现过。** 任务 1–3 只是"在写这份计划时最先落笔的三段"，不是"已经做完的三段"。落笔时逐条核对过它们的目标现状（`Snippet` 在 `device_profile.dart:26-50` 且确实没有 `==`；`editor_panel.dart` 确实没有 `insertAtCursor`/`replaceAllText`/`appendText`；`test/models/device_profile_test.dart:235` 的 `group('Snippet')` 里确实只有一条 JSON 往返用例），三处的"为什么做"都成立 —— 也就是说 **Task 1/2/3 都还有活要干**。
 
 **已知的验证欠账（不在本计划内，如实记着）**：5a 的 Tasks 1–6 的 diff 没有被独立复读过；5b-1 的每一个 diff 也没有独立评审。这本计划同样按用户 `停止测试，先完成剩余编码` 的指示执行 —— **只跑实施者，不跑独立评审**。
+
+---
+
+# 5b-2 收尾验收记录（2026-09-26）
+
+**结论：15 个任务全部落地，本计划列出的验收判据全部达到。** 有一条**已知的验收债**
+（全仓测试的 flake，见第 5 节）：它不改变本次"代码做完了"的结论，但它让
+**"全仓 `flutter test` 绿"这个判据在本机基本不可用**，如实记在最显眼处。
+
+## 1. 落地清单
+
+`053582b`（计划本身）之后共 **42 个提交**，其中 **18 个**改代码/测试
+（`git log --oneline 053582b..HEAD`）。逐任务：
+
+| 任务 | 实现提交 |
+|---|---|
+| 1 Snippet 值相等 | `efc8c9c`、`d00e2af`（const 规范化那条恒真用例的修） |
+| 2 编辑区文本 API | `a58fc93` |
+| 3 命令库抽屉 | `8dd5edf` |
+| 4 设备编辑对话框 | `6c277a5`、`a1073c0`（`useTallSurface`/`pumpUntilSnackBar` 提到共享脚手架） |
+| 5 改连接参数就断开（决策①） | `0dd46db` |
+| 6 右键四项 + ＋ 接真对话框 | `6759f6f` |
+| 7 导入文件（FR-E-15/16） | `0fbcf78` |
+| 8 同步到另一台（FR-E-17） | `29793ac`、`1dab9c4` |
+| 9 设置对话框 | `b491bf0` |
+| 10 已知主机密钥区 | `3d732d7` |
+| 11 指纹确认 + `onUnknownHostKey` 接线 | `4338fef`、`f031c80`（缩进） |
+| 12 FR-C-06 首次失败即变红（决策②） | `d1193d4`、`5a3dff8`（过期注释） |
+| 13 断线文案（决策③） | `66fd048` |
+| 14 §13.21-2/4 两笔 | `78d9ba0` |
+| 15 收尾 | 不改代码 |
+
+另有 4 个提交把测试脚手架提到共享层（`da0f122`、`bf547a7`、`32f371b`）；其余
+为计划拼接与 `docs/` 更正。**HEAD = `092d7f1`，工作树干净。**
+
+## 2. 验收原始输出（Step 1–5）
+
+**Step 1 全仓测试** —— 达标的那一条：
+
+```
+00:16 +608 ~3: All tests passed!
+```
+
+（5b-1 收尾时是 510 通过 + 3 跳过；本刀净增 **98 条**。）
+
+**Step 2 静态检查**：
+
+```
+$ dart analyze lib/ test/
+Analyzing lib, test...
+No issues found!
+EXIT=0
+```
+
+**Step 3 NFR-M-01 的 grep**：`grep -rn "print(" lib/` 与 `grep -rn "debugPrint(" lib/`
+**均无输出**（exit 1 = 无匹配），与 5b-1 收尾时一致。
+
+**Step 4 golden 重生成**：
+
+```
+$ WCT_GOLDEN=1 flutter test test/ui/main_window_golden_test.dart --update-goldens
+00:00 +0: 主窗口 —— 浅色
+00:00 +0: +1: 主窗口 —— 深色
+00:01 +2: 面板 —— 设备列表 / 编辑区 / 输出区
+00:01 +3: All tests passed!
+```
+
+`git status --short` **全仓无输出** —— 即 `test/ui/golden/` 下**零改动**。
+这是本步要的结论，而**判据是字节不是 mtime**（`--update-goldens` 无条件重写五张，
+五张的 mtime 必然被刷新到 `12:28/12:29`）。五张的 sha256 在重写前后**逐张相同**，
+控制者事后独立复核过：
+
+```
+5eadf7c7…  device_list_panel.png
+daef80eb…  editor_panel.png
+df92559e…  main_window_dark.png
+aa65369a…  main_window_light.png
+ff869f77…  output_panel.png
+```
+
+⇒ **五张都已是最新，没有任何一步的像素改动漏在中间，渲染后端也没漂。**
+
+逐张开图确认（实施者与**控制者各自**用 Read 看过，结论一致）：
+
+- `main_window_light.png` / `_dark.png`：AppBar 右上角 **「设置」齿轮在左、「＋」在右**；编辑区工具栏 6 个图标，顺序为 连接 / 断开（置灰）/ 发送 / 命令库 / 导入文件 / 同步到另一台；输出区是带颜色的 Huawei 回显（`Info` 绿、`Error` 红、`42` 黄、「不在位」反白）。
+- `editor_panel.png`：同 6 个图标；正文行号 **1–5 完整**（`sys` / `interface GE0/0/1` / ` description 上行链路` / `display version` / `quit`），没有停在 1。
+- `device_list_panel.png` / `output_panel.png`：与 5b-1 观感一致，本计划没动它们。
+
+**Step 5 真机冒烟**：`flutter build linux --release` **一次成功**。`xwininfo` 命中两条，
+取 **`0x3000002`（1280x720）**，不取 `0x3000001`（10x10 未映射的 GTK group leader）。
+
+```
+$ DISPLAY=:11 import -window 0x3000002 /tmp/wct_5b2_smoke.png
+-rw-rw-r-- 1 lwliu lwliu 4964 Sep 26 12:30 /tmp/wct_5b2_smoke.png
+PNG image data, 1280 x 720, 8-bit colormap, 243 colors
+```
+
+不是 586 字节的空白图。控制者独立开图看到：标题「网络设备命令行工具」，右上角
+**齿轮与「＋」都清晰（齿轮在左）**，正文中央「请先添加一台设备」，**没有 debug 的
+`DEBUG` 角标遮挡**。
+
+数据重定向用 `XDG_DATA_HOME=/tmp/wct-smoke-data`；用户真实数据目录
+`~/.local/share/com.example.win_cli_tool` 的 mtime 仍是 `2026-09-25 13:06:42`，
+**未被本次冒烟触碰**。收尾已杀进程、删临时目录。
+
+**这一步证明了什么、没证明什么**：证明了**空设备列表下**应用能起、能渲染、AppBar
+两个按钮在。**没证明**有设备时的界面（造设备要键盘输入），那部分由 golden 覆盖；
+**没证明**未决项 14（防抖窗口内关窗），原因见下。
+
+## 3. 未决项 14 的处置
+
+**记为「本机无法用真机验证」，不写成"已验证"。** 它问的是"打字后在 500ms 防抖窗口内
+关窗，重开还在不在"，必须先能向应用输入文本；本机**实测确认** `xdotool` / `xte` /
+`wmctrl` / `ydotool` **四个都不存在**，无法合成按键。该行为目前**只有 widget 测试
+覆盖**，不是真机证据。
+
+## 4. 本轮在计划自身发现的问题（都不是实施者的错）
+
+1. **`git add` 之外的收尾命令也会咬人：`pkill -f 'bundle/win_cli_tool'` 会杀掉执行它的
+   shell 本身**（`pkill -f` 匹配全命令行，而那条命令自己的命令行里就含这个字面量）。
+   实施者第一次执行即被自杀（exit 144）。**改用 `pkill -f '[b]undle/win_cli_tool'`
+   这类自排除写法，或先 `pgrep` 出 pid 再 `kill`。** 计划原文给的命令已在此更正。
+2. **本记录上方 Step 4 的"5 条"初稿写错了**（实际 3 条用例 / 5 张图），由实施者
+   指出并已就地改正 —— 见那一段里的更正说明。
+3. **Task 11 的提交信息丢了两个 ASCII 引号**（`git commit -m "…"` 把信息里的 `"`
+   当成串边界吃掉，commit `4338fef`）。改写历史是用户的硬约束，所以**不改**，
+   记在 Task 11 的 Step 9 执行记录里，免得后来的人比对时以为漏了什么。
+
+## 5. ⚠ 已知验收债：全仓 `flutter test` 的 flake 在本机近乎必然
+
+**这是本刀唯一没解决、且会影响后续 CI 的问题。** 量级远大于"偶发"：
+
+在本仓库观测到的全仓跑里，**20 次有 15 次红**（分任务：Task 12 实施者 4 跑 2 红、
+控制者 1 跑 1 红、Task 13 实施者 3 跑 2 红、Task 14 实施者 2 跑 1 红、Task 15
+实施者 **10 跑 9 红**，其中 Run 9 一次挂 2 条）。挂点全部落在 `test/ui/` 的 widget
+用例上，**每次挂的可以不同**：
+
+| 文件 | 观测到的挂点 | 占红次数 |
+|---|---|---|
+| `device_list_panel_test.dart` | 右键删除（FR-D-04）、拖拽排序（FR-D-03） | **11 / 15**（最热） |
+| `main_window_test.dart` | 切换设备时草稿跟着换（FR-E-03） | 4 / 15 |
+| `editor_text_api_test.dart` | 改文本会触发草稿落盘（FR-E-03） | 只在干净 worktree 那次诊断里出现过 |
+
+**性质是已知 flake，不是回归**：① 每次都是"总数对、只少一条"（`+607 ~3 -1`）；
+② 挂的文件**单独跑必绿**（实施者逐一验过）；③ 在没有本地改动的干净 `git worktree`
+上同样复现；④ 它与本刀任何一次改动都没有对应关系（挂点跨 Task 12/13/14 不变）。
+
+**成因有据可查、不用猜**：`test/ui/ui_harness.dart` 的 `settleDisk` 文档自己写着它是
+**写死的** 12 × 5ms ≈ 60ms **真实时间**，而 `pump` / `pumpAndSettle` 推的是假时钟、
+推不动真盘 I/O。全仓跑时文件是并行起 isolate 的，机器一忙这 60ms 就不够。同一份文档
+还记着"同一份代码多一句 `debugPrint` 就从红变绿"。**这台机器的负载是常态**：48 核、
+load average 6.84，另有一个 UVM 仿真进程长期占满 1 核，Xvnc `:11` 也在跑。
+
+**为什么本次不修**：用户的口径是 `停止测试，先完成剩余编码`。修法是把"等一段固定时间"
+换成"等条件成立"（`pumpUntilTrue` / `pumpUntil` 已经在脚手架里，就是为这件事写的），
+但它要动 ~30 个调用点、且每个都碰得到断言 —— 那是测试基建改造，不是这一刀要落的代码。
+**作为已知债留给下一刀。**
+
+**下一次要拿"全仓绿"时**：若红在 `test/ui/` 的 widget 用例上，**先单跑那个文件、
+再重跑全仓**，别当成回归。Task 15 就是这样在 Run 10 拿到 `+608 ~3` 的。
+
+## 6. 仍然开着的验证欠账
+
+**本刀的每一个 diff 都没有独立评审过。** 执行方式是用户 `按1执行` 指定的
+Subagent-Driven Development，但按 `停止测试，先完成剩余编码` 的指示**只跑了实施者**，
+省掉了 spec 合规评审与代码质量评审两段 —— 所以 **Task 1–15 的 diff 全部只有控制者
+一个人看过**。这与 5a Tasks 1–6、5b-1 全部 diff 的欠账是同一笔，现在又叠上了 5b-2。
+
+**实施者报告没有用户授权**：子代理的交付报告每一份都只当"该代理的陈述"处理。
+写进本记录的关键结论里，控制者**另行复核过**的是：全仓测试的通过数、`dart analyze`
+输出、五张 golden 的 sha256 与 `git status` 干净（含"重写后字节不变"这个判据本身）、
+逐张开图看到的 AppBar 图标顺序与工具栏 6 图标、冒烟截图的画面、子代理违反约束的
+痕迹（`git status`/`HEAD` 干净）。**没有逐一复核**的是各实施者对源码的陈述
+（例如 Task 14 报的"`lib/` 里直接调 `Session.connect()` 只有一处"）—— 那些是
+按"实施者自称已核对"记录的，不是控制者独立验证过的。
