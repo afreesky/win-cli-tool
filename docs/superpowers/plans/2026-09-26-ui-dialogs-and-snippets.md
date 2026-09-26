@@ -3850,7 +3850,22 @@ void main() {
           .value,
       isFalse,
     );
-    expect(find.text('深色'), findsOneWidget);
+    // **不能用 `find.text('深色')` 断主题初值 —— 那条断言恒真。**
+    // `DropdownButton` 把**所有**选项都塞进一个 `IndexedStack`，只画选中
+    // 那一个（`dropdown.dart:1624`，`children: widget.isDense ? items : …`）。
+    // 三个选项不管选谁都在元素树上，`find.text('深色')` 永远是
+    // `findsOneWidget` —— 把 `_theme` 写死成 `AppTheme.light` 它照样绿。
+    //
+    // 断 `initialValue`：它就是构造时传进去的 `_theme`（`dropdown.dart:1871`
+    // 转发给 `FormField.initialValue`），能真的红。
+    expect(
+      tester
+          .widget<DropdownButtonFormField<AppTheme>>(
+            find.byKey(const ValueKey('settings-theme')),
+          )
+          .initialValue,
+      AppTheme.dark,
+    );
   });
 
   testWidgets('改三项数值后保存，设置与盘上文件都变了（FR-G-01/02）', (tester) async {
@@ -3888,7 +3903,17 @@ void main() {
       await tester.tap(find.text('保存'));
       await tester.pumpAndSettle();
       expect(
-        find.textContaining('命令执行超时必须是'),
+        // **这个空格是承重的，别"顺手"删掉。** 对话框那边的模板是
+        // `'$label 必须是正整数'` —— `$label` 与「必须是」之间有一个空格，
+        // 渲染出来是「命令执行超时 必须是正整数」。写成
+        // `find.textContaining('命令执行超时必须是')`（无空格）**匹配不上**，
+        // 这条用例会在四个坏值上全部报 findsNothing。
+        //
+        // 对照 Task 4 的设备编辑对话框：那边的模板是
+        // `'端口必须是 1 到 65535 之间的整数'`（空格在「必须是」**之后**），
+        // 所以它的断言 `'端口必须是'` 恰好不跨空格。两处的空格位置不同，
+        // 断言的切法就得跟着不同。
+        find.textContaining('命令执行超时 必须是'),
         findsOneWidget,
         reason: '「$bad」应当被挡下',
       );
@@ -4351,7 +4376,10 @@ class _SettingsDialogState extends ConsumerState<SettingsDialog> {
 import 'dialogs/settings_dialog.dart';
 ```
 
-在 `test/ui/main_window_test.dart` 末尾追加：
+在 `test/ui/main_window_test.dart` 追加一条 —— **位置是 `main()` 的闭括号之前**
+（该文件现在 214 行，第 214 行那个 `}` 收的是 `main`；追加到它**后面**是语法
+错误，`dart analyze` 会直接报 `Expected a declaration`）。也就是插在现在第 213
+行 `});` 与第 214 行 `}` 之间：
 
 ```dart
   testWidgets('AppBar 的「设置」打开设置对话框（FR-G-01）', (tester) async {
