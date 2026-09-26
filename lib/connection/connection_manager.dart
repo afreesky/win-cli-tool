@@ -16,7 +16,8 @@ import 'session_factory.dart';
 /// connected→绿、reconnecting→黄、failed→红。
 ///
 /// 注意"红"：§5.4 的逐事件表里**没有**红（只有黄/黄/绿/灰），红来自
-/// FR-C-06 的"连接失败"。`failed` 何时可达目前尚未定论，见 spec §13.17-3。
+/// FR-C-06 的"连接失败"。**它何时可达已定**（2026-09-26 拍板）：首次失败
+/// 即变红，之后的重试期间是黄 —— 见 [DeviceConnectionState.failed]。
 enum DeviceConnectionState {
   /// 未连接。与 [connecting]/[reconnecting] 同为"没有连接"，
   /// 但颜色不同：这两个是黄，本状态是灰。
@@ -27,10 +28,14 @@ enum DeviceConnectionState {
   /// 重连中。与 [connecting] **颜色相同**（都是黄），区别只在输出区文案。
   reconnecting,
 
-  /// 连接失败且**不再自动重试**（`autoReconnect` 为 false 时）。
+  /// 连接失败（FR-C-06）。**首次失败即进入本状态**，按钮变红。
   ///
-  /// 注意：用户主动断开**不是**这个状态 —— §5.4 要求那种情况按钮变灰，
-  /// 也就是 [disconnected]。
+  /// 红**不代表"不再重试"**：`autoReconnect` 打开时（默认）下一次尝试会在
+  /// 退避时长之后自动发起，那时状态转为 [reconnecting]（黄）。`autoReconnect`
+  /// 关闭时则一直停在这里。
+  ///
+  /// 用户主动断开**不是**这个状态 —— §5.4 要求那种情况按钮变灰，也就是
+  /// [disconnected]。
   failed;
 
   /// 该状态下设备按钮是否应显示为"有连接"。重连中算"没有连接"——
@@ -371,7 +376,18 @@ class ConnectionManager {
       return;
     }
 
-    _setState(DeviceConnectionState.reconnecting);
+    // FR-C-06：**首次失败当场变红**，之后才走退避（决策②）。
+    //
+    // `_attempt` 在这里是"此前已经失败过几次"：它在连接成功时归零
+    // （见 `_attemptConnect` 末尾），也在 `disconnect()` 里归零。所以
+    // `_attempt == 0` 就是"刚连上过、或者这是第一次尝试" —— 这两种情况下
+    // 用户看到红都是对的。之后的重试仍是黄（`_attemptConnect` 开头按
+    // `_attempt` 是否为 0 选 `connecting` / `reconnecting`）。
+    if (_attempt == 0) {
+      _setState(DeviceConnectionState.failed);
+    } else {
+      _setState(DeviceConnectionState.reconnecting);
+    }
     _attempt++;
 
     // 超出序列时用最后一项（封顶，FR-C-07）。

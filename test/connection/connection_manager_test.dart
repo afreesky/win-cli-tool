@@ -192,7 +192,12 @@ void main() {
       mgr.connect(); // 第 1 次尝试立即失败
       async.flushMicrotasks();
       expect(factory.created, 1);
-      expect(mgr.state, DeviceConnectionState.reconnecting);
+      // FR-C-06（决策②）：**首次失败当场变红**，退避继续排。
+      expect(
+        mgr.state,
+        DeviceConnectionState.failed,
+        reason: '第一次就连不上时按钮必须是红的，不是黄的',
+      );
 
       // 第 1 次重连：1s。差 1ms 时必须还没动，否则"等了 1s"无从证明。
       async.elapse(const Duration(milliseconds: 999));
@@ -731,6 +736,10 @@ void main() {
         [
           DeviceConnectionState.connecting,
           DeviceConnectionState.connected,
+          // FR-C-06（决策②）：掉线时 `_attempt` 是 0（上次连接成功时归的零），
+          // 所以先红；1s 后重连定时器醒来，`_attemptConnect` 看到 `_attempt == 1`，
+          // 于是这一格是**黄**（重连中）而不是灰/红。
+          DeviceConnectionState.failed,
           DeviceConnectionState.reconnecting,
           DeviceConnectionState.connected,
           DeviceConnectionState.disconnected,
