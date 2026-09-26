@@ -5323,8 +5323,14 @@ class _HostKeyPromptHostState extends ConsumerState<HostKeyPromptHost> {
   var _showing = false;
 
   @override
-  Widget build(BuildContext context) {
-    ref.listen(hostKeyPromptProvider, (previous, next) {
+  void initState() {
+    super.initState();
+    // **riverpod 3.x 的 `ref.listen` 没有 `fireImmediately`。** 带这个开关的
+    // 是 `ref.listenManual`，而它的文档点明了两个用法：`initState` 这类生命
+    // 周期，以及"弹模态" —— 本部件两个都占（它 `addPostFrameCallback` 里
+    // `showDialog`）。计划里写的是 `ref.listen(..., fireImmediately: true)`，
+    // 那个签名在 3.4.3 上不存在；这里只换 API，下面的监听体与意图一字未动。
+    ref.listenManual(hostKeyPromptProvider, (previous, next) {
       // `fireImmediately` 是为了"本部件挂载时就已经有一个在等"这种时序
       // （`ask` 发生在建连那一刻，可能早于本部件的第一帧）。
       if (next == null || _showing) return;
@@ -5342,9 +5348,10 @@ class _HostKeyPromptHostState extends ConsumerState<HostKeyPromptHost> {
         ref.read(hostKeyPromptProvider.notifier).reply(next, accepted);
       });
     }, fireImmediately: true);
-
-    return widget.child;
   }
+
+  @override
+  Widget build(BuildContext context) => widget.child;
 }
 ```
 
@@ -5353,13 +5360,13 @@ class _HostKeyPromptHostState extends ConsumerState<HostKeyPromptHost> {
 在 `lib/state/providers.dart` 的 `sessionFactoryProvider` 里，`verifyHostKey:` 那一行**之后**加：
 
 ```dart
-      // FR-C-11 / NFR-S-03：**首次连接某主机时问用户。** 少了这一行，
-      // `SessionFactory.onUnknownHostKey` 就是 null，而 `SshSession` 里那句
-      // `await onUnknownHostKey?.call(candidate) ?? false` 于是恒为 false ——
-      // 没有主机密钥能被登记，任何一台新设备都连不上。校验开着（默认）却
-      // 谁也连不上，是这一版里最严重的一条。
-      onUnknownHostKey: (host) =>
-          ref.read(hostKeyPromptProvider.notifier).ask(host),
+    // FR-C-11 / NFR-S-03：**首次连接某主机时问用户。** 少了这一行，
+    // `SessionFactory.onUnknownHostKey` 就是 null，而 `SshSession` 里那句
+    // `await onUnknownHostKey?.call(candidate) ?? false` 于是恒为 false ——
+    // 没有主机密钥能被登记，任何一台新设备都连不上。校验开着（默认）却
+    // 谁也连不上，是这一版里最严重的一条。
+    onUnknownHostKey: (host) =>
+        ref.read(hostKeyPromptProvider.notifier).ask(host),
 ```
 
 文件顶部加 import：
@@ -5420,6 +5427,12 @@ SshSession 的 `?? false` 于是把每一次首次连接都判成拒绝。
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
+
+> **执行记录（2026-09-26）：这条提交信息落地时丢了两个 ASCII 引号。**
+> 上面那句 `修的是"校验开着却谁也连不上"` 里的两个 `"` 被 `git commit -m "..."`
+> 当成串的边界吃掉了，**提交信息里没有它们**（commit `4338fef`）。代码与测试不受
+> 影响，只是信息文本与这里少两个字符。改写历史（`--amend`）是用户的硬约束，
+> 所以**不改**，记在这里以免后来的人比对时以为漏了什么。
 
 ---
 
@@ -6145,7 +6158,7 @@ Expected：PNG 是 1280x720 的真图（不是 586 字节、2 色的空白图）
 - `_setText` 是 Task 2 的私有方法，Task 7/8 不直接调它（都走那三个公开方法）。
 - `ValueKey` 命名前后一致：`device-*`（Task 4/5）、`settings-*`（Task 9）、`known-host*`（Task 10）、`import-path`（Task 7）、`sync-target`（Task 8）、`snippet-*`（Task 3）。
 
-**十四处誊抄时踩过的坑（都在写入本计划时改掉了，实施者照着抄就行）：**
+**十五处誊抄时踩过的坑（都在写入本计划时改掉了，实施者照着抄就行）：**
 
 - **Task 1 的测试用例里，比较的两个操作数必须是非 const 构造的。** 这是本计划里最危险的一处：初稿写成 `const a = Snippet(同样参数); const b = Snippet(同样参数);`，而 Dart 会把参数相同的 const 字面量**规范化成同一个实例**，`Object.==` 按身份答 true —— 四条用例在**完全没实现** `==` 的情况下全绿，等于零守备。Task 1 的 Step 1 现在一律用 `Snippet.fromJson(...)` 造副本，并额外断言 `identical(a, b)` 是 false 把前提钉住。**这是 Task 1 实施者实测报上来的，不是推理出来的。**
 - **Task 7 的测试文件要 `import 'package:flutter_riverpod/misc.dart';`** —— `readerOf` 的返回类型是 `List<Override>`，而 `Override` 不在 `flutter_riverpod.dart` 的主入口里（3.4.3 实测；`ui_harness.dart` 开头那段注释就是为这件事写的）。少这一行，红的是 `non_type_as_type_argument`。
@@ -6160,6 +6173,7 @@ Expected：PNG 是 1280x720 的真图（不是 586 字节、2 色的空白图）
 - **长对话框在默认窗口里点不到靠下的控件；等 SnackBar 不能靠推帧（Task 4）。** 这两条各让 2 条和 1 条用例红在**对话框之外**（`tap` 空点、SnackBar 没等到），而代码是对的 —— 也就是说**红的位置会指向错误的方向**。修法分别是 `useTallSurface` 与 `pumpUntilSnackBar`（都在 `ui_harness.dart`），细节见前面「测对话框之前必须先知道的两件事」。Task 5/6/7/9 的用例照用。
 - **让会话保持连接到用例结束的用例，收尾要 `drainCommandTimeout(tester)`（Task 5）。** 同样红在断言之外：`flutter_test` 在用例体跑完后断言 `!timersPending`，而连接时排进队列的 `postLoginCommands` 起了一个 10s 命令超时定时器，`FakeSession` 不吐提示符所以它一直挂着。**同一个文件里"会断开的用例绿、不断开的用例红"就是它的指纹** —— 代码和断言都是对的。见地基第 3 条。**只有活在 widget 树之外的定时器才会漏** —— `DraftAutosave` 那个 500ms 落盘防抖是 `EditorPanelState.dispose()` 取消的，所以不受影响（Task 7 已核）。
 - **`testWidgets` 的用例体里不能裸 `await` 真 I/O —— 会挂到 10 分钟超时，而 `dart analyze` 完全看不出来（Task 8）。** `seedDraft` 初稿是 `Future<void> seedDraft(String, String) => AppStores(...).drafts.write(...);`，四个调用点直接 `await`。用例体跑在 `FakeAsync.run` 里（`flutter_test` 的 `binding.dart`），真 I/O 的完成回调落进**假**的微任务队列，而那个队列只有 `pump` / `runAsync` 才会推 —— 体在等它，框架在等体，谁都不动。指纹是**"挂"而不是"红"**：`flutter test` 十分钟才吐一条 `TimeoutException`，而且 `--timeout 30s` 压不住它（`testWidgets` 自带 10 分钟的 `Timeout`）。**修法一律是 `tester.runAsync`** —— 与 `ui_harness.dart` 里 `settleDisk` / `pumpUntilTrue` 是同一条规矩。**判据：凡是在用例体（或它的辅助函数）里 `await` 一个不是 `tester.*` 的 Future，先问它是不是真 I/O。** 这是 Task 8 实施者实测报上来的：四条调用它的用例各挂 10 分钟，包上 `runAsync` 后同六条 3 秒跑完。
+- **计划里写下的框架 API 可能在锁定的版本上根本不存在（Task 11）。** Step 4 的宿主初稿写的是 `ref.listen(..., fireImmediately: true)` —— **riverpod 3.4.3 的 `ref.listen` 没有这个具名参数**（`widget_ref.dart:226-232` 只有 `onError` / `weak`；`consumer.dart:543-545` 还写了为什么："We can't implement a fireImmediately flag because we wouldn't know which listen call was preserved between widget rebuild"）。带它的是 `ref.listenManual`，而它的文档正好点明两个用法：`State.initState` 这类生命周期，与"弹模态" —— 宿主这两样都占。修法是把注册挪到 `initState` 并换成 `ref.listenManual`（它的订阅随部件销毁自动关闭，不用手写 `dispose`），监听体一字不动。**这类错的形状是"编译不过"，比誊抄常量错得浅，但同样会挡住实施者** —— 遇到它时先查 `~/.pub-cache` 里那个版本的真源码，别照抄计划里的签名。**这是 Task 11 实施者实测报上来的。**
 - **右键菜单的 `live` 是"右键那一刻"的快照（Task 6，已知并接受）。** 菜单开着时若会话掉了，「断开」仍是可点的。实测 `ConnectionManager.disconnect()` 对已断开的会话是幂等的（只置 `_userClosed`、拆一条已经不存在的会话），而且"用户明确点了断开"本来就应该压住 FR-C-07 的自动重连 —— 所以这是**行为正确、只是有点陈旧**，不修。记在这里免得后来的人重新论证一遍。
 
 **一条通用教训（值得单独记着）：** 「分析器干净」这条验收门比它看起来严 —— `unnecessary_null_comparison`（warning）与 `unrelated_type_equality_checks`（**info**）都会让 `dart analyze` 打印 `1 issue found` 而不是 `No issues found!`。写断言时对**静态类型已知**的比较（非空对象与 `null`、无关类型之间）要格外小心。
