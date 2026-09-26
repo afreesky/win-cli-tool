@@ -66,3 +66,36 @@ Future<void> settleDisk(WidgetTester tester, {int rounds = 12}) async {
   }
   await tester.pumpAndSettle();
 }
+
+/// 装一个"点一下就开对话框"的宿主。
+///
+/// `showDialog` 不能在 `build` 里调 —— 它要一次用户动作。所以每个对话框用例
+/// 都得先有这么一个按钮；放在这里省得十来条用例各写一遍 `Builder`。
+///
+/// [open] 里那一下就由按钮的 `onPressed` 挂着（返回的 Future 没人 await，
+/// 这正是 `showDialog` 的用法），用例只需 `tap` + `pumpAndSettle`。
+Future<void> pumpDialogHost(
+  WidgetTester tester, {
+  required Directory root,
+  required String buttonLabel,
+  required Future<void> Function(BuildContext context) open,
+  List<DeviceProfile> devices = const [],
+  AppSettings settings = const AppSettings(),
+  FakeSessionFactory? factory,
+  List<Override> extra = const [],
+}) => pumpUi(
+  tester,
+  root: root,
+  devices: devices,
+  settings: settings,
+  factory: factory,
+  extra: extra,
+  child: Builder(
+    builder: (context) => Center(
+      child: ElevatedButton(
+        onPressed: () => open(context),
+        child: Text(buttonLabel),
+      ),
+    ),
+  ),
+);
