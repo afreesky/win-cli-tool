@@ -23,6 +23,22 @@
 - **发现的代码块/断言看起来是错的就停下来报告**，不要就地"修好"或把断言放松。你的报告不带用户授权。
 - 计划里的 `dart` 围栏是**逐字抄的**，不是示意。抄进去的时候不要"顺手改好"。
 
+### 测对话框之前必须先知道的两件事（Task 4 实测踩出来的，Task 5/6/7/9 同样适用）
+
+1. **默认的测试窗口是 800×600，装不下一张长对话框。** 实测设备编辑对话框的内容
+   有 798 逻辑像素高，而视口只有 384 —— 折在窗口外的控件 `tap` 只是**空点一下**，
+   不报错。设备对话框里「启动时自动连接」在 y=866、行尾符下拉在 y=634，
+   两个都在 600 之外。**`tester.ensureVisible` 救不了**：内容滚到底（`pixels=322`，
+   上限 `maxScrollExtent` 414）那两个控件仍在视口下沿之外。
+   要**点到**靠下的控件，用例开头调 `useTallSurface(tester)`（在 `ui_harness.dart`）。
+2. **`pumpAndSettle` 与 `settleDisk` 都推不动真 I/O。** `settleDisk` 的轮数是写死的
+   （12 × 5ms ≈ 60ms 真实时间），够不够看机器当下忙不忙 —— 实测**同一份代码多一句
+   `debugPrint` 就从红变绿**。断开那条路上还有 `restrictToOwner` 的
+   `Process.run('chmod', …)`，那是**一个真子进程**。要等 SnackBar 出现就用
+   `pumpUntilSnackBar(tester)`（按条件等，出现即走），不要靠多推几帧。
+   **而且别用状态断言代替它**：连接状态是经 `onStatus` 回调推进 provider 的，
+   不等那个 await —— 实测状态已经是 `disconnected` 时 SnackBar 一个都还没有。
+
 ### 已经定下来的四个用户决策（不要再重新论证）
 
 1. **改连接参数就断开**（Task 5）：编辑设备时若连接参数变了，保存后断开该设备的会话并提示用户重连；只改显示字段（名字、自动连接、命令库）不动会话。
@@ -1156,9 +1172,15 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 **先把测试脚手架补上。** `showDialog` 不能在 `build` 里调，所以每个对话框用例都得先有一个按钮。
 
-- [ ] **Step 1：给测试脚手架加 `pumpDialogHost`**
+- [ ] **Step 1：给测试脚手架加 `pumpDialogHost`（外加两个通用件）**
 
-在 `test/ui/ui_harness.dart` 的 `settleDisk` **之后**追加：
+在 `test/ui/ui_harness.dart` 的 `settleDisk` **之后**追加**三个**函数。前两个不是
+设备对话框独有的，别抄进用例文件里：
+
+- `useTallSurface` —— 默认测试窗口只有 800×600，装不下任何一张长对话框；
+- `pumpUntilSnackBar` —— 有些 SnackBar 要等真 I/O，`settleDisk` 的固定轮数不够。
+
+两者都会在 Task 5/6/7/9 里再用到（那几张对话框同样经 `pumpDialogHost` 打开）。
 
 ```dart
 /// 装一个"点一下就开对话框"的宿主。
@@ -1193,6 +1215,49 @@ Future<void> pumpDialogHost(
     ),
   ),
 );
+```
+
+```dart
+/// 把测试窗口调高到装得下整个对话框。
+///
+/// **默认的 800×600 装不下**（这是实测设备编辑对话框的数字）：对话框内容
+/// 798 逻辑像素高、视口只有 384，折在窗口外的控件 `tap` 只会空点一下 ——
+/// 实测开关在 y=866、行尾符下拉在 y=634，都在 600 之外。
+///
+/// **`ensureVisible` 救不了这个**：它也只把内容滚到 `pixels=322`（上限
+/// `maxScrollExtent` 是 414），开关仍在 y=516–572，还是落在视口下沿 480 之外
+/// —— 因为那已经是内容最后一项，没有更多东西可滚了。
+///
+/// 所以凡是**需要点到**对话框里靠下那几个控件的用例，开头先调这一下。
+/// 只是断言（不点）的用例不必调。
+Future<void> useTallSurface(WidgetTester tester) async {
+  await tester.binding.setSurfaceSize(const Size(1000, 1200));
+  addTearDown(() => tester.binding.setSurfaceSize(null));
+}
+
+/// 等到 SnackBar 真的弹出来（最多 [rounds] 轮），动画走完再返回。
+///
+/// **不能只靠 `settleDisk` / `pumpAndSettle`。** 举断开那条路：
+/// `_disconnect` → `await …disconnect()` → `_endLog()` → `_flush(force: true)`，
+/// 里面除了 `stat` / `create` / `writeAsString(flush: true)`，还有
+/// `restrictToOwner` 的 `Process.run('chmod', …)` —— **起一个真进程**。
+/// 假时钟推不动这些真 I/O，而 `settleDisk` 的轮数是写死的
+/// （12 × 5ms ≈ 60ms 真实时间），够不够全看机器当下忙不忙：实测同一份代码，
+/// 多一句 `debugPrint` 就从红变绿。所以这里按条件等，出现即走。
+///
+/// **状态断言不能代替它**：`ConnectionManager` 的新状态是经 `onStatus` 回调
+/// 推进 provider 的，不等 `_disconnect` 里那个 await —— 实测状态已经是
+/// `disconnected` 时 SnackBar 还一个都没有。两条都要断。
+Future<void> pumpUntilSnackBar(WidgetTester tester, {int rounds = 400}) async {
+  for (var i = 0; i < rounds; i++) {
+    if (find.byType(SnackBar).evaluate().isNotEmpty) break;
+    await tester.pump(const Duration(milliseconds: 16));
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 5)),
+    );
+  }
+  await tester.pumpAndSettle();
+}
 ```
 
 - [ ] **Step 2：写失败的测试**
@@ -1441,6 +1506,8 @@ void main() {
   });
 
   testWidgets('「启动时自动连接」存得下来（FR-D-12）', (tester) async {
+    // 开关在对话框最下面，默认 800×600 的窗口里点不到 —— 见 `useTallSurface`。
+    await useTallSurface(tester);
     await open(tester);
     await fill(tester, 'device-name', 'A');
     await fill(tester, 'device-host', 'h');
@@ -1472,8 +1539,13 @@ void main() {
     );
 
     await tester.tap(find.text('断开'));
-    await tester.pumpAndSettle();
+    // **`pumpAndSettle` / `settleDisk` 在这里都不够**：断开要落盘，路上还有
+    // `restrictToOwner` 起的 chmod 真进程。按条件等 SnackBar，见它的文档。
+    await pumpUntilSnackBar(tester);
 
+    // 状态与 SnackBar **两条都要断**：实测状态先到、SnackBar 后到，而状态是
+    // 经 `onStatus` 回调推进的，不等 `_disconnect` 那个 await —— 只断状态的话，
+    // 就算 SnackBar 永远不出现，用例也是绿的。
     expect(
       containerOf(tester).read(sessionProvider('d1')).state,
       DeviceConnectionState.disconnected,
@@ -1482,6 +1554,8 @@ void main() {
   });
 
   testWidgets('行尾符是可选的两种（FR-G-03）', (tester) async {
+    // 行尾符下拉也在折叠线以下，同上。
+    await useTallSurface(tester);
     await open(tester);
     await fill(tester, 'device-name', 'A');
     await fill(tester, 'device-host', 'h');
@@ -5709,6 +5783,7 @@ Expected：PNG 是 1280x720 的真图（不是 586 字节、2 色的空白图）
 - **断言要问"组件在不在"，不是"里面某句文案在不在"（Task 3）。** 初稿用 `find.text('还没有命令片段')` 来证明抽屉关上了，而被测设备**有**片段，那句话在它的抽屉里根本不会渲染 —— 这条断言恒真，抽屉关没关都绿。正确的问法是 `find.byType(SnippetDrawer)`。和上面 Task 1 那条是同一类病：**断言在测空气。**
 - **`findsOneWidget` 撞上"同一句话说了两遍"（Task 4）。** 「NFR-S-02 的警告就在对话框里」初稿写的是 `find.textContaining('明文')`，而设计里**有意**在两个地方点了「明文」：那条警告，和密码框的标签「密码（明文保存）」。实测（本机 3.44.4，用一个只含这两样东西的 scratch 用例跑出来的）：`Found 2 widgets with text containing 明文`，`findsOneWidget` 直接红。**断言用宽泛的短语去数一个"有意重复出现"的词，是这一类红的来源。**
 - **构造函数里没写出来的字段会走默认值，编辑对话框于是变成"静默清字段"（Task 4）。** `DeviceProfile` 除了对话框要编辑的那十来项，还有 `jumpHostIds`（默认 `const []`）。`_submit` 里那份 `DeviceProfile(...)` 初稿没写它 —— 于是编辑任何一台设备都会把盘上那条跳板机链抹成空，没有任何提示。`snippets` 那一行本来就带着注释说"不让 update 把它抹掉"，`jumpHostIds` 是同一个坑漏掉的一个。**写编辑类对话框时，把模型的字段表对着构造函数数一遍。**
+- **长对话框在默认窗口里点不到靠下的控件；等 SnackBar 不能靠推帧（Task 4）。** 这两条各让 2 条和 1 条用例红在**对话框之外**（`tap` 空点、SnackBar 没等到），而代码是对的 —— 也就是说**红的位置会指向错误的方向**。修法分别是 `useTallSurface` 与 `pumpUntilSnackBar`（都在 `ui_harness.dart`），细节见前面「测对话框之前必须先知道的两件事」。Task 5/6/7/9 的用例照用。
 
 **一条通用教训（值得单独记着）：** 「分析器干净」这条验收门比它看起来严 —— `unnecessary_null_comparison`（warning）与 `unrelated_type_equality_checks`（**info**）都会让 `dart analyze` 打印 `1 issue found` 而不是 `No issues found!`。写断言时对**静态类型已知**的比较（非空对象与 `null`、无关类型之间）要格外小心。
 
