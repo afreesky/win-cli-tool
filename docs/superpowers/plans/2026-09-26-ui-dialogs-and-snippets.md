@@ -6088,7 +6088,7 @@ Expected：PNG 是 1280x720 的真图（不是 586 字节、2 色的空白图）
 - `_setText` 是 Task 2 的私有方法，Task 7/8 不直接调它（都走那三个公开方法）。
 - `ValueKey` 命名前后一致：`device-*`（Task 4/5）、`settings-*`（Task 9）、`known-host*`（Task 10）、`import-path`（Task 7）、`sync-target`（Task 8）、`snippet-*`（Task 3）。
 
-**五处誊抄时踩过的坑（都在写入本计划时改掉了，实施者照着抄就行）：**
+**十四处誊抄时踩过的坑（都在写入本计划时改掉了，实施者照着抄就行）：**
 
 - **Task 1 的测试用例里，比较的两个操作数必须是非 const 构造的。** 这是本计划里最危险的一处：初稿写成 `const a = Snippet(同样参数); const b = Snippet(同样参数);`，而 Dart 会把参数相同的 const 字面量**规范化成同一个实例**，`Object.==` 按身份答 true —— 四条用例在**完全没实现** `==` 的情况下全绿，等于零守备。Task 1 的 Step 1 现在一律用 `Snippet.fromJson(...)` 造副本，并额外断言 `identical(a, b)` 是 false 把前提钉住。**这是 Task 1 实施者实测报上来的，不是推理出来的。**
 - **Task 7 的测试文件要 `import 'package:flutter_riverpod/misc.dart';`** —— `readerOf` 的返回类型是 `List<Override>`，而 `Override` 不在 `flutter_riverpod.dart` 的主入口里（3.4.3 实测；`ui_harness.dart` 开头那段注释就是为这件事写的）。少这一行，红的是 `non_type_as_type_argument`。
@@ -6102,6 +6102,7 @@ Expected：PNG 是 1280x720 的真图（不是 586 字节、2 色的空白图）
 - **构造函数里没写出来的字段会走默认值，编辑对话框于是变成"静默清字段"（Task 4）。** `DeviceProfile` 除了对话框要编辑的那十来项，还有 `jumpHostIds`（默认 `const []`）。`_submit` 里那份 `DeviceProfile(...)` 初稿没写它 —— 于是编辑任何一台设备都会把盘上那条跳板机链抹成空，没有任何提示。`snippets` 那一行本来就带着注释说"不让 update 把它抹掉"，`jumpHostIds` 是同一个坑漏掉的一个。**写编辑类对话框时，把模型的字段表对着构造函数数一遍。**
 - **长对话框在默认窗口里点不到靠下的控件；等 SnackBar 不能靠推帧（Task 4）。** 这两条各让 2 条和 1 条用例红在**对话框之外**（`tap` 空点、SnackBar 没等到），而代码是对的 —— 也就是说**红的位置会指向错误的方向**。修法分别是 `useTallSurface` 与 `pumpUntilSnackBar`（都在 `ui_harness.dart`），细节见前面「测对话框之前必须先知道的两件事」。Task 5/6/7/9 的用例照用。
 - **让会话保持连接到用例结束的用例，收尾要 `drainCommandTimeout(tester)`（Task 5）。** 同样红在断言之外：`flutter_test` 在用例体跑完后断言 `!timersPending`，而连接时排进队列的 `postLoginCommands` 起了一个 10s 命令超时定时器，`FakeSession` 不吐提示符所以它一直挂着。**同一个文件里"会断开的用例绿、不断开的用例红"就是它的指纹** —— 代码和断言都是对的。见地基第 3 条。**只有活在 widget 树之外的定时器才会漏** —— `DraftAutosave` 那个 500ms 落盘防抖是 `EditorPanelState.dispose()` 取消的，所以不受影响（Task 7 已核）。
+- **`testWidgets` 的用例体里不能裸 `await` 真 I/O —— 会挂到 10 分钟超时，而 `dart analyze` 完全看不出来（Task 8）。** `seedDraft` 初稿是 `Future<void> seedDraft(String, String) => AppStores(...).drafts.write(...);`，四个调用点直接 `await`。用例体跑在 `FakeAsync.run` 里（`flutter_test` 的 `binding.dart`），真 I/O 的完成回调落进**假**的微任务队列，而那个队列只有 `pump` / `runAsync` 才会推 —— 体在等它，框架在等体，谁都不动。指纹是**"挂"而不是"红"**：`flutter test` 十分钟才吐一条 `TimeoutException`，而且 `--timeout 30s` 压不住它（`testWidgets` 自带 10 分钟的 `Timeout`）。**修法一律是 `tester.runAsync`** —— 与 `ui_harness.dart` 里 `settleDisk` / `pumpUntilTrue` 是同一条规矩。**判据：凡是在用例体（或它的辅助函数）里 `await` 一个不是 `tester.*` 的 Future，先问它是不是真 I/O。** 这是 Task 8 实施者实测报上来的：四条调用它的用例各挂 10 分钟，包上 `runAsync` 后同六条 3 秒跑完。
 - **右键菜单的 `live` 是"右键那一刻"的快照（Task 6，已知并接受）。** 菜单开着时若会话掉了，「断开」仍是可点的。实测 `ConnectionManager.disconnect()` 对已断开的会话是幂等的（只置 `_userClosed`、拆一条已经不存在的会话），而且"用户明确点了断开"本来就应该压住 FR-C-07 的自动重连 —— 所以这是**行为正确、只是有点陈旧**，不修。记在这里免得后来的人重新论证一遍。
 
 **一条通用教训（值得单独记着）：** 「分析器干净」这条验收门比它看起来严 —— `unnecessary_null_comparison`（warning）与 `unrelated_type_equality_checks`（**info**）都会让 `dart analyze` 打印 `1 issue found` 而不是 `No issues found!`。写断言时对**静态类型已知**的比较（非空对象与 `null`、无关类型之间）要格外小心。
@@ -6116,6 +6117,8 @@ Expected：PNG 是 1280x720 的真图（不是 586 字节、2 色的空白图）
 | `QueueAborted.dropped` **不含**在途那条 → 它的「未发送」是对的，不改 | `command_dispatcher.dart:185-198` |
 | `DuplicateDeviceNameError.message` 是可直接展示的中文 | 那个类的文档 |
 | `AppSettings.copyWith(logDir: null)` 能真的清掉 | `_unset` 哨兵 |
+| `SessionStatus.copyWith` 的 `lastDispatchEvent` **没有**哨兵 → 传 `null` 会被 `??` 吃掉 | `session_controller.dart:43-59`（`reconnect` / `lastFailure` 有，它没有；Task 13 要先补上） |
+| `testWidgets` 用例体里裸 `await` 真 I/O 会死锁到 10 分钟超时 | `flutter_test` 的 `binding.dart`（`FakeAsync.run` 包住用例体） |
 | `FileHostKeyStore` 不持实例缓存 → 测试里可以用第二个实例预置 | 它 `_readFromDisk` 的文档 |
 | `AppStores.hostKeys` 的静态类型是 `FileHostKeyStore` → 不需要向下转型 | `app_stores.dart` |
 | `EditorPanel._toolbar` 的 `Spacer` 在按钮之后 | `editor_panel.dart:363`（**Task 2 已落地，行号从 303 移到了 363**；按内容 grep，别信旧行号） |
