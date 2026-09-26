@@ -11,10 +11,16 @@ import 'package:win_cli_tool/models/device_profile.dart';
 /// 那个要验证连接语义（订阅所有权、拆除顺序、退避），带着一段承重的注释；
 /// 这个只验证"接线接对了没有"，所以刻意做小 —— 只有吐数据、断线、记下发过什么。
 class FakeSession implements Session {
-  FakeSession(this.profile, {this.failConnect = false});
+  FakeSession(this.profile, {this.failConnect = false, this.failError});
 
   final DeviceProfile profile;
   final bool failConnect;
+
+  /// 建连失败时抛哪个异常。null 表示用默认的 [FakeConnectFailure]。
+  ///
+  /// 存在的理由：验证 FR-C-06 的"原因**变了**就必须重新报"这一条，需要
+  /// **两种不同**的失败原因，而默认夹具只会抛同一种。
+  final Object? failError;
 
   final _output = StreamController<String>.broadcast();
   final _done = Completer<void>();
@@ -34,7 +40,7 @@ class FakeSession implements Session {
   @override
   Future<void> connect() async {
     connectCalls++;
-    if (failConnect) throw const FakeConnectFailure();
+    if (failConnect) throw failError ?? const FakeConnectFailure();
   }
 
   @override
@@ -68,15 +74,31 @@ class FakeConnectFailure implements Exception {
   String toString() => 'connect failed';
 }
 
+/// **第二种**建连失败，与 [FakeConnectFailure] 的可读原因不同。
+///
+/// 只为 FR-C-06 的"原因变了就必须重新报"那一条存在 —— 用同一种异常测不出
+/// 它与"重复的同一条原因"的区别。
+class FakeConnectFailure2 implements Exception {
+  const FakeConnectFailure2();
+
+  @override
+  String toString() => 'connect failed differently';
+}
+
 class FakeSessionFactory implements SessionFactory {
-  FakeSessionFactory({this.failConnect = false});
+  FakeSessionFactory({this.failConnect = false, this.failError});
 
   bool failConnect;
+
+  /// 每一条新造的会话都用它建连失败。**可变**：用例可以在重试之间换掉它，
+  /// 以验证"失败原因变了"这条路径（见 [FakeSession.failError]）。
+  Object? failError;
+
   final sessions = <FakeSession>[];
 
   @override
   Session create(DeviceProfile profile) {
-    final s = FakeSession(profile, failConnect: failConnect);
+    final s = FakeSession(profile, failConnect: failConnect, failError: failError);
     sessions.add(s);
     return s;
   }

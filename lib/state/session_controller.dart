@@ -149,6 +149,11 @@ class SessionController {
 
   var _status = const SessionStatus();
 
+  /// 最近一条**已经写进输出区**的失败原因（FR-C-06）。见 [_reportFailure]。
+  ///
+  /// null 表示"还没报过"，于是下一条失败一定会显示。
+  String? _reportedFailure;
+
   /// 状态变化时回调（界面订阅它重绘）。
   void Function(SessionStatus status)? onStatus;
 
@@ -170,7 +175,13 @@ class SessionController {
   /// 中止队列（FR-E-13 / Esc）：不再发送剩余命令，已发出的不做处理。
   void abort() => _manager.dispatcher?.abort();
 
-  Future<void> connect() => _manager.connect();
+  Future<void> connect() {
+    // FR-C-06：手动重连时重新开始"这条原因报过没有"的判断。不清的话，
+    // 上一次已报过的同一原因会被当成重复而**不再显示** —— 用户按了连接，
+    // 界面却连一句理由都不给。见 [_reportFailure]。
+    _reportedFailure = null;
+    return _manager.connect();
+  }
 
   Future<void> disconnect() async {
     await _manager.disconnect();
@@ -228,6 +239,7 @@ class SessionController {
         _log?.reconnected();
       case ConnectionFailed(:final failure):
         _setStatus(_status.copyWith(lastFailure: failure));
+        _reportFailure(failure);
       case SessionLost():
         _markWarn('--- 连接断开 ---');
         _log?.disconnected();
@@ -235,6 +247,9 @@ class SessionController {
   }
 
   void _onSessionReady(CommandDispatcher dispatcher) {
+    // FR-C-06：新会话开始了，上一次失败的原因已经翻篇 —— 这段会话将来若
+    // 再失败，即使原因与上次逐字相同，也应当重新显示。见 [_reportFailure]。
+    _reportedFailure = null;
     _setStatus(
       _status.copyWith(
         reconnect: null,
@@ -288,6 +303,31 @@ class SessionController {
   void _setStatus(SessionStatus next) {
     _status = next;
     onStatus?.call(next);
+  }
+
+  /// FR-C-06：把失败原因写进**输出区**。
+  ///
+  /// **原先只写进了 `_status.lastFailure`，而 `lib/ui/` 里没有任何一处读它**
+  /// —— 于是用户看到的是一个没有任何解释的重试循环。这正是 2026-09-26 对真机
+  /// 排查时的现场：一台只提供 `ssh-rsa` 的交换机连不上，界面只有"X 秒后重连"
+  /// 反复滚动。规格 §10.1 接受"不兼容旧算法"的**前提**就是"失败时按 FR-C-06
+  /// 给出可读原因"，那个前提当时是空的。
+  ///
+  /// **同一条原因只报一次。** `ConnectionFailed` 是**每次失败尝试**都发的
+  /// （`ConnectionManager._attemptConnect` 的 catch 里），而 FR-C-07 会一直重试
+  /// 下去（退避到 30s 封顶后无限期），逐条写会把输出区刷满同一句话，把真正的
+  /// 输出挤走。抑制的只是**重复的同一句**：
+  ///
+  /// - 原因**变了**（超时 → 认证失败）→ 立刻再报一条，那是新信息；
+  /// - 重连成功后再次失败（[_onSessionReady] 清空）→ 再报；
+  /// - 用户手动点连接（[connect] 清空）→ 再报，否则"按了连接却没有任何理由"
+  ///   会比不显示更费解。
+  ///
+  /// "还在重试"这件事由 `ReconnectScheduled` 那条标记负责，两者不重复。
+  void _reportFailure(ConnectionFailure failure) {
+    if (_reportedFailure == failure.message) return;
+    _reportedFailure = failure.message;
+    _markWarn('--- 连接失败：${failure.message} ---');
   }
 
   void _markWarn(String text) => buffer.addMarker(text, style: kMarkerWarnStyle);

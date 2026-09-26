@@ -273,6 +273,107 @@ void main() {
       reason: '在途的那条已经写到设备上了，说它"未发送"是假的',
     );
   });
+
+  test('连接失败的原因必须写进**输出区**（FR-C-06）', () async {
+    // 原先 `ConnectionFailed` 只做了 `_status.copyWith(lastFailure: …)`，
+    // 而 `lib/ui/` 里**没有任何一处读 `lastFailure`** —— 于是原因只活在状态
+    // 对象里，用户永远看不到。2026-09-26 对真机排查时现场正是这样：一台只
+    // 提供 `ssh-rsa` 的交换机连不上，界面只有"X 秒后重连"在滚，没有任何线索。
+    //
+    // FR-C-06 的原文是「**在输出区**给出可读的失败原因」—— 所以这条断言必须
+    // 落在 buffer 上，只断言 `status.lastFailure` 是抓不到这个缺陷的（那正是
+    // 缺陷当时唯一的表现）。
+    final c = make();
+    addTearDown(c.dispose);
+
+    factory.failConnect = true;
+    await c.connect();
+    await settle();
+
+    expect(
+      _textOf(buffer),
+      contains('连接失败'),
+      reason: 'FR-C-06：原因必须在输出区，不能只留在状态对象里',
+    );
+    expect(
+      c.status.lastFailure,
+      isNotNull,
+      reason: '状态里那一份仍要保留（界面别处可能用它）',
+    );
+  });
+
+  test('同一条原因只报一次，用户手动重连要重新报（FR-C-06）', () async {
+    // `ConnectionFailed` 是**每次失败尝试**都发的，而 FR-C-07 会一直重试下去
+    // （退避到 30s 封顶后无限期）。逐条写会把输出区刷满同一句话，把真正的
+    // 输出挤走 —— 所以要抑制**重复的同一句**。
+    //
+    // 但抑制不能过头：用户手动点"连接"时必须重新报。否则界面会变成"按了
+    // 连接，连一句理由都不给"，比不显示更费解。
+    final c = make();
+    addTearDown(c.dispose);
+
+    factory.failConnect = true;
+    await c.connect();
+    await settle();
+    expect(_countOf(_textOf(buffer), '--- 连接失败'), 1);
+
+    // 再等至少两轮重试（退避 1s → 2s）。期间失败原因逐字相同。
+    await Future<void>.delayed(const Duration(seconds: 3));
+    await settle();
+    expect(
+      _countOf(_textOf(buffer), '--- 连接失败'),
+      1,
+      reason: '同一条原因重复出现时不得刷屏',
+    );
+
+    // 用户手动重连。
+    await c.connect();
+    await settle();
+    expect(
+      _countOf(_textOf(buffer), '--- 连接失败'),
+      2,
+      reason: '手动重连后必须重新给出理由，否则按了连接却看不到任何解释',
+    );
+  });
+
+  test('失败原因**变了**就必须重新报（FR-C-06）', () async {
+    // 抑制的判据是"与上一条**逐字相同**"，不是"报过就不再报"。原因从
+    // 一种变成另一种（超时 → 认证失败）是新信息，用户要靠它决定下一步做什么。
+    final c = make();
+    addTearDown(c.dispose);
+
+    factory.failConnect = true;
+    await c.connect();
+    await settle();
+    expect(_textOf(buffer), contains('connect failed'));
+
+    // 换一种失败原因，等下一轮重试探到它。
+    factory.failError = const FakeConnectFailure2();
+    await Future<void>.delayed(const Duration(seconds: 3));
+    await settle();
+
+    expect(
+      _textOf(buffer),
+      contains('connect failed differently'),
+      reason: '换了一种失败原因，必须让用户看到新的那一条',
+    );
+  });
+}
+
+/// 输出区的全文。多条用例要看"某个标记出现了几次"，所以单独抽出来。
+String _textOf(OutputBuffer buffer) =>
+    buffer.lines.map((line) => line.map((s) => s.text).join()).join('\n');
+
+/// [needle] 在 [haystack] 里出现了几次（不重叠）。
+int _countOf(String haystack, String needle) {
+  var count = 0;
+  var from = 0;
+  while (true) {
+    final at = haystack.indexOf(needle, from);
+    if (at < 0) return count;
+    count++;
+    from = at + needle.length;
+  }
 }
 
 /// 读遍日志根目录下的所有 .log 文件，拼成一个字符串。
