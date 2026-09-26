@@ -367,7 +367,11 @@ class EditorPanelState extends ConsumerState<EditorPanel> {
             // **`Scaffold.of` 找的是主窗口那个 Scaffold** —— 抽屉挂在它的
             // `endDrawer` 上，编辑区只是它 `body` 里的一棵树。
             // 这也是"编辑区的用例不能点这个按钮"的原因：`ui_harness.dart` 的
-            // `pumpUi` 包的那个 `Scaffold` 没有 `endDrawer`，点了会在断言里炸。
+            // `pumpUi` 包的那个 `Scaffold` 没有 `endDrawer`。
+            // 点下去**不炸** —— `ScaffoldState.openEndDrawer()` 是
+            // `_endDrawerKey.currentState?.open();`（`scaffold.dart:2310`），
+            // 没有 `endDrawer` 时 `currentState` 也是 null，静默无操作。它比炸
+            // 更坏：那种用例会**绿着什么都没测**。命令库的用例一律走 `MainWindow`。
             onPressed: () => Scaffold.of(context).openEndDrawer(),
           ),
           const Spacer(),

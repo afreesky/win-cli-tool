@@ -503,7 +503,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 **一个必须先知道的形状：** 抽屉挂在**主窗口**的 `Scaffold.endDrawer` 上（`test/ui/ui_harness.dart` 的 `pumpUi` 包的 `Scaffold` 没有抽屉），所以：
 - 编辑区工具栏的「命令库」按钮调 `Scaffold.of(context).openEndDrawer()` —— 编辑区是主窗口 `Scaffold.body` 里的一棵树，`Scaffold.of` 找得到它。
-- **`test/ui/editor_panel_test.dart` 与 `test/ui/editor_text_api_test.dart` 里绝不能点那个按钮**：那两个用例装的 `Scaffold` 没有 `endDrawer`，`openEndDrawer()` 会在断言里炸。命令库的用例一律走 `MainWindow`。
+- **`test/ui/editor_panel_test.dart` 与 `test/ui/editor_text_api_test.dart` 里绝不能点那个按钮**：那两个用例装的 `Scaffold` 没有 `endDrawer`。点下去**不炸** —— `ScaffoldState.openEndDrawer()` 的实现是 `_endDrawerKey.currentState?.open();`（`scaffold.dart:2310`），`endDrawer` 为 null 时 `currentState` 也是 null，`?.` 直接跳过，静默无操作。它比炸更坏：**那种用例会"绿着什么都没测"** —— 断言照过，抽屉根本没开过。命令库的用例一律走 `MainWindow`。
 
 - [ ] **Step 1：先加 id 生成器**
 
