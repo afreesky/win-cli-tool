@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../models/app_settings.dart';
 import '../../state/providers.dart';
+import 'known_hosts_section.dart';
 
 /// 主题的三个人话名字。
 String themeLabel(AppTheme theme) => switch (theme) {
@@ -290,6 +291,10 @@ class _SettingsDialogState extends ConsumerState<SettingsDialog> {
                   Text('${(_splitRatio * 100).round()}%'),
                 ],
               ),
+              const Divider(height: 24),
+              // **在 `_error` 之前**：这一段的读写是即时的，与下面那个
+              // 「保存」按钮无关（见它的文档）。
+              const KnownHostsSection(),
               if (_error != null) ...[
                 const SizedBox(height: 8),
                 Text(
