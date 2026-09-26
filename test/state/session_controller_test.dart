@@ -250,6 +250,29 @@ void main() {
       reason: 'FR-C-12：不向设备发送任何命令 —— 包括不清除分页、不发登出序列',
     );
   });
+
+  test('断线标记说的是「未完成」，不是「未发送」（FR-C-10 的文案）', () async {
+    final c = make();
+    addTearDown(c.dispose);
+    await c.connect();
+
+    // 两条：第一条在途、第二条排队 —— 丢弃数是 2，而其中只有 1 条是真的
+    // 没发出去。文案必须对这两条都成立。
+    c.enqueue(const ['show version', 'show clock']);
+    await settle();
+    factory.sessions.single.drop();
+    await settle();
+
+    final text = buffer.lines
+        .map((line) => line.map((s) => s.text).join())
+        .join('\n');
+    expect(text, contains('2 条命令未完成'));
+    expect(
+      text,
+      isNot(contains('未发送')),
+      reason: '在途的那条已经写到设备上了，说它"未发送"是假的',
+    );
+  });
 }
 
 /// 读遍日志根目录下的所有 .log 文件，拼成一个字符串。

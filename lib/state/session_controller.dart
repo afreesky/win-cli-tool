@@ -45,7 +45,11 @@ class SessionStatus {
     Object? reconnect = _unset,
     int? droppedCommands,
     Object? lastFailure = _unset,
-    DispatchEvent? lastDispatchEvent,
+    // **哨兵不能省。** 配 `?? this.lastDispatchEvent` 的话，传 `null` 会被
+    // `??` 吃掉 —— "清空"这个动作**静默失效**，而调用点看起来完全正确
+    // （`reconnect` / `lastFailure` 早就有哨兵，这是同一个坑的第三个实例：
+    // `lastDispatchEvent` 直到 5b-2 才出现第一个"传 null 有意义"的调用点）。
+    Object? lastDispatchEvent = _unset,
   }) => SessionStatus(
     state: state ?? this.state,
     reconnect: identical(reconnect, _unset)
@@ -55,7 +59,9 @@ class SessionStatus {
     lastFailure: identical(lastFailure, _unset)
         ? this.lastFailure
         : lastFailure as ConnectionFailure?,
-    lastDispatchEvent: lastDispatchEvent ?? this.lastDispatchEvent,
+    lastDispatchEvent: identical(lastDispatchEvent, _unset)
+        ? this.lastDispatchEvent
+        : lastDispatchEvent as DispatchEvent?,
   );
 }
 
@@ -235,6 +241,10 @@ class SessionController {
         lastFailure: null,
         // 上一次断线的丢弃数属于上一次断线，新会话开始就归零。
         droppedCommands: 0,
+        // **进度文案同理。** 新会话里队列是空的，上一段断线留下的
+        // `QueueDropped` 若不清掉，工具栏会在**已经重连成功**之后继续显示
+        // "断线，N 条命令未完成" —— 那句话说的是现在，而现在是绿的。
+        lastDispatchEvent: null,
       ),
     );
     // **每次重连都新建一个 dispatcher**，所以这里必须重新订阅 —— 不重订的话
@@ -251,7 +261,17 @@ class SessionController {
     if (_disposed) return;
     if (event is QueueDropped) {
       _setStatus(_status.copyWith(droppedCommands: event.count));
-      _markWarn('--- 连接断开，${event.count} 条未发送的命令已丢弃 ---');
+      // **不说"未发送"。** `QueueDropped.count` 是"排队数 + 在途数"
+      // （`command_dispatcher.dart` 的 `onDisconnected`）—— 在途那条**已经写到
+      // 设备上了**，只是输出永远收不到。说它"未发送"会让用户以为设备没被改过。
+      _markWarn('--- 连接断开，${event.count} 条命令未完成并已丢弃 ---');
+      // **原来这里直接 return，于是 `lastDispatchEvent` 从不变成本事件，
+      // 编辑区那条 `if (event is QueueDropped)` 永远走不到**（它的文案再改
+      // 也没人看得见）。落一次，让工具栏也能显示"断线，N 条命令未完成"。
+      //
+      // **事件本身没动**（决策③）：`QueueDropped(count)` 的载荷与语义一个字
+      // 不改，这里只是把这个事件也记进"最近一次派发事件"。
+      _setStatus(_status.copyWith(lastDispatchEvent: event));
       return;
     }
     if (event is CommandCompleted && event.timedOut) {

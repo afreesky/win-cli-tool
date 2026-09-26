@@ -277,7 +277,9 @@ class EditorPanelState extends ConsumerState<EditorPanel> {
           : '已完成 ${event.index}/${event.total}';
     }
     if (event is QueueAborted) return '已中止（${event.dropped} 条未发送）';
-    if (event is QueueDropped) return '断线，${event.count} 条未发送的命令已丢弃';
+    // 与 `SessionController` 那句输出区标记同一个口径：**不说"未发送"**
+    // —— `count` 含在途的那一条，它已经写到设备上了。
+    if (event is QueueDropped) return '断线，${event.count} 条命令未完成';
     if (event is QueueFinished) return '队列完成';
     return null;
   }

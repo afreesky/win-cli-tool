@@ -151,4 +151,53 @@ void main() {
             as SentLineController;
     expect(controller.sentLines, {0, 1});
   });
+
+  testWidgets('断线后编辑区工具栏的进度文案不再是「未发送」', (tester) async {
+    final factory = FakeSessionFactory();
+    await pumpEditor(tester, factory: factory);
+    await tester.tap(find.byTooltip('连接'));
+    await tester.pumpAndSettle();
+
+    await tester.enterText(find.byType(TextField), 'show version\nshow clock');
+    await tester.pump();
+    // **`enterText` 会把光标收到文本末尾**（`TextSelection.collapsed(offset: 23)`），
+    // 而 §5.1 的规则是"没有选中就只发光标那一行" —— 那样队列里只有 `show clock`
+    // **一条**，丢弃数是 1，下面那句 `断线，2 条命令未完成` 永远找不到。
+    // 本文件三条兄弟用例都栽过这个坑（见它们各自的注释）。
+    final editor = tester.widget<TextField>(find.byType(TextField)).controller!;
+    editor.selection = TextSelection(
+      baseOffset: 0,
+      extentOffset: editor.text.length,
+    );
+    await tester.pump();
+    await tester.tap(find.byTooltip('发送'));
+    await tester.pump();
+
+    // 第一条在途、第二条排队 —— 丢弃数因此是 2（在途那条也计入，见
+    // `command_dispatcher.dart` 的 `onDisconnected`）。
+    factory.sessions.first.drop();
+    await tester.pump();
+
+    expect(find.text('断线，2 条命令未完成'), findsOneWidget);
+
+    // **把重连定时器走完，并顺带钉住"重连成功后这句文案要消失"。**
+    //
+    // 不走定时器的话用例会红在 `A Timer is still pending even after the widget
+    // tree was disposed` —— 那是拆卸期的假象，断言其实已经过了（见 `drainQueue`
+    // 的注释）。退避首档是 1s，所以推 1s 就够。
+    //
+    // **为什么这里还要再断一次**：`断线，N 条命令未完成` 说的是**现在**，不是
+    // 过去。重连成功后按钮已经绿了，工具栏却还挂着"断线"就是一句假话 —— 那正是
+    // 本任务要消灭的形状。所以 Step 3 在 `_onSessionReady` 里把
+    // `lastDispatchEvent` 一并清掉（与旁边那句 `droppedCommands: 0` 同一个道理）。
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pumpAndSettle();
+
+    expect(factory.sessions, hasLength(2), reason: '前提：1s 后确实重连了');
+    expect(
+      find.text('断线，2 条命令未完成'),
+      findsNothing,
+      reason: '重连成功后不能再挂着上一段断线的进度文案',
+    );
+  });
 }
