@@ -117,6 +117,28 @@ Future<void> useTallSurface(WidgetTester tester) async {
   addTearDown(() => tester.binding.setSurfaceSize(null));
 }
 
+/// 等到 [finder] 能找到东西（最多 [rounds] 轮），再 `pumpAndSettle`。
+///
+/// **为什么不能只是多推几帧**：`pump`/`pumpAndSettle` 推的是**假时钟**，而落盘、
+/// `Process.run('chmod', …)` 这些是**真 I/O**，假时钟推不动。`settleDisk` 的轮数
+/// 又是写死的（12 × 5ms ≈ 60ms 真实时间），够不够全看机器当下忙不忙 —— 实测
+/// **同一份代码多一句 `debugPrint` 就从红变绿**。所以这里按条件等，出现即走：
+/// 机器快就快过，机器慢就多等几轮，都不会红。
+Future<void> pumpUntil(
+  WidgetTester tester,
+  Finder finder, {
+  int rounds = 400,
+}) async {
+  for (var i = 0; i < rounds; i++) {
+    if (finder.evaluate().isNotEmpty) break;
+    await tester.pump(const Duration(milliseconds: 16));
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 5)),
+    );
+  }
+  await tester.pumpAndSettle();
+}
+
 /// 等到 SnackBar 真的弹出来（最多 [rounds] 轮），动画走完再返回。
 ///
 /// **不能只靠 `settleDisk` / `pumpAndSettle`。** 举断开那条路：
@@ -130,13 +152,5 @@ Future<void> useTallSurface(WidgetTester tester) async {
 /// **状态断言不能代替它**：`ConnectionManager` 的新状态是经 `onStatus` 回调
 /// 推进 provider 的，不等 `_disconnect` 里那个 await —— 实测状态已经是
 /// `disconnected` 时 SnackBar 还一个都没有。两条都要断。
-Future<void> pumpUntilSnackBar(WidgetTester tester, {int rounds = 400}) async {
-  for (var i = 0; i < rounds; i++) {
-    if (find.byType(SnackBar).evaluate().isNotEmpty) break;
-    await tester.pump(const Duration(milliseconds: 16));
-    await tester.runAsync(
-      () => Future<void>.delayed(const Duration(milliseconds: 5)),
-    );
-  }
-  await tester.pumpAndSettle();
-}
+Future<void> pumpUntilSnackBar(WidgetTester tester, {int rounds = 400}) =>
+    pumpUntil(tester, find.byType(SnackBar), rounds: rounds);
