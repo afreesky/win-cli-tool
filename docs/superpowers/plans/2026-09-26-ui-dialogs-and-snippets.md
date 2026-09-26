@@ -2158,6 +2158,9 @@ void main() {
     WidgetTester tester, {
     required DeviceProfile device,
   }) async {
+    // 对话框内容比默认的 800×600 窗口高，靠下的开关点不到 —— 见 `useTallSurface`。
+    // 四条用例都走这个口，所以放在这里。
+    await useTallSurface(tester);
     await pumpDialogHost(
       tester,
       root: root,
@@ -2224,7 +2227,13 @@ void main() {
 
     await fill(tester, 'device-name', '核心交换机 A');
     await tester.tap(find.text('保存'));
-    await settleDisk(tester);
+    // **这两条"不该断开"的用例要等到对话框真的关掉为止，不能只 `settleDisk`。**
+    // `_submit` 是**先 `await update(draft)`、再（若需要）`await disconnect()`、
+    // 最后才 `pop()`**，所以"对话框关了"这件事本身就证明了整条保存路径已经跑完
+    // —— 包括那个本该发生却没发生的断开。只推 60ms 真实时间的话，万一这条路上
+    // 还有没走完的真 I/O，`findsNothing` 与 `connected` 都会在你还没等到的时候
+    // 就先绿了（负向断言尤其容易被这种"还没轮到"骗过去）。
+    await pumpUntilTrue(tester, () => find.text('保存').evaluate().isEmpty);
 
     expect(
       stateOf(tester),
@@ -2241,7 +2250,8 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('device-autoconnect')));
     await tester.pumpAndSettle();
     await tester.tap(find.text('保存'));
-    await settleDisk(tester);
+    // 同「只改名字」：等对话框关掉，才算保存路径整条走完。
+    await pumpUntilTrue(tester, () => find.text('保存').evaluate().isEmpty);
 
     expect(stateOf(tester), DeviceConnectionState.connected);
     expect(containerOf(tester).read(devicesProvider).single.autoConnect, isTrue);
