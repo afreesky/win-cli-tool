@@ -5301,10 +5301,12 @@ import 'host_key_prompt.dart';
 import 'ui/widgets/host_key_prompt_host.dart';
 ```
 
+（指纹那两条 `find.text('SHA256:…')` 能用，是因为对话框里用的是 `SelectableText`，而它内部就是一个 `EditableText` —— `_MatchTextFinder.matches` 对 `EditableText` 走的是 `widget.controller.text`（`finders.dart:1540` 与 `1573`）。**别**因为"看着像找不到"就换成 `find.textContaining` 或 `find.byType`：指纹必须**一字不差**，这正是那两条断言要的。）
+
 - [ ] **Step 6：跑测试，确认全绿**
 
 Run: `flutter test test/ui/host_key_prompt_test.dart`
-Expected: PASS（10 条）
+Expected: PASS（10 条 —— 数一下 `test(` + `testWidgets(`：`HostKeyPromptNotifier` 4 条 + `sessionFactoryProvider 的接线` 3 条 + `HostKeyPromptHost` 3 条）
 
 一条容易红的：`两个询问排队出现，不是只弹一个` 若在第二次 `pumpAndSettle` 后找不到 `SHA256:second` —— 检查 `reply` 里 `state = _queue.isEmpty ? null : _queue.first;` 那一行的**顺序**：它必须在 `prompt.complete(accept)` **之后**（先兑现旧的、再换新的），否则 `_showing` 的翻转与 `state` 的翻转会错开一帧，第二个对话框要等下一次 pump 才出来（`pumpAndSettle` 能兜住，但顺序写对更省事）。
 
