@@ -46,6 +46,17 @@
    **而且别用状态断言代替它**：连接状态是经 `onStatus` 回调推进 provider 的，
    不等那个 await —— 实测状态已经是 `disconnected` 时 SnackBar 一个都还没有。
    反过来也一样：**要断状态就等状态**，别去等 SnackBar。
+3. **用例结束时如果会话还连着，收尾要调 `drainCommandTimeout(tester)`。** 否则用例
+   会红在**所有 `expect` 之后**：`connect()` 会把 `postLoginCommands` 排进
+   `CommandDispatcher`，那是一个 10s 的命令超时定时器（默认值，
+   `command_dispatcher.dart:75`），而 `FakeSession` 从不吐提示符，它就那么挂着；
+   `flutter_test` 在用例体跑完后断言"没有挂着的定时器"（`binding.dart` 的
+   `!timersPending`），于是报 `A Timer is still pending even after the widget tree
+   was disposed`。**认出来的办法是数通过的条数** —— 每条 `expect` 其实都过了。
+   会断开的用例**不需要**它（`disconnect()` 把 dispatcher 连同定时器一起拆了）。
+   实测于 Task 5：同一个文件里两条正向用例绿、两条负向用例红，差别只在于断没断。
+   **凡是故意让会话保持连接到结束的用例（Task 6 的「连接」菜单用例要当心），
+   结尾都加这一行，位置在所有断言之后。**
 
 ### 已经定下来的四个用户决策（不要再重新论证）
 
@@ -1185,6 +1196,8 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 在 `test/ui/ui_harness.dart` 的 `settleDisk` **之后**追加**三个**函数。前两个不是
 设备对话框独有的，别抄进用例文件里：
 
+- `drainCommandTimeout` —— 见地基第 3 条：用例结束时会话还连着就必须收尾推过那个
+  10s 命令超时定时器，否则红在断言之外（Task 5 补进来的，用到就调）；
 - `useTallSurface` —— 默认测试窗口只有 800×600，装不下任何一张长对话框；
 - `pumpUntilSnackBar` —— 有些 SnackBar 要等真 I/O，`settleDisk` 的固定轮数不够。
 
@@ -2184,6 +2197,10 @@ void main() {
   Future<void> fill(WidgetTester tester, String key, String text) =>
       tester.enterText(find.byKey(ValueKey(key)), text);
 
+  // `drainCommandTimeout`（把"会话还连着"留下的挂起定时器推过）在
+  // `ui_harness.dart` 里 —— 它不是这一个文件的事，凡是有用例让会话保持连接
+  // 到结束，都会撞上 `flutter_test` 那条 `!timersPending`。
+
   testWidgets('改了主机：保存后会话被断开，并提示重连', (tester) async {
     await openConnected(tester, device: base());
 
@@ -2242,6 +2259,11 @@ void main() {
     );
     expect(find.textContaining('连接参数已改变'), findsNothing);
     expect(containerOf(tester).read(devicesProvider).single.name, '核心交换机 A');
+
+    // 会话在这里是**故意**还连着的（上面刚断言过），而 `base()` 的
+    // `postLoginCommands` 在连接时排进队列、起了一个 10s 命令超时定时器。
+    // 不推过它，本用例会红在断言之外。详见 `ui_harness.dart` 的文档。
+    await drainCommandTimeout(tester);
   });
 
   testWidgets('只改「启动时自动连接」：会话不动', (tester) async {
@@ -2255,6 +2277,9 @@ void main() {
 
     expect(stateOf(tester), DeviceConnectionState.connected);
     expect(containerOf(tester).read(devicesProvider).single.autoConnect, isTrue);
+
+    // 同上：会话还连着，收尾要把那个命令超时定时器推过去。
+    await drainCommandTimeout(tester);
   });
 }
 ```
@@ -5826,6 +5851,7 @@ Expected：PNG 是 1280x720 的真图（不是 586 字节、2 色的空白图）
 - **`findsOneWidget` 撞上"同一句话说了两遍"（Task 4）。** 「NFR-S-02 的警告就在对话框里」初稿写的是 `find.textContaining('明文')`，而设计里**有意**在两个地方点了「明文」：那条警告，和密码框的标签「密码（明文保存）」。实测（本机 3.44.4，用一个只含这两样东西的 scratch 用例跑出来的）：`Found 2 widgets with text containing 明文`，`findsOneWidget` 直接红。**断言用宽泛的短语去数一个"有意重复出现"的词，是这一类红的来源。**
 - **构造函数里没写出来的字段会走默认值，编辑对话框于是变成"静默清字段"（Task 4）。** `DeviceProfile` 除了对话框要编辑的那十来项，还有 `jumpHostIds`（默认 `const []`）。`_submit` 里那份 `DeviceProfile(...)` 初稿没写它 —— 于是编辑任何一台设备都会把盘上那条跳板机链抹成空，没有任何提示。`snippets` 那一行本来就带着注释说"不让 update 把它抹掉"，`jumpHostIds` 是同一个坑漏掉的一个。**写编辑类对话框时，把模型的字段表对着构造函数数一遍。**
 - **长对话框在默认窗口里点不到靠下的控件；等 SnackBar 不能靠推帧（Task 4）。** 这两条各让 2 条和 1 条用例红在**对话框之外**（`tap` 空点、SnackBar 没等到），而代码是对的 —— 也就是说**红的位置会指向错误的方向**。修法分别是 `useTallSurface` 与 `pumpUntilSnackBar`（都在 `ui_harness.dart`），细节见前面「测对话框之前必须先知道的两件事」。Task 5/6/7/9 的用例照用。
+- **让会话保持连接到用例结束的用例，收尾要 `drainCommandTimeout(tester)`（Task 5）。** 同样红在断言之外：`flutter_test` 在用例体跑完后断言 `!timersPending`，而连接时排进队列的 `postLoginCommands` 起了一个 10s 命令超时定时器，`FakeSession` 不吐提示符所以它一直挂着。**同一个文件里"会断开的用例绿、不断开的用例红"就是它的指纹** —— 代码和断言都是对的。见地基第 3 条。Task 6 的「连接」菜单用例尤其要当心。
 
 **一条通用教训（值得单独记着）：** 「分析器干净」这条验收门比它看起来严 —— `unnecessary_null_comparison`（warning）与 `unrelated_type_equality_checks`（**info**）都会让 `dart analyze` 打印 `1 issue found` 而不是 `No issues found!`。写断言时对**静态类型已知**的比较（非空对象与 `null`、无关类型之间）要格外小心。
 

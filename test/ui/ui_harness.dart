@@ -164,3 +164,28 @@ Future<void> pumpUntil(
 /// `disconnected` 时 SnackBar 还一个都没有。两条都要断。
 Future<void> pumpUntilSnackBar(WidgetTester tester, {int rounds = 400}) =>
     pumpUntil(tester, find.byType(SnackBar), rounds: rounds);
+
+/// 清掉"会话到用例结束还是活的"留下的挂起定时器。**放在所有断言之后调。**
+///
+/// **凡是故意让会话保持连接**（`connected` 且不断开）**的用例，结尾都要来这一下。**
+/// `connect()` 成功会把 `profile.postLoginCommands` 排进 `CommandDispatcher`
+/// （`connection_manager.dart:335`），那会起一个**命令超时**定时器 ——
+/// `CommandDispatcher` 的 `commandTimeout` 默认 10s（`command_dispatcher.dart:75`），
+/// `ConnectionManager` 构造它时没有覆盖。`FakeSession` 从不吐提示符，所以它一直
+/// 挂着；而 `flutter_test` 在用例体跑完之后会断言"没有挂着的定时器"
+/// （`binding.dart` 的 `!timersPending`），于是用例**红在断言之外** ——
+/// 报错是 `A Timer is still pending even after the widget tree was disposed`，
+/// 堆栈指向 `CommandDispatcher._restartTimeout`。数一下通过的条数就能认出来：
+/// 失败的用例其实每条 `expect` 都过了。
+///
+/// **反过来，会断开的用例不需要它** —— `disconnect()` → `_teardownSession`
+/// 把 dispatcher 连同定时器一起拆了。（这也是"两条正向用例不红、两条负向用例红"
+/// 的原因，实测于 Task 5。）
+///
+/// 推过它不改任何语义：定时器到点只是把那条命令记成超时、队列收尾
+/// （`_cancelTimers()` + `_emitNext()`，见 `command_dispatcher.dart:254`），
+/// **连接状态不受影响** —— 而"会话还连着"正是这类用例要断言的东西。
+Future<void> drainCommandTimeout(WidgetTester tester) async {
+  await tester.pump(const Duration(seconds: 11));
+  await tester.pumpAndSettle();
+}

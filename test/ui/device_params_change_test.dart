@@ -139,23 +139,9 @@ void main() {
   Future<void> fill(WidgetTester tester, String key, String text) =>
       tester.enterText(find.byKey(ValueKey(key)), text);
 
-  /// 清掉"会话到用例结束还是活的"留下的挂起定时器。
-  ///
-  /// 两条**不该断开**的用例里，会话是**故意**保持连接的，而 `connect()` 会把
-  /// `base()` 的 `postLoginCommands`（`['enable']`）排进 `CommandDispatcher`
-  /// —— 那会起一个 10s 的**命令超时**定时器（`commandTimeout` 没被覆盖，就是
-  /// 默认的 10s）。`FakeSession` 从不吐提示符，所以它一直挂着；而 `flutter_test`
-  /// 在用例体结束时断言"没有挂着的定时器"（`binding.dart` 的 `!timersPending`），
-  /// 不推过它，用例就红在**断言之外**（两条正向用例不红，正是因为它们的断开把
-  /// dispatcher 连同定时器一起拆了）。
-  ///
-  /// 推过它是安全的、也不改任何断言的意图：定时器到点只是把那条命令记成"超时"、
-  /// 队列收尾（`_finish()` 取消所有定时器），**连接状态不受影响** —— 这两条用例
-  /// 要断言的恰恰就是"这条会话还连着"。调用点都在所有断言**之后**。
-  Future<void> drainCommandTimeout(WidgetTester tester) async {
-    await tester.pump(const Duration(seconds: 11));
-    await tester.pumpAndSettle();
-  }
+  // `drainCommandTimeout`（把"会话还连着"留下的挂起定时器推过）在
+  // `ui_harness.dart` 里 —— 它不是这一个文件的事，凡是有用例让会话保持连接
+  // 到结束，都会撞上 `flutter_test` 那条 `!timersPending`。
 
   testWidgets('改了主机：保存后会话被断开，并提示重连', (tester) async {
     await openConnected(tester, device: base());
@@ -216,6 +202,9 @@ void main() {
     expect(find.textContaining('连接参数已改变'), findsNothing);
     expect(containerOf(tester).read(devicesProvider).single.name, '核心交换机 A');
 
+    // 会话在这里是**故意**还连着的（上面刚断言过），而 `base()` 的
+    // `postLoginCommands` 在连接时排进队列、起了一个 10s 命令超时定时器。
+    // 不推过它，本用例会红在断言之外。详见 `ui_harness.dart` 的文档。
     await drainCommandTimeout(tester);
   });
 
@@ -231,6 +220,7 @@ void main() {
     expect(stateOf(tester), DeviceConnectionState.connected);
     expect(containerOf(tester).read(devicesProvider).single.autoConnect, isTrue);
 
+    // 同上：会话还连着，收尾要把那个命令超时定时器推过去。
     await drainCommandTimeout(tester);
   });
 }
