@@ -3168,7 +3168,12 @@ void main() {
     if (root.existsSync()) await root.delete(recursive: true);
   });
 
-  final two = [
+  /// 两台设备。**类型必须显式写出来。** `fakeProfile` 的返回类型是推断的，
+  /// 而"推断出来的类型"不算"用了那个 import" —— 全文件没有一处写出
+  /// `DeviceProfile` 这个名字的话，上面 `models/device_profile.dart` 那行
+  /// 就成了 `unused_import`（分析器的警告，不是提示），`dart analyze` 当场
+  /// 不再打印 `No issues found!`，闸门就卡在一行没人看的 import 上。
+  final List<DeviceProfile> two = [
     fakeProfile(id: 'd1', name: '核心交换机', host: '10.0.0.1'),
     fakeProfile(id: 'd2', name: '边界防火墙', host: '10.0.0.2'),
   ];
@@ -3185,6 +3190,15 @@ void main() {
   /// （`FileHostKeyStore` 的文档里那段"缓存整个去掉"）。两处都靠这一点。
   Future<void> seedDraft(String deviceId, String text) =>
       AppStores(paths: AppPaths(root)).drafts.write(deviceId, text);
+
+  /// 从**树里**的 provider 容器读东西（本仓既有的写法，见
+  /// `device_params_change_test.dart`）。锚点是编辑区自己 —— 这个文件没有
+  /// "打开"那种按钮可锚。
+  ///
+  /// 这一行也顺带让 `flutter_riverpod.dart` 那行 import 有人用了：本文件
+  /// 别处一个 riverpod 名字都没有，少了它同样是 `unused_import`。
+  ProviderContainer containerOf(WidgetTester tester) =>
+      ProviderScope.containerOf(tester.element(find.byType(EditorPanel)));
 
   group('对话框本身', () {
     testWidgets('只有一台设备时说清楚，不给同步（FR-E-17 的边界）', (tester) async {
@@ -3241,7 +3255,22 @@ void main() {
         devices: two,
         child: const SizedBox(height: 400, child: EditorPanel(deviceId: 'd1')),
       );
-      await settleDisk(tester);
+      // 草稿是**真 I/O** 读进来的（`DraftStore.read` 的 `exists` + `readAsBytes`），
+      // `pumpUi` 收尾那个 `pumpAndSettle` 推的是假时钟，推不动它。
+      //
+      // **必须等它落地再返回。** `_loadDraft` 拿到值之后会 `_text.text = text`
+      // （`editor_panel.dart:119-123`）。用例紧接着就 `editor.value = …`，那个
+      // **迟到的**载入会把编辑区盖回草稿内容 —— 红起来的样子（"编辑区是空的"、
+      // 点开同步按钮没有对话框）跟用例要验的东西毫无关系。`settleDisk` 的
+      // 12×5ms 够不够全看机器当下忙不忙，所以这里按条件等，出现即走。
+      //
+      // 顺带也是 `_seeded` 的前提：`_onTextChanged` 在 `_seeded` 之前直接
+      // return（`editor_panel.dart:137`），载入没落地时设 `editor.value` 连
+      // 落盘防抖都不会排上。
+      await pumpUntilTrue(
+        tester,
+        () => containerOf(tester).read(draftProvider('d1')).hasValue,
+      );
       return tester.widget<TextField>(find.byType(TextField)).controller!;
     }
 
@@ -3260,7 +3289,17 @@ void main() {
       await tester.tap(find.text('边界防火墙').last);
       await tester.pumpAndSettle();
       await tester.tap(find.text(label));
-      await settleDisk(tester);
+      // **不能只 `settleDisk`。** 这一按之后 `_run` 要先读目标草稿、再
+      // `save()` 落盘，而 `DraftStore.write` 走 `writeFileAtomically`：
+      // 建目录 → 写 `.tmp`（flush）→ **两次 `chmod` 真进程** → rename。
+      // 本组每条断言看的都是**盘上的结果**，所以要等写真的完成。
+      // `save()` 返回之后对话框才 `pop()`，因此"按钮没了"就等于"盘上写完了"
+      // —— 按条件等，不用赌那 60ms 真实时间。
+      //
+      // 顺带一提，本文件里 `find.text('覆盖')` / `find.text('追加')` 都不会被
+      // 之后弹出的 SnackBar 命中：那句是"已覆盖到「边界防火墙」的草稿"，
+      // 而 `find.text` 是全等匹配。
+      await pumpUntilTrue(tester, () => find.text(label).evaluate().isEmpty);
     }
 
     testWidgets('覆盖：目标草稿变成编辑区的内容（FR-E-17）', (tester) async {
@@ -3538,7 +3577,7 @@ class _SyncDialogState extends ConsumerState<SyncDialog> {
 
 - [ ] **Step 4：接到编辑区上**
 
-在 `lib/ui/panels/editor_panel.dart` 的 `_toolbar` 里，**Task 3 加的「命令库」按钮之后、`const Spacer(),` 之前**插入：
+在 `lib/ui/panels/editor_panel.dart` 的 `_toolbar` 里插入。位置：**「导入文件」那个 `IconButton`（Task 7 加的，现占第 391–395 行）之后、紧跟其后的 `const Spacer(),`（现第 396 行）之前**。插完后工具栏的图标顺序是「连接 / 断开 / 发送 / 命令库 / 导入文件 / 同步到另一台」——也就是**最右边、紧挨 `Spacer` 的那个**。
 
 ```dart
           const SizedBox(width: 8),
@@ -3588,9 +3627,9 @@ import '../dialogs/sync_dialog.dart';
 - [ ] **Step 5：跑测试，确认全绿**
 
 Run: `flutter test test/ui/sync_dialog_test.dart`
-Expected: PASS（9 条）
+Expected: PASS（8 条 —— 数一下 `testWidgets(`：`对话框本身` 2 条 + `接到编辑区上` 6 条）
 
-一条常见红：`覆盖：目标草稿变成编辑区的内容` 若红在 `draftOnDisk('d2')` 还是旧值 —— 多半是 `settleDisk` 的轮数不够（`DraftStore.write` 是先写 `.tmp`、`chmod`、再 rename 三步）。先确认不是逻辑错，再考虑加轮数。
+这个文件**一条 `settleDisk` 都不用来收尾**：`pumpEditor` 等 provider 解析出来、`syncAs` 等对话框关掉，两处都是按条件等（理由见 `ui_harness.dart` 里 `pumpUntilTrue` 那段）。所以若还红在 `draftOnDisk('d2')` 是旧值，那是**真的逻辑错**，别再往回加轮数 —— 加轮数只会把这个红变成一个随机出现的红。
 
 - [ ] **Step 6：跑一遍全仓**
 
@@ -5866,12 +5905,13 @@ Expected：PNG 是 1280x720 的真图（不是 586 字节、2 色的空白图）
 - `_setText` 是 Task 2 的私有方法，Task 7/8 不直接调它（都走那三个公开方法）。
 - `ValueKey` 命名前后一致：`device-*`（Task 4/5）、`settings-*`（Task 9）、`known-host*`（Task 10）、`import-path`（Task 7）、`sync-target`（Task 8）、`snippet-*`（Task 3）。
 
-**四处誊抄时踩过的坑（都在写入本计划时改掉了，实施者照着抄就行）：**
+**五处誊抄时踩过的坑（都在写入本计划时改掉了，实施者照着抄就行）：**
 
 - **Task 1 的测试用例里，比较的两个操作数必须是非 const 构造的。** 这是本计划里最危险的一处：初稿写成 `const a = Snippet(同样参数); const b = Snippet(同样参数);`，而 Dart 会把参数相同的 const 字面量**规范化成同一个实例**，`Object.==` 按身份答 true —— 四条用例在**完全没实现** `==` 的情况下全绿，等于零守备。Task 1 的 Step 1 现在一律用 `Snippet.fromJson(...)` 造副本，并额外断言 `identical(a, b)` 是 false 把前提钉住。**这是 Task 1 实施者实测报上来的，不是推理出来的。**
 - **Task 7 的测试文件要 `import 'package:flutter_riverpod/misc.dart';`** —— `readerOf` 的返回类型是 `List<Override>`，而 `Override` 不在 `flutter_riverpod.dart` 的主入口里（3.4.3 实测；`ui_harness.dart` 开头那段注释就是为这件事写的）。少这一行，红的是 `non_type_as_type_argument`。
 - **Task 8 的 `syncAs` 里不能有 `tester.enterText`** —— `sync-target` 是 `DropdownButtonFormField`，不是输入框；`enterText` 找不到 `EditableText` 会直接抛。选目标只能"点开、再点那一项"。
 - **`DropdownButtonFormField.initialValue` 是本版 Flutter 的正确参数名**（`value` 已废弃）。且 `setState` 之后显示会跟着变 —— `dropdown.dart:2004` 的 `didUpdateWidget` 里有 `if (oldWidget.initialValue != widget.initialValue) setValue(...)`。Task 8/9 的三处下拉都靠这一条。
+- **推断出来的类型不算"用了那行 import"。** Task 8 的测试文件初稿里 `final two = [fakeProfile(…), fakeProfile(…)];` —— 类型是推断的，全文件再没出现过 `DeviceProfile` 这个名字，于是 `import 'package:win_cli_tool/models/device_profile.dart';` 成了 `unused_import`。**那不是提示，是分析器的警告**，`dart analyze` 就不再打印 `No issues found!`，验收闸门卡在一行谁也不会去看的 import 上。同一个文件的 `flutter_riverpod.dart` 也一样（除非像现在这样真去用 `ProviderScope.containerOf`）。**Task 9～15 每一个新建的测试文件收尾时都过一遍 `dart analyze`，别等 Task 15 才发现。**
 - **双击区域里不能包着别的按钮（Task 3）。** `DoubleTapGestureRecognizer` 在第一次按下时会 `gestureArena.hold(pointer)`（`gestures/multitap.dart:330`），把手势竞技场按到双击超时（300ms）为止。所以 `GestureDetector(onDoubleTap:)` 里**但凡裹着一个 `IconButton`**（初稿是把它当 `ListTile.trailing`），那个按钮的单击就要等满 300ms 才生效，双击它还会顺带触发插入。初稿在测试里表现为"点了编辑/删除，对话框 0 个"—— 而 `pumpAndSettle()` 在 ~100ms 后就没帧可等了，hold 还没释放，于是永远等不到。修法是把按钮挪出 `GestureDetector` 的子树（`Row(Expanded(双击区), 按钮, 按钮)`）。**这是 Task 3 实施者实测报上来的。**
 - **改编辑区工具栏的 Task 一次要重生成三张 golden**，不是一张：`main_window_light.png` 与 `main_window_dark.png` 里也含着那条工具栏（实测三张各差 226 像素）。Task 3/7/8 的 `git add` 清单都已按这个改过 —— 漏掉的那两张会以"改了但没进提交"的形式留在工作区，然后被下一次 `--update-goldens` 悄悄吞掉。
 - **断言要问"组件在不在"，不是"里面某句文案在不在"（Task 3）。** 初稿用 `find.text('还没有命令片段')` 来证明抽屉关上了，而被测设备**有**片段，那句话在它的抽屉里根本不会渲染 —— 这条断言恒真，抽屉关没关都绿。正确的问法是 `find.byType(SnippetDrawer)`。和上面 Task 1 那条是同一类病：**断言在测空气。**
