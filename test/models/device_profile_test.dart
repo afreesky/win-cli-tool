@@ -242,5 +242,44 @@ void main() {
       expect(restored.name, '保存配置');
       expect(restored.content, 'save\nY');
     });
+
+    test('值相等：三个字段全同才相等（spec §13.7）', () {
+      const a = Snippet(id: 's1', name: '看版本', content: 'display version');
+      const b = Snippet(id: 's1', name: '看版本', content: 'display version');
+
+      expect(a, equals(b));
+      expect(a.hashCode, equals(b.hashCode));
+    });
+
+    test('缺任一字段就不相等', () {
+      const base = Snippet(id: 's1', name: '看版本', content: 'display version');
+
+      expect(base, isNot(equals(base.copyWith(name: '看接口'))));
+      expect(base, isNot(equals(base.copyWith(content: 'display interface'))));
+      expect(
+        base,
+        isNot(
+          equals(
+            const Snippet(id: 's2', name: '看版本', content: 'display version'),
+          ),
+        ),
+        reason: 'id 也是身份的一部分：两条同名片段是允许的',
+      );
+    });
+
+    test('List.contains / Set 按值判（命令库据此判重）', () {
+      const a = Snippet(id: 's1', name: 'x', content: 'y');
+      const b = Snippet(id: 's1', name: 'x', content: 'y');
+
+      expect(<Snippet>[a].contains(b), isTrue);
+      expect(<Snippet>{a}.contains(b), isTrue);
+    });
+
+    test('与别的类型比不相等，且不抛', () {
+      const a = Snippet(id: 's1', name: 'x', content: 'y');
+
+      expect(a, isNot(equals('s1')));
+      expect(a == null, isFalse);
+    });
   });
 }

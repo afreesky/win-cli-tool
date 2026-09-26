@@ -47,6 +47,22 @@ class Snippet {
         'name': name,
         'content': content,
       };
+
+  /// 值相等（spec §13.7）。
+  ///
+  /// **三个字段全参与**，包括 [id]。两条同名同内容的片段是合法的（用户可能
+  /// 想把同一条命令按不同用途存两份），所以不能用"名字 + 内容"当身份 —— 那样
+  /// 后者会把前者顶掉。反过来，`id` 单独当身份也不行：`Snippet` 的 id 只在
+  /// 一台设备的数组里唯一，跨设备比会误判成同一条。
+  @override
+  bool operator ==(Object other) =>
+      other is Snippet &&
+      other.id == id &&
+      other.name == name &&
+      other.content == content;
+
+  @override
+  int get hashCode => Object.hash(id, name, content);
 }
 
 /// 一台 SSH 跳板机（堡垒机）。全局共享，设备通过 id 引用。
