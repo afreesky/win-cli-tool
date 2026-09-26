@@ -145,6 +145,66 @@ class EditorPanelState extends ConsumerState<EditorPanel> {
     _gutter.jumpTo(_editor.offset);
   }
 
+  /// FR-S-03：把一段文本插入**当前光标处**。
+  ///
+  /// **光标所在行非空时先换行**（FR-S-03 原文）。判的是光标所在那一行，不是
+  /// "文本末尾" —— 把片段接在 `display version` 的尾巴上会拼出一条谁也没写过
+  /// 的命令，而那条命令会真的发到设备上。
+  ///
+  /// **只有空白字符的行不算非空行。** FR-E-08 规定"确需发送空行时，在行内输入
+  /// 一个空格"，所以一行 `'   '` 是**空的**；它上面没有命令可拼，添一个换行只会
+  /// 平白多出一个空行。
+  void insertAtCursor(String content) {
+    final text = _text.text;
+    final selection = _text.selection;
+    // 从未获得过焦点时 selection 是 `collapsed(offset: -1)`（`isValid` 为
+    // false）。此时按"插到末尾"处理 —— 直接抛或什么都不做，都会让"双击命令库
+    // 但编辑区还没点过"变成一个静默失败。
+    final start = selection.isValid ? selection.start : text.length;
+    final end = selection.isValid ? selection.end : text.length;
+
+    // `lastIndexOf` 在 start-1 < 0 时返回 -1，加一正好是 0。
+    final lineStart = text.lastIndexOf('\n', start - 1) + 1;
+    final lineEndIndex = text.indexOf('\n', start);
+    final lineEnd = lineEndIndex < 0 ? text.length : lineEndIndex;
+    final lineIsBlank = text.substring(lineStart, lineEnd).trim().isEmpty;
+
+    final insertion = lineIsBlank ? content : '\n$content';
+    _setText(
+      text.replaceRange(start, end, insertion),
+      caret: start + insertion.length,
+    );
+  }
+
+  /// 用 [content] **整份替换**编辑区内容（FR-E-15 的「替换现有内容」）。
+  void replaceAllText(String content) => _setText(content, caret: content.length);
+
+  /// 把 [content] **追加到末尾**（FR-E-15 的「追加到末尾」）。
+  ///
+  /// 原文本非空且不以换行结尾时补一个换行 —— 不补的话，原来的最后一行会和导入
+  /// 进来的第一行粘成一条，而那正是用户最不容易发现的一种错。
+  void appendText(String content) {
+    final text = _text.text;
+    if (text.isEmpty) {
+      replaceAllText(content);
+      return;
+    }
+    replaceAllText('$text${text.endsWith('\n') ? '' : '\n'}$content');
+  }
+
+  /// 三个改文本的入口都走这里。
+  ///
+  /// 一次写 `value`（而不是先改 `text` 再改 `selection`）有两个好处：
+  /// `_text.text = ...` 会把 selection 收成无效值，而 listeners 会在那一次就
+  /// 被通知 —— `_onTextChanged` 于是排一次落盘、`setState` 重画一次行号栏；
+  /// 写两次就是白做一轮。
+  void _setText(String next, {required int caret}) {
+    _text.value = TextEditingValue(
+      text: next,
+      selection: TextSelection.collapsed(offset: caret),
+    );
+  }
+
   void send() {
     final commands = commandsToSend(_text.text, _text.selection);
     if (commands.isEmpty) {
