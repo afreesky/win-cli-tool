@@ -73,6 +73,16 @@ class _SyncDialogState extends ConsumerState<SyncDialog> {
       );
     }
 
+    // **`!` 不能省。** `_targetId` 是 `String?`，三元的两支是 `String?` 与
+    // `String`，于是 `selected` 推断出来是 **`String?`** —— 而 `_run` 收的是
+    // `String`，不写 `!` 这里**根本编译不过**（`The argument type 'String?'
+    // can't be assigned to the parameter type 'String'`）。
+    //
+    // **它不可能抛**：能走到真分支，就说明 `targets` 里有一台的 `id` 与
+    // `_targetId` 相等，而 `id` 是 `String`（非空），所以 `_targetId` 必非空。
+    // 别改成 `_targetId ?? targets.first.id` —— 那会丢掉 `any(...)` 这道守卫：
+    // 目标设备**已被删掉**时 `_targetId` 还留着旧 id，`??` 会原样用它，
+    // 而 `any(...)` 会正确地退回 `targets.first.id`。
     final selected = targets.any((d) => d.id == _targetId)
         ? _targetId!
         : targets.first.id;
