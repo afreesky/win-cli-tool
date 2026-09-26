@@ -6091,6 +6091,25 @@ git commit -m "fix(conn): Telnet 入口守卫挪到拨号之前，并补 close()
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
+> **执行记录（2026-09-26）：落地为 commit `78d9ba0`，8 步全按计划执行，无偏离。**
+>
+> - 五处锚点实现者都回源码核过；Step 2 的红**正是预测的形状**
+>   （`TimeoutException after 0:00:02`，且是那一个文件里唯一的红）——
+>   超时**本身就是缺陷的证据**：少了入口守卫，`connect()` 挂在那个永不完成的
+>   `gate.future` 上。
+> - **两道守卫都在，各自有测试守着**：Step 5 里
+>   `connect 等待期间被 close`（走**下面**那道）与新加的
+>   `close() 之后再 connect()`（走**入口**那道）同时绿。计划里那条
+>   "它若红了说明入口守卫被错写成唯一的一道"的警戒线没有被触发。
+> - **新入口守卫对现有调用路径是 no-op，这一点被查证过而不是假设**：`lib/`
+>   里直接调 `Session.connect()` 的只有 `connection_manager.dart:265` 一处，
+>   而它在两行前才 `factory.create(profile)`，`_closed` 不可能为真；其余 8 处
+>   都走 `SessionController.connect()` → `ConnectionManager.connect()`，不直接
+>   碰 `Session`。`SshSession` 早就有一道同样的入口守卫，且 `ssh_session_test.dart`
+>   里**本来就有同名的一条用例** —— Telnet 这一侧现在与它对称。
+> - 实现者指出控制者派单前言里把 `/// 关闭会话。` 写成了半角句点。属实（前言
+>   的笔误），计划正文的代码块是对的，未受影响。
+
 ---
 
 ## Task 15：收尾
@@ -6118,7 +6137,25 @@ Expected: 无输出（5b-1 收尾时也是无输出）。
 本计划的 Task 3（编辑区 +命令库）、Task 7（编辑区 +导入文件）、Task 8（编辑区 +同步到另一台）与 Task 9（主窗口 AppBar +设置）都改了像素，**每一步当时都已经重生成了**（Task 3 的 Step 9b、Task 7 的 Step 8b、Task 8 的 Step 7b、Task 9 的 Step 6）。这一步是最后一遍确认：**没有一张漏在中间**。若有哪张的 mtime 早于它对应的那次改动，说明那一步被跳过了 —— 补上。
 
 Run: `WCT_GOLDEN=1 flutter test test/ui/main_window_golden_test.dart --update-goldens`
-Expected: PASS，且 `git status` 显示 `test/ui/golden/` 下的改动。
+Expected: **5 条全跑（不是跳过）且 PASS，并且 `git status --short` 在 `test/ui/golden/`
+下必须没有输出。**
+
+⚠ **这一行原先写的是"Expected: … 且 `git status` 显示改动"，方向是反的，已改正。**
+`--update-goldens` **无条件重写全部五张 PNG**，而 5b-1 已经证明这条流水线是
+**确定性的**（两台独立生成、sha256 相同）。所以重跑一遍**字节级不该有任何变化**：
+`git status` 干净 = 五张都已是最新、没有一张漏在中间；**`git status` 里出现改动
+才是异常信号** —— 要么渲染后端漂了，要么**某一步的像素改动当时没重生成**，
+现在补上了。按旧写法把"有改动"当成期望，等于把后一种情况直接提交掉，而
+Step 4 存在的全部意义就是抓它。
+
+**mtime 证明不了这件事**：`--update-goldens` 每次都重写五张，五张的 mtime 永远
+一致（当前就都是 `Sep 26 11:38`）。判据只有字节。
+
+**还有一道静默的坑**：`golden_harness.dart` 在本机缺字体时会把整组**跳过**
+（`fontsAvailable`）。已确认本机两个字体文件都在
+（`/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc`、
+`/usr/share/fonts/wqy-microhei/wqy-microhei.ttc`），所以应当看到 **5 条通过**。
+看到 `~5` 就是字体没了 —— 那不是验收通过，是没跑。
 
 **逐张开图确认**（这是这一步的全部价值）：
 
