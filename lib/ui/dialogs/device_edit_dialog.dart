@@ -5,6 +5,41 @@ import '../../data/device_store.dart';
 import '../../models/device_profile.dart';
 import '../../state/providers.dart';
 
+/// 编辑一台设备时，改动**这些**字段不动它的会话（决策①）。
+///
+/// **写成"显示字段"的白名单、其余一律算连接参数，是为了让漏掉一个新字段的
+/// 后果是"多断一次线"（用户重连即可），而不是"改了参数还连着旧会话"** ——
+/// 后者的表现是用户以为新参数生效了，而设备上跑的还是旧凭据。
+const _displayOnlyFields = {'name', 'autoConnect', 'snippets'};
+
+/// 两台设备的**连接参数**是否不同。
+///
+/// 比的是逐字段的值，不是 `DeviceProfile` 的相等（它没有 `==`；就算有，
+/// `snippets` 也在里面 —— 加一条命令片段不该断线）。
+///
+/// **列表按内容比，不按 identity。** `List` 不覆写 `==`，直接 `a != b` 会让
+/// 两个内容相同的 `postLoginCommands` 判成不同 —— 那样每次保存都会断线一次。
+bool connectionParamsDiffer(DeviceProfile before, DeviceProfile after) {
+  final a = before.toJson();
+  final b = after.toJson();
+  for (final key in a.keys) {
+    if (_displayOnlyFields.contains(key)) continue;
+    if (!_sameJsonValue(a[key], b[key])) return true;
+  }
+  return false;
+}
+
+bool _sameJsonValue(Object? a, Object? b) {
+  if (a is List && b is List) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (!_sameJsonValue(a[i], b[i])) return false;
+    }
+    return true;
+  }
+  return a == b;
+}
+
 /// 设备编辑对话框（FR-D-01…05、11、12）。
 ///
 /// 三个出口：
@@ -204,11 +239,24 @@ class _DeviceEditDialogState extends ConsumerState<DeviceEditDialog> {
       _error = null;
     });
 
+    // **SnackBar 的 messenger 要在 pop 之前抓。** pop 之后本 widget 的 context
+    // 已经不能用了，而 `ScaffoldMessengerState` 活得比对话框长。
+    final messenger = ScaffoldMessenger.of(context);
+    final existing = widget.existing;
+    var disconnected = false;
+
     try {
-      if (widget.existing == null) {
+      if (existing == null) {
         await ref.read(devicesProvider.notifier).add(draft);
       } else {
         await ref.read(devicesProvider.notifier).update(draft);
+        // 决策①：**改了连接参数就断开。** 不断的话，那条活着的会话用的还是
+        // 旧主机/旧凭据，而界面上的设备行看起来已经"改好了"——用户以为在跟
+        // 新设备说话。只改名字/自动连接/命令库则不动会话。
+        if (connectionParamsDiffer(existing, draft)) {
+          await ref.read(sessionProvider(existing.id).notifier).disconnect();
+          disconnected = true;
+        }
       }
     } catch (error) {
       if (!mounted) return;
@@ -223,7 +271,13 @@ class _DeviceEditDialogState extends ConsumerState<DeviceEditDialog> {
       return;
     }
 
-    if (mounted) Navigator.of(context).pop();
+    if (!mounted) return;
+    Navigator.of(context).pop();
+    if (disconnected) {
+      messenger.showSnackBar(
+        const SnackBar(content: Text('连接参数已改变，已断开该设备，请重新连接')),
+      );
+    }
   }
 
   void _fail(String message) => setState(() => _error = message);
