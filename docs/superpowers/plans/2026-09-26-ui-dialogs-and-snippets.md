@@ -5446,7 +5446,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `lib/connection/connection_manager.dart`（`_scheduleRetry` + `DeviceConnectionState.failed` 的文档）
-- Test: `test/connection/connection_manager_test.dart`（改两处断言）
+- Test: `test/connection/connection_manager_test.dart`（改两处断言 + 一条过期注释，见 Step 3b）
 
 - [ ] **Step 1：改那条会红的既有断言，让它先红**
 
@@ -5557,6 +5557,28 @@ Expected: FAIL（两条）—— 实际是 `reconnecting`（第 195 行那条）
 /// 即变红，之后的重试期间是黄 —— 见 [DeviceConnectionState.failed]。
 ```
 
+- [ ] **Step 3b：改掉测试里那条同样过期的注释**
+
+Step 1 改的是**断言**，可紧挨着它的那条**注释**也变成了假话（执行本任务时由
+实现者发现并上报，控制者复核确认）。`test/connection/connection_manager_test.dart`
+里 `autoReconnect: false` 那条用例中：
+
+```dart
+      // autoReconnect=false 是唯一应当变红（failed）的情形。
+      // 注意与"用户主动断开"区分：那种情况 §5.4 要求是灰的。
+```
+
+第一句在本任务之后**不成立**：红在默认配置（`autoReconnect: true`）下就可达 ——
+证据在同一个文件里，Step 1 刚改过的第 195 行那条断言。这条注释的用处恰恰是
+区分"红"与"用户主动断开的灰"，留着旧说法等于把决策②要纠正的那个理解重新种回去。
+两句一起换成：
+
+```dart
+      // 红（failed）在默认配置下也到得了 —— 见上面那条断言。这里断的是
+      // autoReconnect=false 时**停**在红：不排程重连，所以一直红着。
+      // 注意与"用户主动断开"区分：那种情况 §5.4 要求是灰的。
+```
+
 - [ ] **Step 4：跑测试，确认全绿**
 
 Run: `flutter test test/connection/connection_manager_test.dart`
@@ -5586,6 +5608,41 @@ failed 的含义随之从"不再重试"改成"这一次失败了"，文档同步
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
+
+> **执行记录（2026-09-26）：Step 1/2/3 落地为 commit `d1193d4`，Step 3b 是事后补的。**
+> 实现者按 Files 的原话（"改两处断言"）执行，因此**没碰**那条注释 —— 它不在
+> 授权的改动范围里 —— 并在交付报告里点名它是过期注释、"does not affect test
+> behavior"。实现者的判断是对的：**错在计划的 Files 列表不完整**，不在于执行。
+> 控制者复核确认该注释确已被本任务证伪（`test/connection/connection_manager_test.dart:564`），
+> 于是补写 Step 3b、更新 Files 行，并另起一笔提交落地（commit `5a3dff8`；
+> 只动注释文本，无行为改动）。这一条与 Task 9 那三处、Task 10 的 `runAsync`、
+> Task 11 的 `fireImmediately` 同属一类：**计划自己写漏了，不是实现者做错了。**
+>
+> 另外记一笔环境观察（与本次改动无关，但会影响 Task 15 的判定）：全仓
+> `flutter test` 在本机**偶发**在 `test/ui/` 的 widget 用例上变红。累计证据
+> （Task 12、13 执行期）：
+>
+> | 观察者 | 结果 | 挂在哪 |
+> |---|---|---|
+> | Task 12 实现者 | 2 / 4 红 | `main_window_test` 切设备草稿、`device_list_panel_test` 右键删除 |
+> | 同上的干净 HEAD worktree | 红 | `device_list_panel_test` 拖拽排序、`editor_text_api_test` 草稿落盘 |
+> | 控制者 | 1 / 1 红 | `main_window_test` 切设备草稿 |
+> | Task 13 实现者 | 2 / 3 红 | `device_list_panel_test` 右键删除、**同一个文件**的拖拽排序 |
+>
+> 每次都是 `+60N ~3 -1`（总数对，只少一条），每次挂的用例都不同，且**单跑那个
+> 文件必绿**。`device_list_panel_test.dart` 是目前唯一的重复热点（两条不同用例
+> 各挂过一次）。
+>
+> **成因有据可查，不用猜**：`test/ui/ui_harness.dart` 的 `settleDisk` 文档自己
+> 写着它是**写死的** 12 × 5ms ≈ 60ms 真实时间，而 `pump` / `pumpAndSettle` 推的是
+> 假时钟、推不动真盘 I/O —— 全仓跑时文件是并行起 isolate 的，机器一忙这 60ms
+> 就不够。同一份文档还记着"多一句 `debugPrint` 就从红变绿"。这正是
+> `pumpUntilTrue` / `pumpUntil` 存在的理由，只是并非每个调用点都换了。
+>
+> **Task 15 收尾时若全仓变红，先单跑那个文件、再重跑全仓**，别当成回归。
+> **本次不修**（用户的口径是"停止测试，先完成剩余编码"）：修法是把"等一段固定
+> 时间"换成"等条件成立"，属测试基建改造，不是这一刀要落的代码；作为已知的
+> 验收债记在这里。
 
 ---
 
@@ -5845,6 +5902,25 @@ QueueDropped.count 含在途那一条，它已经写到设备上了。事件载�
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
+
+> **执行记录（2026-09-26）：落地为 commit `66fd048`，8 步全按计划执行，无偏离。**
+>
+> - **两处前置声明都被实现者回到源码核过**（不是照抄）：`QueueDropped` 那一支
+>   确实提前 `return`；`copyWith` 的 `lastDispatchEvent` 确实是
+>   `DispatchEvent?` + `?? this.lastDispatchEvent`、确实**没有**哨兵
+>   （而 `reconnect` / `lastFailure` 都有）。计划在这两点上是对的。
+> - **Step 1 的红正是预测的两条**，而且编辑区那条红在 `findsOneWidget` 找到 **0 个**
+>   —— 这**证实了计划关于"那条分支不可达"的判断**：它红的原因不是文案，是分支
+>   根本走不到。若它是文案问题，会红在"找到 1 个但文字不对"。
+> - **哨兵是承重的，实现者做了针对性验证**（把 `copyWith` 临时改回 `??` 看
+>   `editor_panel_test.dart:197` 那条 `findsNothing` 变红，其余 5 条仍绿），
+>   随后按字节还原。控制者复核：`lib/state/session_controller.dart` 在
+>   `66fd048` 之后**工作树干净**，临时改动没有残留。这条验证是本次唯一的
+>   "变更—观察—还原"动作，值这一趟：它把"断言是不是空转的"从推测变成实测。
+> - `未发送` 在 `lib/` 的其余出现处只有 `editor_panel.dart:279`（`QueueAborted`
+>   那一行），正是计划要求**不要动**的那行，实现者确认未动。与 Step 4 的警告一致。
+> - **Step 6 跑了三次**才拿到绿（前两次都撞上上面记的那条 flake，且两次都落在
+>   `device_list_panel_test.dart`）。绿的那次是 `+607 ~3`，与预期条数一致。
 
 ---
 
