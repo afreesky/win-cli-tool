@@ -13,6 +13,40 @@ import 'connector.dart';
 import 'known_host.dart';
 import 'session.dart';
 
+/// V1 实际使用的 SSH 算法集：**dartssh2 的默认值，末尾追加 `ssh-rsa`**。
+///
+/// **为什么要有这一条。** dartssh2 4.x 的默认 `hostkey` 列表是
+/// `ed25519 / rsa-sha2-512 / rsa-sha2-256 / ecdsa-*`，**不含 `ssh-rsa`**
+/// （SHA-1，已被现代 OpenSSH 弃用）。而大量存量网络设备的 SSH 服务**只提供
+/// `ssh-rsa` 这一种主机密钥算法**，于是两边列表交集为空，握手直接失败 ——
+/// 2026-09-26 对一台锐捷交换机（10.166.96.41）实测，双方列表为：
+///
+///   设备 KEXINIT : `host key algorithms: ssh-rsa`（仅此一项）
+///   我方默认集   : `ed25519, rsa-sha2-512, rsa-sha2-256, ecdsa-521/384/256`
+///
+/// 结果是 `SSHInternalError(Bad state: No matching host key algorithm)`，
+/// 传输层在认证之前关闭，用户看到的是一个**没有尽头的重试循环**。
+/// 这不是个例：同型号/同代固件的机器都只给 `ssh-rsa`。
+///
+/// **追加在末尾，不是插在前面，也不是替换。** RFC 4253 §7.1 取双方列表中
+/// 第一个共同项，所以只有当对端拿不出任何更好的算法时才会选中它 ——
+/// 现代设备协商出的结果与不追加时**逐字相同**。OpenSSH 自己的默认
+/// `HostKeyAlgorithms` 同样保留 `ssh-rsa`，本行即对齐这一行为。
+///
+/// **代价是如实的**：选中它意味着接受 SHA-1 签名的主机密钥。它只影响
+/// "服务端身份由哪种签名算法证明"，**不影响会话密钥强度** —— 密钥由 KEX
+/// 协商（本机实测的设备用 `curve25519-sha256`），与主机密钥算法无关。
+/// 且它只在"对端别无选择"时才被选中。
+///
+/// 规格出处：`docs/superpowers/specs/2026-09-24-win-cli-tool-requirements.md`
+/// §10.1「旧 SSH 算法的兼容开关」与 §13 风险表。那两处原本记的是"V1 明确不做
+/// 兼容开关"，**前提是"失败时按 FR-C-06 给出可读原因"**；实测证明该前提当时
+/// 并不成立（原因根本没显示给用户），而这类设备在目标环境里占比不低，
+/// 故 2026-09-26 连同 FR-C-06 一起改为本条。**规格那两处需要同步修订。**
+final _algorithms = SSHAlgorithms(
+  hostkey: [...const SSHAlgorithms().hostkey, SSHHostkeyType.rsaSha1],
+);
+
 /// 基于 dartssh2 的 SSH 会话实现。
 ///
 /// 与 [TelnetSession] 的结构差异：这里不需要"原始字节 → 文本"的中间
@@ -82,6 +116,8 @@ class SshSession implements Session {
       socket,
       username: profile.username,
       identities: identities,
+      // 见 [_algorithms]：默认集 + 末尾的 ssh-rsa。
+      algorithms: _algorithms,
       onPasswordRequest: _onPasswordRequest,
       // 始终非 null，见 _buildHostKeyCallback 的说明。
       onVerifyHostKey: _buildHostKeyCallback(),

@@ -3,7 +3,8 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:dartssh2/dartssh2.dart' show SSHKeyDecodeError;
+import 'package:dartssh2/dartssh2.dart'
+    show SSHAlgorithms, SSHHostkeyType, SSHKeyDecodeError;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:win_cli_tool/connection/connection_failure.dart';
 import 'package:win_cli_tool/connection/connector.dart';
@@ -281,6 +282,55 @@ void main() {
         reason: 'verifyHostKey=$verify 时，回调仍必须被显式传入',
       );
     }
+  });
+
+  test('交给 SSHClient 的算法集：默认项原样保留，ssh-rsa 只追加在**末尾**', () {
+    // 这条钉的是 2026-09-26 对真机查出来的那个缺口：dartssh2 4.x 的默认
+    // `hostkey` 列表**不含 `ssh-rsa`**，而只提供 `ssh-rsa` 的设备（实测的锐捷
+    // 交换机就是 `host key algorithms: ssh-rsa` 一项，华为/思科的老固件同理）
+    // 于是与它交集为空，握手在认证之前就失败 —— 用户看到的是一个没有解释的
+    // 重试循环。
+    //
+    // 断言的是**已构造的 SSHClient 上的那个字段**，与上面那条回调用例同一个
+    // 理由：断言 `_algorithms` 自身是代理断言 —— `_createClient()` 里漏写
+    // `algorithms:` 时它照绿，而那正是"又被改回去"的形状。
+    //
+    // **两条性质缺一不可，只钉一条都会漏掉一种坏改法：**
+    //   1. `ssh-rsa` 在列表里 —— 少了它，老设备依旧连不上（回到今天这个 bug）；
+    //   2. 它在**最后** —— RFC 4253 §7.1 取双方列表的第一个共同项，把它挪到
+    //      前面会改变现代设备的协商结果，把一个兼容性补丁变成一次静默的安全降级。
+    final session = SshSession(
+      profile: _profile(),
+      connector: _FailingConnector(Exception('不该走到这里')),
+      hostKeyStore: InMemoryHostKeyStore(),
+    );
+
+    final hostkey = session
+        .debugBuildClient(_StubConnection(), null)
+        .algorithms
+        .hostkey;
+    final defaults = const SSHAlgorithms().hostkey;
+
+    expect(
+      hostkey.take(defaults.length).toList(),
+      defaults,
+      reason: '默认项必须原样保留、顺序不变 —— 否则现代设备的协商结果会变',
+    );
+    expect(
+      hostkey,
+      hasLength(defaults.length + 1),
+      reason: '只许追加一项，不许替换或删减默认项',
+    );
+    expect(
+      hostkey.last,
+      SSHHostkeyType.rsaSha1,
+      reason: 'ssh-rsa 必须在末尾：只有对端别无选择时才轮到它',
+    );
+    expect(
+      hostkey.where((h) => h == SSHHostkeyType.rsaSha1),
+      hasLength(1),
+      reason: 'ssh-rsa 只能出现一次',
+    );
   });
 
   test('connect() 自己那条传参路径：它建出来的 client 也必须拿到非 null 回调', () async {
