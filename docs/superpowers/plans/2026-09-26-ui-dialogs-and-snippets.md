@@ -532,6 +532,9 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:win_cli_tool/models/device_profile.dart';
 import 'package:win_cli_tool/state/providers.dart';
 import 'package:win_cli_tool/ui/main_window.dart';
+// 「抽屉真的关了吗」这条断言要靠 `find.byType(SnippetDrawer)` 来问 ——
+// 见下面那条用例里的注释。
+import 'package:win_cli_tool/ui/panels/snippet_drawer.dart';
 
 import '../fixtures/fake_session.dart';
 import 'ui_harness.dart';
@@ -627,7 +630,13 @@ void main() {
       'sys\ndisplay version',
       reason: '光标在非空行上，插入前要先换行',
     );
-    expect(find.text('还没有命令片段'), findsNothing, reason: '抽屉要关上');
+    // 这两条合起来才证明"抽屉关了、而页面还在"。
+    //
+    // **别把它写成 `find.text('还没有命令片段')`。** d1 是有片段的，那句话在
+    // d1 的抽屉里根本不会渲染 —— 写成它，这条断言就恒真了：抽屉关没关都绿。
+    // （和 Task 1 里 const 规范化让相等用例恒真是同一类错误：断言在测空气。）
+    // 要问的是抽屉这个**组件**还在不在，不是它里面某句文案。
+    expect(find.byType(SnippetDrawer), findsNothing, reason: '抽屉要关上');
     expect(find.byType(MainWindow), findsOneWidget, reason: '关抽屉不能把页面一起弹掉');
   });
 
@@ -720,7 +729,14 @@ void main() {
 - [ ] **Step 3：跑测试，确认它红**
 
 Run: `flutter test test/ui/snippet_drawer_test.dart`
-Expected: FAIL —— 编译错误 `The getter 'tooltip' ... ` 不会出现（`find.byTooltip` 是运行时查找），先红在 `Could not find the tooltip "命令库"`（`openDrawer` 里那次 `tap`）。这是"功能还不存在"的正常形状。
+Expected: FAIL —— **7 条全红**，先红在 `openDrawer` 里那次 `tap`。本机 flutter 3.44.4 的实际措辞是：
+
+```
+The finder "Found 0 widgets with widget matching predicate: []" (used in a call to "tap()")
+could not find any matching widgets.
+```
+
+（不是"Could not find the tooltip"）。这是"功能还不存在"的正常形状。
 
 - [ ] **Step 4：实现抽屉**
 
@@ -799,38 +815,50 @@ class SnippetDrawer extends ConsumerWidget {
                     final snippet = device.snippets[i];
                     // `ListTile` 只有 `onTap`/`onLongPress`，没有 `onDoubleTap`
                     // —— 双击要靠外面这层 `GestureDetector`。
-                    return GestureDetector(
-                      onDoubleTap: () => onInsert(snippet.content),
-                      child: ListTile(
-                        title: Text(
-                          snippet.name,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                        subtitle: Text(
-                          snippet.content,
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                          style: Theme.of(context).textTheme.bodySmall,
-                        ),
-                        trailing: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            // tooltip 带片段名：两条片段的按钮必须能彼此区分。
-                            IconButton(
-                              tooltip: '编辑 ${snippet.name}',
-                              icon: const Icon(Icons.edit, size: 18),
-                              onPressed: () =>
-                                  _edit(context, ref, device, snippet),
+                    //
+                    // ⚠ **两个按钮必须放在 `GestureDetector` 外面**，不能图省事
+                    // 当 `ListTile.trailing`。`DoubleTapGestureRecognizer` 在第一次
+                    // 按下时会 `gestureArena.hold(pointer)`（`gestures/multitap.dart:330`，
+                    // `_registerFirstTap` 里），把手势竞技场**按住**到双击超时
+                    // （300ms）才释放。按钮是 `GestureDetector` 的后代，于是单击
+                    // 要等满 300ms 才轮到它赢；**双击按钮还会顺带触发插入**。
+                    // 实测（本机 flutter 3.44.4）：写成 `trailing` 的话，
+                    // `tap` 完 `pumpAndSettle()` 之后对话框是 0 个 ——
+                    // `pumpAndSettle` 在 ~100ms 后就没有待处理的帧了，而 hold
+                    // 还没释放；再推 400ms 才出现。这不是测试写法的问题，
+                    // 是真机上按钮真的迟 300ms。
+                    return Row(
+                      children: [
+                        Expanded(
+                          child: GestureDetector(
+                            onDoubleTap: () => onInsert(snippet.content),
+                            child: ListTile(
+                              title: Text(
+                                snippet.name,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                              subtitle: Text(
+                                snippet.content,
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                                style: Theme.of(context).textTheme.bodySmall,
+                              ),
                             ),
-                            IconButton(
-                              tooltip: '删除 ${snippet.name}',
-                              icon: const Icon(Icons.delete_outline, size: 18),
-                              onPressed: () =>
-                                  _delete(context, ref, device, snippet),
-                            ),
-                          ],
+                          ),
                         ),
-                      ),
+                        // tooltip 带片段名：两条片段的按钮必须能彼此区分。
+                        IconButton(
+                          tooltip: '编辑 ${snippet.name}',
+                          icon: const Icon(Icons.edit, size: 18),
+                          onPressed: () => _edit(context, ref, device, snippet),
+                        ),
+                        IconButton(
+                          tooltip: '删除 ${snippet.name}',
+                          icon: const Icon(Icons.delete_outline, size: 18),
+                          onPressed: () =>
+                              _delete(context, ref, device, snippet),
+                        ),
+                      ],
                     );
                   },
                 ),
@@ -1049,7 +1077,7 @@ import 'panels/snippet_drawer.dart';
 
 - [ ] **Step 6：工具栏加「命令库」按钮**
 
-在 `lib/ui/panels/editor_panel.dart` 的 `_toolbar` 里，`const Spacer(),`（`editor_panel.dart:303`）**之前**插入：
+在 `lib/ui/panels/editor_panel.dart` 的 `_toolbar` 里，`const Spacer(),`（**现在在第 363 行**；Task 2 在 `send()` 前面插了 60 行，把它从 303 挤了下来 —— 按内容 grep，别信行号）**之前**插入：
 
 ```dart
           const SizedBox(width: 8),
@@ -1059,7 +1087,11 @@ import 'panels/snippet_drawer.dart';
             // **`Scaffold.of` 找的是主窗口那个 Scaffold** —— 抽屉挂在它的
             // `endDrawer` 上，编辑区只是它 `body` 里的一棵树。
             // 这也是"编辑区的用例不能点这个按钮"的原因：`ui_harness.dart` 的
-            // `pumpUi` 包的那个 `Scaffold` 没有 `endDrawer`，点了会在断言里炸。
+            // `pumpUi` 包的那个 `Scaffold` 没有 `endDrawer`。
+            // 注意它**不是**炸，是**静默无操作**：`ScaffoldState.openEndDrawer`
+            // 的实现是 `_endDrawerKey.currentState?.open();`（`scaffold.dart:2310`），
+            // 没有 `endDrawer` 时 key 的 currentState 是 null，`?.` 直接跳过。
+            // 所以那种用例只会以"什么都没发生"的形式红，不会给出好读的报错。
             onPressed: () => Scaffold.of(context).openEndDrawer(),
           ),
 ```
@@ -1081,19 +1113,28 @@ Expected: PASS（5b-1 收尾时是 510 通过 + 3 跳过；本任务之后条数
 Run: `dart analyze lib/ test/`
 Expected: `No issues found!`
 
-- [ ] **Step 9b：像素变了 —— 重新生成编辑区的 golden**
+- [ ] **Step 9b：像素变了 —— 重新生成 golden**
 
-工具栏上多了一个图标，`editor_panel.png` **一定**会不同。**现在就跟上**，别留到收尾 —— 一张过期的 golden 比没有 golden 更坏：它是绿的，而它绿的原因是没人跑过它（`WCT_GOLDEN` 没设时那几条是跳过的）。
+工具栏上多了一个图标，**三张** golden 都会不同 —— 不只是 `editor_panel.png`：`main_window_light.png` 与 `main_window_dark.png` 里也含着这条工具栏（实测三张各差 226 个像素，`device_list_panel.png` / `output_panel.png` 没动）。
+
+**现在就跟上**，别留到收尾 —— 一张过期的 golden 比没有 golden 更坏：它是绿的，而它绿的原因是没人跑过它（`WCT_GOLDEN` 没设时那几条是跳过的）。
+
+先不加 `--update-goldens` 跑一遍，**看清单**到底哪几张飘了（比盲更新安全：盲更新会把"本来该红"的一并吞掉）：
+
+Run: `WCT_GOLDEN=1 flutter test test/ui/main_window_golden_test.dart`
+Expected: FAIL，报出上面那三张。
+
+再更新：
 
 Run: `WCT_GOLDEN=1 flutter test test/ui/main_window_golden_test.dart --update-goldens`
-Expected: PASS，且 `git status` 里 `test/ui/golden/editor_panel.png` 有改动。
+Expected: PASS，且 `git status` 里那三张 `M`。
 
-**开图看一眼**确认多出来的是那个书图标（`Icons.menu_book`），且没把别的什么挤歪。
+**开图看一眼** `test/ui/golden/editor_panel.png`（360×520）确认工具栏依次是「连接 / 断开 / 发送 / **命令库**（`Icons.menu_book`）/ 进度文字」，且行号栏、正文、间距都没被挤歪。顺手删掉失败那次留下的 `test/ui/failures/` 碎屑。
 
 - [ ] **Step 10：提交**
 
 ```bash
-git add lib/state/providers.dart lib/ui/panels/snippet_drawer.dart lib/ui/panels/editor_panel.dart lib/ui/main_window.dart test/ui/snippet_drawer_test.dart test/ui/golden/editor_panel.png
+git add lib/state/providers.dart lib/ui/panels/snippet_drawer.dart lib/ui/panels/editor_panel.dart lib/ui/main_window.dart test/ui/snippet_drawer_test.dart test/ui/golden/editor_panel.png test/ui/golden/main_window_light.png test/ui/golden/main_window_dark.png
 git commit -m "feat(ui): 命令库抽屉（FR-S-01…04）
 
 抽屉挂在主窗口的 endDrawer 上；双击插入走编辑区的 insertAtCursor。
@@ -2882,17 +2923,17 @@ Expected: PASS
 Run: `dart analyze lib/ test/`
 Expected: `No issues found!`
 
-- [ ] **Step 8b：像素又变了 —— 重新生成编辑区的 golden**
+- [ ] **Step 8b：像素又变了 —— 重新生成 golden**
 
-工具栏上再添一个图标（`Icons.file_open`），`editor_panel.png` 又要重生成一次。理由与 Task 3 的 Step 9b 相同：**别让 golden 悄悄过期。**
+工具栏上再添一个图标（`Icons.file_open`），**又是那三张**（`editor_panel.png` + `main_window_light.png` + `main_window_dark.png`，主窗口那两张里含着这条工具栏）。理由与 Task 3 的 Step 9b 相同：**别让 golden 悄悄过期。**
 
 Run: `WCT_GOLDEN=1 flutter test test/ui/main_window_golden_test.dart --update-goldens`
-Expected: PASS，`git status` 里 `test/ui/golden/editor_panel.png` 有改动。开图确认多出来的是"打开文件"那个图标。
+Expected: PASS，`git status` 里那三张有改动。开图确认多出来的是"打开文件"那个图标。
 
 - [ ] **Step 9：提交**
 
 ```bash
-git add lib/state/file_reader.dart lib/ui/dialogs/import_dialog.dart lib/ui/panels/editor_panel.dart test/ui/import_dialog_test.dart test/ui/golden/editor_panel.png
+git add lib/state/file_reader.dart lib/ui/dialogs/import_dialog.dart lib/ui/panels/editor_panel.dart test/ui/import_dialog_test.dart test/ui/golden/editor_panel.png test/ui/golden/main_window_light.png test/ui/golden/main_window_dark.png
 git commit -m "feat(ui): 导入文件（FR-E-15/16）
 
 零依赖的路径输入框 + 可注入的读取缝；严格 UTF-8 解码，非 UTF-8 明确拒绝。
@@ -3382,17 +3423,17 @@ Expected: PASS
 Run: `dart analyze lib/ test/`
 Expected: `No issues found!`
 
-- [ ] **Step 7b：像素又变了 —— 重新生成编辑区的 golden**
+- [ ] **Step 7b：像素又变了 —— 重新生成 golden**
 
-工具栏上第三个新图标（`Icons.copy_all`）。这是编辑区工具栏最后一次变动，所以这一张之后到收尾都不用再动。
+工具栏上第三个新图标（`Icons.copy_all`）。这是编辑区工具栏最后一次变动，所以**这三张**之后到收尾都不用再动。
 
 Run: `WCT_GOLDEN=1 flutter test test/ui/main_window_golden_test.dart --update-goldens`
-Expected: PASS，`git status` 里 `test/ui/golden/editor_panel.png` 有改动。开图确认工具栏现在是「连接 / 断开 / 发送 / 命令库 / 导入文件 / 同步到另一台」六个图标。
+Expected: PASS，`git status` 里那三张有改动。开图确认工具栏现在是「连接 / 断开 / 发送 / 命令库 / 导入文件 / 同步到另一台」六个图标。
 
 - [ ] **Step 8：提交**
 
 ```bash
-git add lib/ui/dialogs/sync_dialog.dart lib/ui/panels/editor_panel.dart test/ui/sync_dialog_test.dart test/ui/golden/editor_panel.png
+git add lib/ui/dialogs/sync_dialog.dart lib/ui/panels/editor_panel.dart test/ui/sync_dialog_test.dart test/ui/golden/editor_panel.png test/ui/golden/main_window_light.png test/ui/golden/main_window_dark.png
 git commit -m "feat(ui): 同步到另一台（FR-E-17）
 
 目标设备选择 + 覆盖/追加；写经 draftProvider.save 以免缓存过期；
@@ -5652,6 +5693,9 @@ Expected：PNG 是 1280x720 的真图（不是 586 字节、2 色的空白图）
 - **Task 7 的测试文件要 `import 'package:flutter_riverpod/misc.dart';`** —— `readerOf` 的返回类型是 `List<Override>`，而 `Override` 不在 `flutter_riverpod.dart` 的主入口里（3.4.3 实测；`ui_harness.dart` 开头那段注释就是为这件事写的）。少这一行，红的是 `non_type_as_type_argument`。
 - **Task 8 的 `syncAs` 里不能有 `tester.enterText`** —— `sync-target` 是 `DropdownButtonFormField`，不是输入框；`enterText` 找不到 `EditableText` 会直接抛。选目标只能"点开、再点那一项"。
 - **`DropdownButtonFormField.initialValue` 是本版 Flutter 的正确参数名**（`value` 已废弃）。且 `setState` 之后显示会跟着变 —— `dropdown.dart:2004` 的 `didUpdateWidget` 里有 `if (oldWidget.initialValue != widget.initialValue) setValue(...)`。Task 8/9 的三处下拉都靠这一条。
+- **双击区域里不能包着别的按钮（Task 3）。** `DoubleTapGestureRecognizer` 在第一次按下时会 `gestureArena.hold(pointer)`（`gestures/multitap.dart:330`），把手势竞技场按到双击超时（300ms）为止。所以 `GestureDetector(onDoubleTap:)` 里**但凡裹着一个 `IconButton`**（初稿是把它当 `ListTile.trailing`），那个按钮的单击就要等满 300ms 才生效，双击它还会顺带触发插入。初稿在测试里表现为"点了编辑/删除，对话框 0 个"—— 而 `pumpAndSettle()` 在 ~100ms 后就没帧可等了，hold 还没释放，于是永远等不到。修法是把按钮挪出 `GestureDetector` 的子树（`Row(Expanded(双击区), 按钮, 按钮)`）。**这是 Task 3 实施者实测报上来的。**
+- **改编辑区工具栏的 Task 一次要重生成三张 golden**，不是一张：`main_window_light.png` 与 `main_window_dark.png` 里也含着那条工具栏（实测三张各差 226 像素）。Task 3/7/8 的 `git add` 清单都已按这个改过 —— 漏掉的那两张会以"改了但没进提交"的形式留在工作区，然后被下一次 `--update-goldens` 悄悄吞掉。
+- **断言要问"组件在不在"，不是"里面某句文案在不在"（Task 3）。** 初稿用 `find.text('还没有命令片段')` 来证明抽屉关上了，而被测设备**有**片段，那句话在它的抽屉里根本不会渲染 —— 这条断言恒真，抽屉关没关都绿。正确的问法是 `find.byType(SnippetDrawer)`。和上面 Task 1 那条是同一类病：**断言在测空气。**
 
 **一条通用教训（值得单独记着）：** 「分析器干净」这条验收门比它看起来严 —— `unnecessary_null_comparison`（warning）与 `unrelated_type_equality_checks`（**info**）都会让 `dart analyze` 打印 `1 issue found` 而不是 `No issues found!`。写断言时对**静态类型已知**的比较（非空对象与 `null`、无关类型之间）要格外小心。
 
@@ -5667,7 +5711,9 @@ Expected：PNG 是 1280x720 的真图（不是 586 字节、2 色的空白图）
 | `AppSettings.copyWith(logDir: null)` 能真的清掉 | `_unset` 哨兵 |
 | `FileHostKeyStore` 不持实例缓存 → 测试里可以用第二个实例预置 | 它 `_readFromDisk` 的文档 |
 | `AppStores.hostKeys` 的静态类型是 `FileHostKeyStore` → 不需要向下转型 | `app_stores.dart` |
-| `EditorPanel._toolbar` 的 `Spacer` 在按钮之后 | `editor_panel.dart:303`（逐字 grep 过） |
+| `EditorPanel._toolbar` 的 `Spacer` 在按钮之后 | `editor_panel.dart:363`（**Task 2 已落地，行号从 303 移到了 363**；按内容 grep，别信旧行号） |
+| 手势竞技场会被双击识别器 hold 住 | `gestures/multitap.dart:330` `_registerFirstTap` 里的 `gestureArena.hold(tracker.pointer)` |
+| 没有 `endDrawer` 时 `openEndDrawer()` 是静默无操作 | `scaffold.dart:2310` = `_endDrawerKey.currentState?.open();`（`?.` 不是 `!`） |
 | 编辑区 `_loadDraft` 经 `draftProvider` 读 → 写也必须经它 | `editor_panel.dart` 的 `_loadDraft` |
 
 ---
