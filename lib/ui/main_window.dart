@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/app_settings.dart';
 import '../state/providers.dart';
 import 'dialogs/device_edit_dialog.dart';
+import 'dialogs/settings_dialog.dart';
 import 'panels/device_list_panel.dart';
 import 'panels/editor_panel.dart';
 import 'panels/output_panel.dart';
@@ -71,6 +72,11 @@ class _MainWindowState extends ConsumerState<MainWindow> {
           appBar: AppBar(
             title: const Text('网络设备命令行工具'),
             actions: [
+              IconButton(
+                tooltip: '设置',
+                icon: const Icon(Icons.settings),
+                onPressed: () => SettingsDialog.show(context),
+              ),
               IconButton(
                 tooltip: '添加设备',
                 icon: const Icon(Icons.add),

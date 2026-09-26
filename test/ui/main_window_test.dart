@@ -211,4 +211,22 @@ void main() {
 
     expect(find.text('保存'), findsOneWidget);
   });
+
+  testWidgets('AppBar 的「设置」打开设置对话框（FR-G-01）', (tester) async {
+    await pumpWindow(tester);
+
+    await tester.tap(find.byTooltip('设置'));
+    await tester.pumpAndSettle();
+
+    // **只可能是对话框标题那一个。** AppBar 上那个 `IconButton` 的
+    // `tooltip: '设置'` 不算 —— `Tooltip` 没展开时**不渲染它的文字**
+    // （这正是 Task 6 里删掉一条同类断言的原因：当时写的理由是"标题与 tooltip
+    // 都会命中"，而那个机制根本不存在）。所以这里用 `findsOneWidget`；若真
+    // 数出两个，那是树上多了别的东西，要查，不是放宽断言。
+    expect(find.text('设置'), findsOneWidget, reason: '对话框标题');
+    expect(
+      find.byKey(const ValueKey('settings-command-timeout')),
+      findsOneWidget,
+    );
+  });
 }
