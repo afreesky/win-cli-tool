@@ -191,4 +191,24 @@ void main() {
     final after = container.read(settingsProvider).editorSplitRatio;
     expect(after, greaterThan(before), reason: '往下拖应当让编辑区变高');
   });
+
+  testWidgets('AppBar 的「添加设备」打开设备编辑对话框（FR-D-01）', (tester) async {
+    await pumpWindow(tester);
+
+    await tester.tap(find.byTooltip('添加设备'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('保存'), findsOneWidget);
+  });
+
+  testWidgets('Ctrl+N 走同一条路（§4.8）', (tester) async {
+    await pumpWindow(tester);
+
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyN);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+    await tester.pumpAndSettle();
+
+    expect(find.text('保存'), findsOneWidget);
+  });
 }

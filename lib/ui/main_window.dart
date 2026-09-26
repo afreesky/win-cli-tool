@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../models/app_settings.dart';
 import '../state/providers.dart';
+import 'dialogs/device_edit_dialog.dart';
 import 'panels/device_list_panel.dart';
 import 'panels/editor_panel.dart';
 import 'panels/output_panel.dart';
@@ -208,11 +209,6 @@ class _MainWindowState extends ConsumerState<MainWindow> {
     _editorKey.currentState?.insertAtCursor(content);
   }
 
-  void _addDevice() {
-    // FR-D-01 / Ctrl+N。**设备编辑对话框属 5b-2**，这里是有意留的占位：
-    // 快捷键的接线（本任务真正要交付的东西）是真的，落点还没有。
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('设备编辑对话框将在 5b-2 提供')),
-    );
-  }
+  /// FR-D-01 / Ctrl+N。
+  void _addDevice() => DeviceEditDialog.show(context);
 }

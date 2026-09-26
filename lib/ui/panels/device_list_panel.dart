@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../connection/connection_manager.dart';
 import '../../models/device_profile.dart';
 import '../../state/providers.dart';
+import '../dialogs/device_edit_dialog.dart';
 import '../widgets/status_dot.dart';
 
 /// 设备列表（FR-D）：选中、连接/断开、拖拽排序、删除。
@@ -77,7 +78,7 @@ class _DeviceTile extends ConsumerWidget {
 
     return GestureDetector(
       onSecondaryTapDown: (details) =>
-          _showMenu(context, ref, details.globalPosition),
+          _showMenu(context, ref, details.globalPosition, live: live),
       child: ListTile(
         selected: selected,
         onTap: () => ref.read(selectedDeviceProvider.notifier).select(device.id),
@@ -120,8 +121,9 @@ class _DeviceTile extends ConsumerWidget {
   Future<void> _showMenu(
     BuildContext context,
     WidgetRef ref,
-    Offset position,
-  ) async {
+    Offset position, {
+    required bool live,
+  }) async {
     final overlay = Overlay.of(context).context.findRenderObject()! as RenderBox;
     final choice = await showMenu<String>(
       context: context,
@@ -129,11 +131,39 @@ class _DeviceTile extends ConsumerWidget {
         position & Size.zero,
         Offset.zero & overlay.size,
       ),
-      items: const [
-        PopupMenuItem(value: 'delete', child: Text('删除')),
+      items: [
+        // §7.3 的四项。**不能点的那一项要 `enabled: false` 而不是不显示** ——
+        // 菜单项会跳位置的话，用户按肌肉记忆点第二项就会误触。
+        PopupMenuItem(
+          value: 'connect',
+          enabled: !live,
+          child: const Text('连接'),
+        ),
+        PopupMenuItem(
+          value: 'disconnect',
+          enabled: live,
+          child: const Text('断开'),
+        ),
+        const PopupMenuItem(value: 'edit', child: Text('编辑')),
+        const PopupMenuItem(value: 'delete', child: Text('删除')),
       ],
     );
-    if (choice != 'delete' || !context.mounted) return;
+    if (choice == null || !context.mounted) return;
+
+    if (choice == 'connect') {
+      await ref.read(sessionProvider(device.id).notifier).connect();
+      return;
+    }
+    if (choice == 'disconnect') {
+      await ref.read(sessionProvider(device.id).notifier).disconnect();
+      return;
+    }
+    if (choice == 'edit') {
+      // 编辑对话框自己会处理"该不该断开"（Task 5），这里只管打开它。
+      await DeviceEditDialog.show(context, existing: device);
+      return;
+    }
+    if (choice != 'delete') return;
 
     final confirmed = await showDialog<bool>(
       context: context,

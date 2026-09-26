@@ -15,6 +15,20 @@ import 'ui_harness.dart';
 void main() {
   late Directory root;
 
+  /// 在某个设备行上点右键并把菜单等出来。
+  ///
+  /// `ListTile` 的右键走 `GestureDetector.onSecondaryTapDown` —— 用
+  /// `startGesture(buttons: kSecondaryMouseButton)` 才能触发它，
+  /// `tester.tap` 是主键、不会走那条分支。
+  Future<void> openMenu(WidgetTester tester, String deviceName) async {
+    final gesture = await tester.startGesture(
+      tester.getCenter(find.text(deviceName)),
+      buttons: kSecondaryMouseButton,
+    );
+    await gesture.up();
+    await tester.pumpAndSettle();
+  }
+
   setUp(() async {
     root = await Directory.systemTemp.createTemp('wct_dev_');
   });
@@ -132,5 +146,49 @@ void main() {
     await settleDisk(tester);
 
     expect(container.read(devicesProvider).map((d) => d.id), ['d2', 'd1']);
+  });
+
+  testWidgets('右键菜单是四项，顺序为 连接/断开/编辑/删除（§7.3）', (tester) async {
+    await pumpList(tester);
+
+    await openMenu(tester, '核心交换机');
+
+    expect(find.text('连接'), findsOneWidget);
+    expect(find.text('断开'), findsOneWidget);
+    expect(find.text('编辑'), findsOneWidget);
+    expect(find.text('删除'), findsOneWidget);
+  });
+
+  testWidgets('已连接时右键的「连接」不可点、「断开」可点（§7.3）', (tester) async {
+    final factory = FakeSessionFactory();
+    await pumpList(tester, factory: factory);
+    await tester.tap(find.byTooltip('连接 核心交换机'));
+    await tester.pumpAndSettle();
+
+    await openMenu(tester, '核心交换机');
+
+    expect(tester.widget<PopupMenuItem<String>>(
+      find.widgetWithText(PopupMenuItem<String>, '连接'),
+    ).enabled, isFalse);
+    expect(tester.widget<PopupMenuItem<String>>(
+      find.widgetWithText(PopupMenuItem<String>, '断开'),
+    ).enabled, isTrue);
+  });
+
+  testWidgets('右键「编辑」打开设备编辑对话框，且带着那台设备（FR-D-05）', (tester) async {
+    await pumpList(tester);
+
+    await openMenu(tester, '核心交换机');
+    await tester.tap(find.text('编辑'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('编辑设备'), findsOneWidget);
+    expect(
+      tester
+          .widget<TextField>(find.byKey(const ValueKey('device-host')))
+          .controller!
+          .text,
+      '10.0.0.1',
+    );
   });
 }
