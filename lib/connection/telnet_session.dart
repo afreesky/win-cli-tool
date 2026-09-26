@@ -45,11 +45,18 @@ class TelnetSession implements Session {
 
   @override
   Future<void> connect() async {
+    // **入口守卫（spec §13.21-2）。** 已经关闭的会话绝不能再拨号：少了它，
+    // close() 之后再来一次 connect() 会照常向设备发起 TCP 连接，然后走下面
+    // 那道守卫正常返回 —— 一个已关闭的会话对外报"连上了"。与 `SshSession`
+    // 的入口守卫对称。
+    if (_closed) return;
+
     final conn =
         await connector.open(profile.host, profile.port, timeout: connectTimeout);
-    // 建连期间可能已经被 close()（用户切设备、关窗口）。此时必须把刚拿到的
-    // 连接关掉并直接返回，否则 socket 泄漏，且 _dataBytes 已关闭，后续
-    // _onBytes 里的 add 会抛 "Cannot add event after closing"。
+    // **这一道仍然要留。** 上面那道管的是"调 connect 时已经关了"，这一道管的是
+    // "**建连期间**被 close()"（用户切设备、关窗口）—— 两者是不同的时刻。
+    // 此时必须把刚拿到的连接关掉并直接返回，否则 socket 泄漏，且 _dataBytes
+    // 已关闭，后续 _onBytes 里的 add 会抛 "Cannot add event after closing"。
     if (_closed) {
       await conn.close();
       return;

@@ -27,5 +27,14 @@ abstract class Session {
   void write(String text);
 
   /// 关闭会话。
+  ///
+  /// **`connect()` 失败之后，调用方仍然必须调它。** 两个实现都在 `connect()`
+  /// 里分配了资源（`_dataBytes`/`_output` 两个 `StreamController`，Telnet 侧
+  /// 还可能有一个已经拿到的连接），而"连不上"是最常见的路径之一 ——
+  /// `ConnectionManager` 每次都靠 [close] 来收尾。契约原先没写这一条，
+  /// 于是"connect 抛了，那就不用 close 了吧"看起来是合理的，而它会让
+  /// 那些 `StreamController` 永远挂着（spec §13.21-4）。
+  ///
+  /// `close()` 是幂等的：已经关过的会话再关一次直接返回。
   Future<void> close();
 }

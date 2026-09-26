@@ -25,8 +25,15 @@ class _GatedConnector implements Connector {
 
   final Future<Connection> result;
 
+  /// 被要求拨号的目标。**"有没有拨过号"是几条例外的唯一观测点** ——
+  /// 只看 `close()` 的副作用分不出"拨了又关掉"与"压根没拨"。
+  final opened = <String>[];
+
   @override
-  Future<Connection> open(String host, int port, {Duration? timeout}) => result;
+  Future<Connection> open(String host, int port, {Duration? timeout}) {
+    opened.add(host);
+    return result;
+  }
 }
 
 /// 一条记名式的假连接：能人为喂入字节，并记录是否被关闭。
@@ -283,6 +290,26 @@ void main() {
         reason: '不该有异常逃逸到 zone，实际拿到：$zoneError\n$zoneStack',
       );
       expect(conn.closed, isTrue, reason: '建连期间被 close，刚建好的连接必须关掉');
+    });
+
+    test('close() 之后再 connect() 必须直接返回，不能再拨号（§13.21-2）', () async {
+      // 原实现把 `if (_closed)` 放在 `connector.open` **之后**：close() 之后
+      // 再来一次 connect() 会照常向设备发起 TCP 连接，然后走完那道守卫正常
+      // 返回 —— 一个已关闭的会话对外报"连上了"。`SshSession` 早就是对的
+      // （入口在最顶上），这条是补上 Telnet 这一侧，与它对称。
+      final gate = Completer<Connection>();
+      final connector = _GatedConnector(gate.future);
+      final session = TelnetSession(profile: _profile(1), connector: connector);
+
+      // **`close()` 不 await。** 这条会话从没连上，`_dataBytes` 没有监听者，
+      // 它的 close() 会一直挂着（见 close() 里的注释）。而 `_closed` 在第一个
+      // await 之前就已置真，所以下面那次 connect 看到的是"已关闭"。
+      unawaited(session.close());
+      await Future<void>.delayed(Duration.zero);
+
+      await session.connect().timeout(const Duration(seconds: 2));
+
+      expect(connector.opened, isEmpty, reason: '已关闭的会话绝不能再向设备发起连接');
     });
   });
 }
