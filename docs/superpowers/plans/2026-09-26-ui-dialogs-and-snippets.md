@@ -115,49 +115,77 @@ Task 11 排在 Task 7/8 之后只是因为它们都在改编辑区工具栏与 `
 
 ```dart
     test('值相等：三个字段全同才相等（spec §13.7）', () {
-      const a = Snippet(id: 's1', name: '看版本', content: 'display version');
-      const b = Snippet(id: 's1', name: '看版本', content: 'display version');
+      // **两个操作数都必须是非 const 构造，这不是风格问题。** Dart 会把参数
+      // 相同的 `const` 字面量**规范化成同一个实例**，而 `Object.==` 是按身份
+      // 答的 —— 写成 `const a = Snippet(...); const b = Snippet(同样参数);`
+      // 的话 `a == b` 在**没有** `==` 的时候也是 true，这四条用例会全部变绿，
+      // 于是它们守不住任何东西（实测：那种写法下四条全绿，连删掉本任务加的
+      // `==` 都不红）。`fromJson` 是运行期构造，拿到的一定是新实例，只有
+      // **值相等**才能让它绿 —— 这也正是本任务"为什么做"里说的那个场景。
+      final a = Snippet.fromJson(
+        const Snippet(id: 's1', name: '看版本', content: 'display version')
+            .toJson(),
+      );
+      final b = Snippet.fromJson(
+        const Snippet(id: 's1', name: '看版本', content: 'display version')
+            .toJson(),
+      );
 
+      // 把"这是两个不同实例"也断言出来：否则将来有人把上面改回 const，
+      // 用例会安安静静地退化成恒真，没人会注意到。
+      expect(identical(a, b), isFalse, reason: '前提：两个不同的实例');
       expect(a, equals(b));
       expect(a.hashCode, equals(b.hashCode));
     });
 
     test('缺任一字段就不相等', () {
       const base = Snippet(id: 's1', name: '看版本', content: 'display version');
+      final copy = Snippet.fromJson(base.toJson());
 
-      expect(base, isNot(equals(base.copyWith(name: '看接口'))));
-      expect(base, isNot(equals(base.copyWith(content: 'display interface'))));
+      expect(copy, equals(base), reason: '前提：字段全同的副本是相等的');
+      expect(copy.copyWith(name: '看接口'), isNot(equals(copy)));
+      expect(copy.copyWith(content: 'display interface'), isNot(equals(copy)));
       expect(
-        base,
-        isNot(
-          equals(
-            const Snippet(id: 's2', name: '看版本', content: 'display version'),
-          ),
-        ),
+        Snippet(id: 's2', name: '看版本', content: 'display version'),
+        isNot(equals(copy)),
         reason: 'id 也是身份的一部分：两条同名片段是允许的',
       );
     });
 
     test('List.contains / Set 按值判（命令库据此判重）', () {
       const a = Snippet(id: 's1', name: 'x', content: 'y');
-      const b = Snippet(id: 's1', name: 'x', content: 'y');
+      final b = Snippet.fromJson(a.toJson());
 
+      expect(identical(a, b), isFalse, reason: '前提：两个不同的实例');
       expect(<Snippet>[a].contains(b), isTrue);
       expect(<Snippet>{a}.contains(b), isTrue);
+      expect(<Snippet>{a, b}, hasLength(1), reason: '值相等 → Set 里塌成一条');
     });
 
     test('与别的类型比不相等，且不抛', () {
-      const a = Snippet(id: 's1', name: 'x', content: 'y');
+      final a = Snippet.fromJson(
+        const Snippet(id: 's1', name: 'x', content: 'y').toJson(),
+      );
 
-      expect(a, isNot(equals('s1')));
-      expect(a == null, isFalse);
+      // **`a == Object()` 里的括号不能省，也不能换成 `a == 's1'`。**
+      // 三种写法的分析器结果（在 flutter 3.44.4 上实测）：
+      //   - `a == null`  → `unnecessary_null_comparison`（`Snippet` 非空，
+      //                    恒为 false）—— 会打破 Step 5 的"分析器干净"；
+      //   - `a == 's1'`  → `unrelated_type_equality_checks`（info）—— 同样打破；
+      //   - `a == Object()` → **干净**（`Object` 是 `Snippet` 的超类型，
+      //                    那条 lint 不管）。
+      // 它守的是"别把类型判断漏掉"：若实现写成 `(other as Snippet).id == id`
+      // 少了 `other is Snippet`，这一句会抛 `CastError`。
+      expect(a == Object(), isFalse);
     });
 ```
 
 - [ ] **Step 2：跑测试，确认它红**
 
 Run: `flutter test test/models/device_profile_test.dart`
-Expected: FAIL —— 四条新用例里前三组红（`Expected: ... Actual: ...`，`Instance of 'Snippet'` 的形式），最后一条"与别的类型比"反而会**绿**（`Object.==` 本来就这么答）。这是对的：它守的是"你写 `==` 的时候别把类型判断漏掉"，现在还没写 `==`，它当然过。
+Expected: FAIL —— 前三条红（`Expected: <Instance of 'Snippet'> / Actual: <Instance of 'Snippet'>` 与 `Expected: true / Actual: <false>`），第四条"与别的类型比"**绿**（`Object.==` 对不同类型的两个对象本来就这么答）。这是对的：它守的是"你写 `==` 的时候别把类型判断漏掉"，与值相等无关，现在还没写 `==`，它当然过。
+
+（实测记录：这四条在**没有** `==` 时是 3 红 1 绿；加上 `==` 之后 4 条全绿。这个红绿差就是它们真正的守备范围。）
 
 - [ ] **Step 3：实现**
 
@@ -5618,11 +5646,14 @@ Expected：PNG 是 1280x720 的真图（不是 586 字节、2 色的空白图）
 - `_setText` 是 Task 2 的私有方法，Task 7/8 不直接调它（都走那三个公开方法）。
 - `ValueKey` 命名前后一致：`device-*`（Task 4/5）、`settings-*`（Task 9）、`known-host*`（Task 10）、`import-path`（Task 7）、`sync-target`（Task 8）、`snippet-*`（Task 3）。
 
-**三处誊抄时踩过的坑（都在写入本计划时改掉了，实施者照着抄就行）：**
+**四处誊抄时踩过的坑（都在写入本计划时改掉了，实施者照着抄就行）：**
 
+- **Task 1 的测试用例里，比较的两个操作数必须是非 const 构造的。** 这是本计划里最危险的一处：初稿写成 `const a = Snippet(同样参数); const b = Snippet(同样参数);`，而 Dart 会把参数相同的 const 字面量**规范化成同一个实例**，`Object.==` 按身份答 true —— 四条用例在**完全没实现** `==` 的情况下全绿，等于零守备。Task 1 的 Step 1 现在一律用 `Snippet.fromJson(...)` 造副本，并额外断言 `identical(a, b)` 是 false 把前提钉住。**这是 Task 1 实施者实测报上来的，不是推理出来的。**
 - **Task 7 的测试文件要 `import 'package:flutter_riverpod/misc.dart';`** —— `readerOf` 的返回类型是 `List<Override>`，而 `Override` 不在 `flutter_riverpod.dart` 的主入口里（3.4.3 实测；`ui_harness.dart` 开头那段注释就是为这件事写的）。少这一行，红的是 `non_type_as_type_argument`。
 - **Task 8 的 `syncAs` 里不能有 `tester.enterText`** —— `sync-target` 是 `DropdownButtonFormField`，不是输入框；`enterText` 找不到 `EditableText` 会直接抛。选目标只能"点开、再点那一项"。
 - **`DropdownButtonFormField.initialValue` 是本版 Flutter 的正确参数名**（`value` 已废弃）。且 `setState` 之后显示会跟着变 —— `dropdown.dart:2004` 的 `didUpdateWidget` 里有 `if (oldWidget.initialValue != widget.initialValue) setValue(...)`。Task 8/9 的三处下拉都靠这一条。
+
+**一条通用教训（值得单独记着）：** 「分析器干净」这条验收门比它看起来严 —— `unnecessary_null_comparison`（warning）与 `unrelated_type_equality_checks`（**info**）都会让 `dart analyze` 打印 `1 issue found` 而不是 `No issues found!`。写断言时对**静态类型已知**的比较（非空对象与 `null`、无关类型之间）要格外小心。
 
 **4. 与既有代码的口径核对（本计划的作者逐条读过源码）**
 
