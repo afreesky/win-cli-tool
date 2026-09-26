@@ -34,10 +34,18 @@
 2. **`pumpAndSettle` 与 `settleDisk` 都推不动真 I/O。** `settleDisk` 的轮数是写死的
    （12 × 5ms ≈ 60ms 真实时间），够不够看机器当下忙不忙 —— 实测**同一份代码多一句
    `debugPrint` 就从红变绿**。断开那条路上还有 `restrictToOwner` 的
-   `Process.run('chmod', …)`，那是**一个真子进程**。要等 SnackBar 出现就用
-   `pumpUntilSnackBar(tester)`（按条件等，出现即走），不要靠多推几帧。
+   `Process.run('chmod', …)`，那是**一个真子进程**。**不要靠多推几帧，按条件等**，
+   `ui_harness.dart` 里三个都现成：
+
+   | 等什么 | 用哪个 |
+   |---|---|
+   | 某样东西出现（SnackBar、某个控件） | `pumpUntil(tester, find.byType(...))` |
+   | 某个条件为真（常是 provider 的状态） | `pumpUntilTrue(tester, () => …)` |
+   | SnackBar | `pumpUntilSnackBar(tester)` |
+
    **而且别用状态断言代替它**：连接状态是经 `onStatus` 回调推进 provider 的，
    不等那个 await —— 实测状态已经是 `disconnected` 时 SnackBar 一个都还没有。
+   反过来也一样：**要断状态就等状态**，别去等 SnackBar。
 
 ### 已经定下来的四个用户决策（不要再重新论证）
 
@@ -2112,17 +2120,28 @@ void main() {
       }
     });
 
-    test('空列表与同内容的新列表实例算相同（list 不比 identity）', () {
-      final before = base().copyWith(postLoginCommands: const []);
+    test('同内容的新列表实例算相同（list 不按 identity 比）', () {
+      // **两个 list 必须真的是两个实例。** 初稿两边都写 `const []`，而 Dart 会把
+      // 它们**规范化成同一个对象** —— 那样 `a == b` 靠 identity 就成立了，这条
+      // 用例在**没有** `_sameJsonValue` 那份列表逻辑时照样绿（和 Task 1 的 const
+      // 规范化是同一类：断言在测空气）。`List.of` 保证拿到新实例。
+      final before = base().copyWith(
+        postLoginCommands: List<String>.of(const ['enable']),
+      );
+      final after = base().copyWith(
+        postLoginCommands: List<String>.of(const ['enable']),
+      );
 
       expect(
-        connectionParamsDiffer(before, before.copyWith(postLoginCommands: const [])),
+        identical(before.postLoginCommands, after.postLoginCommands),
         isFalse,
+        reason: '前提：两个不同的列表实例',
       );
+      expect(connectionParamsDiffer(before, after), isFalse);
       expect(
         connectionParamsDiffer(
-          base(),
-          base().copyWith(postLoginCommands: ['other']),
+          before,
+          before.copyWith(postLoginCommands: ['other']),
         ),
         isTrue,
       );
@@ -2148,7 +2167,12 @@ void main() {
       open: (context) => DeviceEditDialog.show(context, existing: device),
     );
     containerOf(tester).read(sessionProvider('d1').notifier).connect();
-    await tester.pumpAndSettle();
+    // 连接要开日志文件（真 I/O），假时钟推不动 —— 等的是**状态本身**，
+    // 不是帧数，也不是某个 Finder（这时对话框还没开）。
+    await pumpUntilTrue(
+      tester,
+      () => stateOf(tester) == DeviceConnectionState.connected,
+    );
     await tester.tap(find.text('打开'));
     await tester.pumpAndSettle();
     expect(stateOf(tester), DeviceConnectionState.connected, reason: '前置条件');
@@ -2162,7 +2186,10 @@ void main() {
 
     await fill(tester, 'device-host', '10.0.0.2');
     await tester.tap(find.text('保存'));
-    await settleDisk(tester);
+    // **不能用 `settleDisk`。** 这条路上有两段真 I/O：`update(draft)` 落盘，
+    // 然后是 `disconnect()` 收尾（含 `restrictToOwner` 起的 chmod 真进程）。
+    // 按条件等 SnackBar，出现即走。
+    await pumpUntilSnackBar(tester);
 
     expect(stateOf(tester), DeviceConnectionState.disconnected);
     expect(find.textContaining('连接参数已改变'), findsOneWidget);
@@ -2178,7 +2205,12 @@ void main() {
 
     await fill(tester, 'device-post-login', 'enable\nconf t');
     await tester.tap(find.text('保存'));
-    await settleDisk(tester);
+    // 这条只断状态、不断 SnackBar，但断到的那个状态要等真 I/O 走完
+    // （同样不能用 `settleDisk`）。
+    await pumpUntilTrue(
+      tester,
+      () => stateOf(tester) == DeviceConnectionState.disconnected,
+    );
 
     expect(
       stateOf(tester),

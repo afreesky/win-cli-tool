@@ -117,20 +117,23 @@ Future<void> useTallSurface(WidgetTester tester) async {
   addTearDown(() => tester.binding.setSurfaceSize(null));
 }
 
-/// 等到 [finder] 能找到东西（最多 [rounds] 轮），再 `pumpAndSettle`。
+/// 等到 [ready] 为真（最多 [rounds] 轮），再 `pumpAndSettle`。
 ///
 /// **为什么不能只是多推几帧**：`pump`/`pumpAndSettle` 推的是**假时钟**，而落盘、
 /// `Process.run('chmod', …)` 这些是**真 I/O**，假时钟推不动。`settleDisk` 的轮数
 /// 又是写死的（12 × 5ms ≈ 60ms 真实时间），够不够全看机器当下忙不忙 —— 实测
 /// **同一份代码多一句 `debugPrint` 就从红变绿**。所以这里按条件等，出现即走：
 /// 机器快就快过，机器慢就多等几轮，都不会红。
-Future<void> pumpUntil(
+///
+/// [ready] 里读 provider（`containerOf(tester).read(...)`）是允许的 —— 它就发生在
+/// `pump` 之间。
+Future<void> pumpUntilTrue(
   WidgetTester tester,
-  Finder finder, {
+  bool Function() ready, {
   int rounds = 400,
 }) async {
   for (var i = 0; i < rounds; i++) {
-    if (finder.evaluate().isNotEmpty) break;
+    if (ready()) break;
     await tester.pump(const Duration(milliseconds: 16));
     await tester.runAsync(
       () => Future<void>.delayed(const Duration(milliseconds: 5)),
@@ -138,6 +141,13 @@ Future<void> pumpUntil(
   }
   await tester.pumpAndSettle();
 }
+
+/// 等到 [finder] 能找到东西（最多 [rounds] 轮）。[pumpUntilTrue] 的 Finder 版。
+Future<void> pumpUntil(
+  WidgetTester tester,
+  Finder finder, {
+  int rounds = 400,
+}) => pumpUntilTrue(tester, () => finder.evaluate().isNotEmpty, rounds: rounds);
 
 /// 等到 SnackBar 真的弹出来（最多 [rounds] 轮），动画走完再返回。
 ///
