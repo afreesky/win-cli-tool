@@ -561,7 +561,8 @@ void main() {
       mgr.connect();
       async.flushMicrotasks();
 
-      // autoReconnect=false 是唯一应当变红（failed）的情形。
+      // 红（failed）在默认配置下也到得了 —— 见上面那条断言。这里断的是
+      // autoReconnect=false 时**停**在红：不排程重连，所以一直红着。
       // 注意与"用户主动断开"区分：那种情况 §5.4 要求是灰的。
       expect(mgr.state, DeviceConnectionState.failed);
       expect(failures.length, 1, reason: '失败原因只报一次');
