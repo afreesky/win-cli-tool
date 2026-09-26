@@ -69,41 +69,9 @@ void main() {
   DeviceProfile stored(WidgetTester tester) =>
       containerOf(tester).read(devicesProvider).single;
 
-  /// 把测试窗口调高到装得下整个对话框。
-  ///
-  /// **默认的 800×600 装不下**：对话框内容实测 798 逻辑像素高、视口只有 384，
-  /// 折在窗口外的控件 `tap` 只会空点一下 —— 实测开关在 y=866、行尾符下拉在
-  /// y=634，都在 600 之外（`ensureVisible` 也只把它滚到 516，仍在视口下沿
-  /// 480 之外，因为内容末尾只有那个开关，滚到底也只够露出来一点点）。
-  /// 需要**点到**窗口外那几个控件的用例先调这一下；断言一字未改。
-  Future<void> useTallSurface(WidgetTester tester) async {
-    await tester.binding.setSurfaceSize(const Size(1000, 1200));
-    addTearDown(() => tester.binding.setSurfaceSize(null));
-  }
-
-  /// 等到 SnackBar 真的弹出来（最多 [rounds] 轮），动画走完再返回。
-  ///
-  /// **不能只靠 `settleDisk` / `pumpAndSettle`。** 「断开」走的是
-  /// `_disconnect` → `await …disconnect()` → `_endLog()` → `_flush(force: true)`，
-  /// 里面除了 `stat` / `create` / `writeAsString(flush: true)`，还有
-  /// `restrictToOwner` 的 `Process.run('chmod', …)` —— **起一个真进程**。
-  /// 假时钟推不动这些真 I/O，而 `settleDisk` 的轮数是写死的（12 × 5ms ≈ 60ms
-  /// 真实时间），够不够全看机器当下忙不忙：实测同一份代码，多一句 `debugPrint`
-  /// 就从红变绿。所以这里按条件等，出现即走。
-  ///
-  /// 注意状态断言**不能**代替它：`ConnectionManager` 的新状态是经 `onStatus`
-  /// 回调推进 provider 的，不等 `_disconnect` 里那个 await —— 实测状态已经是
-  /// `disconnected` 时 SnackBar 还一个都没有。
-  Future<void> pumpUntilSnackBar(WidgetTester tester, {int rounds = 400}) async {
-    for (var i = 0; i < rounds; i++) {
-      if (find.byType(SnackBar).evaluate().isNotEmpty) break;
-      await tester.pump(const Duration(milliseconds: 16));
-      await tester.runAsync(
-        () => Future<void>.delayed(const Duration(milliseconds: 5)),
-      );
-    }
-    await tester.pumpAndSettle();
-  }
+  // `useTallSurface`（把窗口调高）与 `pumpUntilSnackBar`（按条件等 SnackBar）
+  // 都在 `ui_harness.dart` 里 —— 它们不是这一个文件的事，Task 5/6/7/9 的对话框
+  // 用例同样躲不开那只 800×600 的默认窗口与那些推不动的真 I/O。
 
   testWidgets('NFR-S-02：明文存储的警告就在对话框里', (tester) async {
     await open(tester);

@@ -99,3 +99,44 @@ Future<void> pumpDialogHost(
     ),
   ),
 );
+
+/// 把测试窗口调高到装得下整个对话框。
+///
+/// **默认的 800×600 装不下**（这是实测设备编辑对话框的数字）：对话框内容
+/// 798 逻辑像素高、视口只有 384，折在窗口外的控件 `tap` 只会空点一下 ——
+/// 实测开关在 y=866、行尾符下拉在 y=634，都在 600 之外。
+///
+/// **`ensureVisible` 救不了这个**：它也只把内容滚到 `pixels=322`（上限
+/// `maxScrollExtent` 是 414），开关仍在 y=516–572，还是落在视口下沿 480 之外
+/// —— 因为那已经是内容最后一项，没有更多东西可滚了。
+///
+/// 所以凡是**需要点到**对话框里靠下那几个控件的用例，开头先调这一下。
+/// 只是断言（不点）的用例不必调。
+Future<void> useTallSurface(WidgetTester tester) async {
+  await tester.binding.setSurfaceSize(const Size(1000, 1200));
+  addTearDown(() => tester.binding.setSurfaceSize(null));
+}
+
+/// 等到 SnackBar 真的弹出来（最多 [rounds] 轮），动画走完再返回。
+///
+/// **不能只靠 `settleDisk` / `pumpAndSettle`。** 举断开那条路：
+/// `_disconnect` → `await …disconnect()` → `_endLog()` → `_flush(force: true)`，
+/// 里面除了 `stat` / `create` / `writeAsString(flush: true)`，还有
+/// `restrictToOwner` 的 `Process.run('chmod', …)` —— **起一个真进程**。
+/// 假时钟推不动这些真 I/O，而 `settleDisk` 的轮数是写死的
+/// （12 × 5ms ≈ 60ms 真实时间），够不够全看机器当下忙不忙：实测同一份代码，
+/// 多一句 `debugPrint` 就从红变绿。所以这里按条件等，出现即走。
+///
+/// **状态断言不能代替它**：`ConnectionManager` 的新状态是经 `onStatus` 回调
+/// 推进 provider 的，不等 `_disconnect` 里那个 await —— 实测状态已经是
+/// `disconnected` 时 SnackBar 还一个都没有。两条都要断。
+Future<void> pumpUntilSnackBar(WidgetTester tester, {int rounds = 400}) async {
+  for (var i = 0; i < rounds; i++) {
+    if (find.byType(SnackBar).evaluate().isNotEmpty) break;
+    await tester.pump(const Duration(milliseconds: 16));
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 5)),
+    );
+  }
+  await tester.pumpAndSettle();
+}
