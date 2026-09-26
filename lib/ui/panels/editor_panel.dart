@@ -9,6 +9,7 @@ import '../../connection/connection_manager.dart';
 import '../../data/draft_store.dart';
 import '../../state/providers.dart';
 import '../dialogs/import_dialog.dart';
+import '../dialogs/sync_dialog.dart';
 import '../draft_autosave.dart';
 import '../widgets/send_range.dart';
 import '../widgets/sent_line_controller.dart';
@@ -157,6 +158,32 @@ class EditorPanelState extends ConsumerState<EditorPanel> {
       case ImportMode.append:
         appendText(request.text);
     }
+  }
+
+  /// FR-E-17：把编辑区当前内容同步给另一台设备的草稿。
+  Future<void> _syncToOther() async {
+    // **空内容不发同步。** 空文本 + 「覆盖」会把目标设备的草稿清空 ——
+    // 那是一个用户几乎不可能想要的破坏性结果，而它在界面上与"同步成功"
+    // 长得一模一样。
+    if (_text.text.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('编辑区是空的，没有可同步的内容')),
+      );
+      return;
+    }
+
+    final result = await SyncDialog.show(
+      context,
+      sourceDeviceId: widget.deviceId,
+      // **传编辑区的当前文本，不读源草稿**（设计点 3）。
+      text: _text.text,
+    );
+    if (result == null || !mounted) return;
+
+    final verb = result.mode == SyncMode.overwrite ? '已覆盖到' : '已追加到';
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('$verb「${result.targetName}」的草稿')),
+    );
   }
 
   /// FR-S-03：把一段文本插入**当前光标处**。
@@ -392,6 +419,12 @@ class EditorPanelState extends ConsumerState<EditorPanel> {
             tooltip: '导入文件',
             icon: const Icon(Icons.file_open, size: 18),
             onPressed: _importFile,
+          ),
+          const SizedBox(width: 8),
+          IconButton(
+            tooltip: '同步到另一台',
+            icon: const Icon(Icons.copy_all, size: 18),
+            onPressed: _syncToOther,
           ),
           const Spacer(),
           if (progress != null)
