@@ -3188,8 +3188,28 @@ void main() {
   ///
   /// 能这么写是因为 `DraftStore` 与 `FileHostKeyStore` 一样**不持实例缓存**
   /// （`FileHostKeyStore` 的文档里那段"缓存整个去掉"）。两处都靠这一点。
-  Future<void> seedDraft(String deviceId, String text) =>
-      AppStores(paths: AppPaths(root)).drafts.write(deviceId, text);
+  ///
+  /// **必须包在 `tester.runAsync` 里，否则用例必挂。** 写盘是真 I/O，而
+  /// `testWidgets` 的用例体跑在 `FakeAsync` 里（`flutter_test` 的
+  /// `binding.dart`，`AutomatedTestWidgetsFlutterBinding` 用 `FakeAsync.run`
+  /// 包住整个用例体）：真 I/O 的完成回调落进**假**的微任务队列，而那个队列
+  /// 只有 `pump` / `runAsync` 才会推。用例体自己 `await` 它是推不动的 ——
+  /// 体挂在那里等，框架在等体，谁都不动，直到 `testWidgets` 自带的
+  /// **10 分钟**超时。`dart analyze` 看不出这件事，它只在运行时发作。
+  ///
+  /// 实测（Task 8 执行期）：不包 `runAsync` 时，四条调用它的用例**各挂
+  /// 10 分钟**；包上之后同六条编辑区用例 3 秒跑完。这与 `settleDisk` /
+  /// `pumpUntilTrue` 里那些 `tester.runAsync` 是**同一条规矩**，写在
+  /// `ui_harness.dart` 的文档里。
+  Future<void> seedDraft(
+    WidgetTester tester,
+    String deviceId,
+    String text,
+  ) async {
+    await tester.runAsync(
+      () => AppStores(paths: AppPaths(root)).drafts.write(deviceId, text),
+    );
+  }
 
   /// 从**树里**的 provider 容器读东西（本仓既有的写法，见
   /// `device_params_change_test.dart`）。锚点是编辑区自己 —— 这个文件没有
@@ -3303,7 +3323,7 @@ void main() {
     }
 
     testWidgets('覆盖：目标草稿变成编辑区的内容（FR-E-17）', (tester) async {
-      await seedDraft('d2', '旧的目标草稿');
+      await seedDraft(tester, 'd2', '旧的目标草稿');
       final editor = await pumpEditor(tester);
       editor.value = const TextEditingValue(
         text: 'hostname R1',
@@ -3318,7 +3338,7 @@ void main() {
     });
 
     testWidgets('追加：目标原有的内容还在（FR-E-17）', (tester) async {
-      await seedDraft('d2', '原有命令');
+      await seedDraft(tester, 'd2', '原有命令');
       final editor = await pumpEditor(tester);
       editor.value = const TextEditingValue(
         text: '新命令',
@@ -3345,7 +3365,7 @@ void main() {
     });
 
     testWidgets('源设备的草稿一个字都没动', (tester) async {
-      await seedDraft('d1', '源的内容');
+      await seedDraft(tester, 'd1', '源的内容');
       final editor = await pumpEditor(tester);
       expect(editor.text, '源的内容', reason: '前置条件：源草稿已经灌进编辑区');
 
@@ -3369,7 +3389,7 @@ void main() {
     });
 
     testWidgets('取消：目标草稿一个字都不动', (tester) async {
-      await seedDraft('d2', '原有命令');
+      await seedDraft(tester, 'd2', '原有命令');
       final editor = await pumpEditor(tester);
       editor.value = const TextEditingValue(
         text: '新命令',
@@ -3473,8 +3493,18 @@ class _SyncDialogState extends ConsumerState<SyncDialog> {
       );
     }
 
+    // **`!` 不能省。** `_targetId` 是 `String?`，三元的两支是 `String?` 与
+    // `String`，于是 `selected` 推断出来是 **`String?`** —— 而 `_run` 收的是
+    // `String`，不写 `!` 这里**根本编译不过**（`The argument type 'String?'
+    // can't be assigned to the parameter type 'String'`）。
+    //
+    // **它不可能抛**：能走到真分支，就说明 `targets` 里有一台的 `id` 与
+    // `_targetId` 相等，而 `id` 是 `String`（非空），所以 `_targetId` 必非空。
+    // 别改成 `_targetId ?? targets.first.id` —— 那会丢掉 `any(...)` 这道守卫：
+    // 目标设备**已被删掉**时 `_targetId` 还留着旧 id，`??` 会原样用它，
+    // 而 `any(...)` 会正确地退回 `targets.first.id`。
     final selected = targets.any((d) => d.id == _targetId)
-        ? _targetId
+        ? _targetId!
         : targets.first.id;
 
     return AlertDialog(
@@ -5342,6 +5372,8 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 **这个决策把 `failed` 的含义钉死了：** 它不再是"不再重试"，而是**"这一次尝试失败了"**。`DeviceConnectionState.failed` 的文档今天写着"**且不再自动重试**"，本次一并改掉 —— 留着旧文档，下一个人会照着它推理。
 
+**spec 侧已经改好了，不在本任务的 Files 里。** §13.17-3 原先写着"尚未决策"，控制者已按决策②改写完毕（连同那句"读法 1 已废弃"）。所以：**读到 spec §13.17-3 时它说的是已决策，别把它当成待办**；也**不要去改 `docs/superpowers/specs/`** —— 本任务的落点只有 `lib/` 与 `test/` 两个文件（见 Files）。
+
 **Files:**
 - Modify: `lib/connection/connection_manager.dart`（`_scheduleRetry` + `DeviceConnectionState.failed` 的文档）
 - Test: `test/connection/connection_manager_test.dart`（改两处断言）
@@ -5494,9 +5526,11 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 **只改文案，不动事件**（决策③）：`QueueDropped(count)` 的载荷与语义一个字不动。
 
 **Files:**
-- Modify: `lib/state/session_controller.dart:254`
-- Modify: `lib/state/session_controller.dart`（`_onDispatchEvent` 的 QueueDropped 分支）
-- Modify: `lib/ui/panels/editor_panel.dart:179`
+- Modify: `lib/state/session_controller.dart`（`_onDispatchEvent` 里那句告警文案，约第 254 行）
+- Modify: `lib/state/session_controller.dart`（`_onDispatchEvent` 的 QueueDropped 分支：不再提前 return）
+- Modify: `lib/state/session_controller.dart`（`_onSessionReady` 清 `lastDispatchEvent`）
+- Modify: `lib/state/session_controller.dart`（`SessionStatus.copyWith` 给 `lastDispatchEvent` 加 `_unset` 哨兵）
+- Modify: `lib/ui/panels/editor_panel.dart`（`_progress` 里那条 `QueueDropped` 分支 —— **Task 8 加过 `_syncToOther` 之后它在第 280 行上下；按代码块里那句话找，别数行**）
 - Test: `test/state/session_controller_test.dart`（追加）
 - Test: `test/ui/editor_panel_test.dart`（追加）
 
@@ -5540,20 +5574,45 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
     await tester.enterText(find.byType(TextField), 'show version\nshow clock');
     await tester.pump();
+    // **`enterText` 会把光标收到文本末尾**（`TextSelection.collapsed(offset: 23)`），
+    // 而 §5.1 的规则是"没有选中就只发光标那一行" —— 那样队列里只有 `show clock`
+    // **一条**，丢弃数是 1，下面那句 `断线，2 条命令未完成` 永远找不到。
+    // 本文件三条兄弟用例都栽过这个坑（见它们各自的注释）。
+    final editor = tester.widget<TextField>(find.byType(TextField)).controller!;
+    editor.selection = TextSelection(
+      baseOffset: 0,
+      extentOffset: editor.text.length,
+    );
+    await tester.pump();
     await tester.tap(find.byTooltip('发送'));
     await tester.pump();
 
-    // 第一条在途、第二条排队。
+    // 第一条在途、第二条排队 —— 丢弃数因此是 2（在途那条也计入，见
+    // `command_dispatcher.dart` 的 `onDisconnected`）。
     factory.sessions.first.drop();
     await tester.pump();
 
     expect(find.text('断线，2 条命令未完成'), findsOneWidget);
 
-    // **把重连定时器走完。** 不走的话用例会红在
-    // `A Timer is still pending even after the widget tree was disposed` ——
-    // 那是拆卸期的假象，断言其实已经过了（见 `drainQueue` 的注释）。
+    // **把重连定时器走完，并顺带钉住"重连成功后这句文案要消失"。**
+    //
+    // 不走定时器的话用例会红在 `A Timer is still pending even after the widget
+    // tree was disposed` —— 那是拆卸期的假象，断言其实已经过了（见 `drainQueue`
+    // 的注释）。退避首档是 1s，所以推 1s 就够。
+    //
+    // **为什么这里还要再断一次**：`断线，N 条命令未完成` 说的是**现在**，不是
+    // 过去。重连成功后按钮已经绿了，工具栏却还挂着"断线"就是一句假话 —— 那正是
+    // 本任务要消灭的形状。所以 Step 3 在 `_onSessionReady` 里把
+    // `lastDispatchEvent` 一并清掉（与旁边那句 `droppedCommands: 0` 同一个道理）。
     await tester.pump(const Duration(seconds: 1));
     await tester.pumpAndSettle();
+
+    expect(factory.sessions, hasLength(2), reason: '前提：1s 后确实重连了');
+    expect(
+      find.text('断线，2 条命令未完成'),
+      findsNothing,
+      reason: '重连成功后不能再挂着上一段断线的进度文案',
+    );
   });
 ```
 
@@ -5596,9 +5655,79 @@ Expected: FAIL —— 状态层那条红在 `contains('2 条命令未完成')`�
     }
 ```
 
+**同一文件里还有第二处，别漏：** 既然 `QueueDropped` 现在会落进 `lastDispatchEvent`，那么**重连成功时必须把它清掉**。`_onSessionReady` 里已经有一条"上一次断线的丢弃数属于上一次断线"的清理（`droppedCommands: 0`）—— `lastDispatchEvent` 是同一个道理，不加的话重连成功后工具栏会一直挂着"断线，N 条命令未完成"，而那时按钮已经是绿的：**那还是一句假话**。
+
+```dart
+  void _onSessionReady(CommandDispatcher dispatcher) {
+    _setStatus(
+      _status.copyWith(
+        reconnect: null,
+        lastFailure: null,
+        // 上一次断线的丢弃数属于上一次断线，新会话开始就归零。
+        droppedCommands: 0,
+        // **进度文案同理。** 新会话里队列是空的，上一段断线留下的
+        // `QueueDropped` 若不清掉，工具栏会在**已经重连成功**之后继续显示
+        // "断线，N 条命令未完成" —— 那句话说的是现在，而现在是绿的。
+        lastDispatchEvent: null,
+      ),
+    );
+```
+
+**⚠ 上面那句 `lastDispatchEvent: null` 现在会被静默吃掉，必须先加哨兵。** 核对过源码（`session_controller.dart:43-59`）：`copyWith` 里 `reconnect` 与 `lastFailure` 都有 `_unset` 哨兵，**只有 `lastDispatchEvent` 是 `lastDispatchEvent ?? this.lastDispatchEvent`** —— 传 `null` 等于什么都没做。所以先把
+
+```dart
+  SessionStatus copyWith({
+    DeviceConnectionState? state,
+    Object? reconnect = _unset,
+    int? droppedCommands,
+    Object? lastFailure = _unset,
+    DispatchEvent? lastDispatchEvent,
+  }) => SessionStatus(
+    state: state ?? this.state,
+    reconnect: identical(reconnect, _unset)
+        ? this.reconnect
+        : reconnect as ReconnectScheduled?,
+    droppedCommands: droppedCommands ?? this.droppedCommands,
+    lastFailure: identical(lastFailure, _unset)
+        ? this.lastFailure
+        : lastFailure as ConnectionFailure?,
+    lastDispatchEvent: lastDispatchEvent ?? this.lastDispatchEvent,
+  );
+```
+
+换成：
+
+```dart
+  SessionStatus copyWith({
+    DeviceConnectionState? state,
+    Object? reconnect = _unset,
+    int? droppedCommands,
+    Object? lastFailure = _unset,
+    // **哨兵不能省。** 配 `?? this.lastDispatchEvent` 的话，传 `null` 会被
+    // `??` 吃掉 —— "清空"这个动作**静默失效**，而调用点看起来完全正确
+    // （`reconnect` / `lastFailure` 早就有哨兵，这是同一个坑的第三个实例：
+    // `lastDispatchEvent` 直到 5b-2 才出现第一个"传 null 有意义"的调用点）。
+    Object? lastDispatchEvent = _unset,
+  }) => SessionStatus(
+    state: state ?? this.state,
+    reconnect: identical(reconnect, _unset)
+        ? this.reconnect
+        : reconnect as ReconnectScheduled?,
+    droppedCommands: droppedCommands ?? this.droppedCommands,
+    lastFailure: identical(lastFailure, _unset)
+        ? this.lastFailure
+        : lastFailure as ConnectionFailure?,
+    lastDispatchEvent: identical(lastDispatchEvent, _unset)
+        ? this.lastDispatchEvent
+        : lastDispatchEvent as DispatchEvent?,
+  );
+```
+
+**Step 5 里编辑区那条 `findsNothing` 断言就是为这件事准备的。** 哨兵若漏了，它是**红**的（工具栏会一直挂着"断线，2 条命令未完成"）—— 那时**加哨兵，不要删断言**。删掉它，这个洞就只剩下一行没人读的 `?? `。
+
 - [ ] **Step 4：改编辑区的文案**
 
-`lib/ui/panels/editor_panel.dart:179`：
+`lib/ui/panels/editor_panel.dart` 的 `_progress` 里：
 
 ```dart
     if (event is QueueDropped) return '断线，${event.count} 条未发送的命令已丢弃';
@@ -5611,6 +5740,14 @@ Expected: FAIL —— 状态层那条红在 `contains('2 条命令未完成')`�
     // —— `count` 含在途的那一条，它已经写到设备上了。
     if (event is QueueDropped) return '断线，${event.count} 条命令未完成';
 ```
+
+**⚠ 紧挨着的上一行不要动。** 那行是
+
+```dart
+    if (event is QueueAborted) return '已中止（${event.dropped} 条未发送）';
+```
+
+它**是对的**，与本任务无关：`abort()` 的 `dropped` 只算 `_queue.length`，**不含**在途那条（`command_dispatcher.dart:188`，与 `onDisconnected` 的 `_queue.length + (_current != null ? 1 : 0)` 刻意不同）。两行并排都写着"未发送"，只有下面那行是假的 —— 别"顺手统一"。
 
 - [ ] **Step 5：跑测试，确认全绿**
 
@@ -5687,7 +5824,7 @@ class _GatedConnector implements Connector {
 
 - [ ] **Step 2：写失败的测试**
 
-在 `test/connection/telnet_session_test.dart` 的 `main` 末尾追加：
+在 `test/connection/telnet_session_test.dart` 里追加 —— 位置是 `main` 里那个 `group('TelnetSession', …)` 的**右花括号之前**（现约第 287 行），不是 `main` 的右花括号之后。**别放错**：落在 `main` 外面的话它根本不跑，而 Step 2 会"如期"不多红一条，看起来像写对了。
 
 ```dart
   test('close() 之后再 connect() 必须直接返回，不能再拨号（§13.21-2）', () async {
