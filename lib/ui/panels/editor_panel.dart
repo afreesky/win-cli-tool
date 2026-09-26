@@ -360,6 +360,16 @@ class EditorPanelState extends ConsumerState<EditorPanel> {
               icon: const Icon(Icons.send, size: 18),
               onPressed: connected ? send : null,
             ),
+          const SizedBox(width: 8),
+          IconButton(
+            tooltip: '命令库',
+            icon: const Icon(Icons.menu_book, size: 18),
+            // **`Scaffold.of` 找的是主窗口那个 Scaffold** —— 抽屉挂在它的
+            // `endDrawer` 上，编辑区只是它 `body` 里的一棵树。
+            // 这也是"编辑区的用例不能点这个按钮"的原因：`ui_harness.dart` 的
+            // `pumpUi` 包的那个 `Scaffold` 没有 `endDrawer`，点了会在断言里炸。
+            onPressed: () => Scaffold.of(context).openEndDrawer(),
+          ),
           const Spacer(),
           if (progress != null)
             Text(progress, style: Theme.of(context).textTheme.bodySmall),

@@ -7,6 +7,7 @@ import '../state/providers.dart';
 import 'panels/device_list_panel.dart';
 import 'panels/editor_panel.dart';
 import 'panels/output_panel.dart';
+import 'panels/snippet_drawer.dart';
 import 'widgets/splitter.dart';
 
 /// 主窗口（§7.1）：工具栏 + 左侧设备列表 + 右上编辑区 + 右下输出区。
@@ -76,6 +77,11 @@ class _MainWindowState extends ConsumerState<MainWindow> {
               ),
             ],
           ),
+          // 命令库抽屉（FR-S-01…04）。**没有选中设备时不给抽屉** —— 片段归属
+          // 设备，一个不知道属于谁的抽屉没有意义。
+          endDrawer: active == null
+              ? null
+              : SnippetDrawer(deviceId: active, onInsert: _insertSnippet),
           body: active == null ? _empty() : _body(active, settings),
         ),
       ),
@@ -189,6 +195,17 @@ class _MainWindowState extends ConsumerState<MainWindow> {
     final id = ref.read(selectedDeviceProvider);
     if (id == null) return;
     ref.read(sessionProvider(id).notifier).abort();
+  }
+
+  /// 双击命令库里的片段：**先关抽屉，再插入**。
+  ///
+  /// `Navigator.pop()` 关得掉抽屉而不是把页面弹掉：`DrawerController` 打开时
+  /// 往当前路由挂了一个 `LocalHistoryEntry`，`LocalHistoryEntry.didPop` 会
+  /// 消费掉这次 pop 并返回 false，于是路由本身留在原地。`snippet_drawer_test.dart`
+  /// 里那条"主窗口还在"的断言守的就是这件事。
+  void _insertSnippet(String content) {
+    Navigator.of(context).pop();
+    _editorKey.currentState?.insertAtCursor(content);
   }
 
   void _addDevice() {
