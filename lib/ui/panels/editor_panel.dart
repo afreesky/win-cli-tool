@@ -8,6 +8,7 @@ import '../../command/command_dispatcher.dart';
 import '../../connection/connection_manager.dart';
 import '../../data/draft_store.dart';
 import '../../state/providers.dart';
+import '../dialogs/import_dialog.dart';
 import '../draft_autosave.dart';
 import '../widgets/send_range.dart';
 import '../widgets/sent_line_controller.dart';
@@ -143,6 +144,19 @@ class EditorPanelState extends ConsumerState<EditorPanel> {
     if (!_gutter.hasClients) return;
     if (_gutter.offset == _editor.offset) return;
     _gutter.jumpTo(_editor.offset);
+  }
+
+  /// FR-E-15：导入一个本地文件到编辑区。
+  Future<void> _importFile() async {
+    final request = await ImportDialog.show(context);
+    if (request == null || !mounted) return;
+    // 两个落法都经 `_setText`，所以落盘防抖与行号栏重画都自动接上了。
+    switch (request.mode) {
+      case ImportMode.replace:
+        replaceAllText(request.text);
+      case ImportMode.append:
+        appendText(request.text);
+    }
   }
 
   /// FR-S-03：把一段文本插入**当前光标处**。
@@ -373,6 +387,11 @@ class EditorPanelState extends ConsumerState<EditorPanel> {
             // 没有 `endDrawer` 时 `currentState` 也是 null，静默无操作。它比炸
             // 更坏：那种用例会**绿着什么都没测**。命令库的用例一律走 `MainWindow`。
             onPressed: () => Scaffold.of(context).openEndDrawer(),
+          ),
+          IconButton(
+            tooltip: '导入文件',
+            icon: const Icon(Icons.file_open, size: 18),
+            onPressed: _importFile,
           ),
           const Spacer(),
           if (progress != null)
