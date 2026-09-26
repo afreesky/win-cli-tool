@@ -4485,11 +4485,26 @@ void main() {
   ///
   /// **用另一个 `AppStores` 实例是安全的**，因为 `FileHostKeyStore` **不持
   /// 实例缓存**（见它 `_readFromDisk` 的文档）。这一点正是那段文档要保的东西。
-  Future<void> seed(List<KnownHost> hosts) async {
-    final store = AppStores(paths: AppPaths(root)).hostKeys;
-    for (final h in hosts) {
-      await store.save(h);
-    }
+  ///
+  /// **必须包在 `tester.runAsync` 里，否则用例必挂。** 写盘是真 I/O，而
+  /// `testWidgets` 的用例体跑在 `FakeAsync` 里（`flutter_test` 的
+  /// `binding.dart`，`AutomatedTestWidgetsFlutterBinding` 用 `FakeAsync.run`
+  /// 包住整个用例体）：真 I/O 的完成回调落进**假**的微任务队列，而那个队列
+  /// 只有 `pump` / `runAsync` 才会推。用例体自己 `await` 它是推不动的 ——
+  /// 体挂在那里等，框架在等体，谁都不动，直到 `testWidgets` 自带的
+  /// **10 分钟**超时。`dart analyze` 看不出这件事，它只在运行时发作。
+  ///
+  /// 实测（Task 10 执行期）：不包 `runAsync` 时，第一条调用它的用例就把整个
+  /// 文件挂住（180s 被杀，`EXIT=124`）；包上之后同七条用例 4 秒跑完。
+  /// 这与 `sync_dialog_test.dart` 的 `seedDraft`、`settleDisk` /
+  /// `pumpUntilTrue` 里那些 `tester.runAsync` 是**同一条规矩**。
+  Future<void> seed(WidgetTester tester, List<KnownHost> hosts) async {
+    await tester.runAsync(() async {
+      final store = AppStores(paths: AppPaths(root)).hostKeys;
+      for (final h in hosts) {
+        await store.save(h);
+      }
+    });
   }
 
   KnownHost host(String ip, {String type = 'ssh-ed25519', String fp = 'SHA256:aaa'}) =>
@@ -4514,7 +4529,7 @@ void main() {
   });
 
   testWidgets('列出一条记录的主机与算法（FR-G-01 的"查看"）', (tester) async {
-    await seed([
+    await seed(tester, [
       host('10.0.0.1', type: 'ssh-ed25519', fp: 'SHA256:abc123'),
     ]);
 
@@ -4526,7 +4541,7 @@ void main() {
   });
 
   testWidgets('同一主机的两种算法是两条（spec §13.5）', (tester) async {
-    await seed([
+    await seed(tester, [
       host('10.0.0.1', type: 'ssh-ed25519', fp: 'SHA256:ed'),
       host('10.0.0.1', type: 'rsa-sha2-256', fp: 'SHA256:rsa'),
     ]);
@@ -4539,7 +4554,7 @@ void main() {
   });
 
   testWidgets('逐条清除：确认之后盘上那条没了（FR-G-01 的"逐条清除"）', (tester) async {
-    await seed([
+    await seed(tester, [
       host('10.0.0.1', fp: 'SHA256:ed'),
       host('10.0.0.2', type: 'rsa-sha2-256', fp: 'SHA256:rsa'),
     ]);
@@ -4561,14 +4576,16 @@ void main() {
       () => find.textContaining('SHA256:ed').evaluate().isEmpty,
     );
 
-    final left = await AppStores(paths: AppPaths(root)).hostKeys.all();
+    final left = (await tester.runAsync(
+      () => AppStores(paths: AppPaths(root)).hostKeys.all(),
+    ))!;
     expect(left, hasLength(1));
     expect(left.single.host, '10.0.0.2');
     expect(find.textContaining('SHA256:ed'), findsNothing, reason: '列表要跟着刷新');
   });
 
   testWidgets('清除时点取消：盘上一条都不少', (tester) async {
-    await seed([host('10.0.0.1')]);
+    await seed(tester, [host('10.0.0.1')]);
     await pumpSection(tester);
 
     await tester.tap(find.byKey(const ValueKey('known-host-remove-0')));
@@ -4576,12 +4593,17 @@ void main() {
     await tester.tap(find.text('取消'));
     await settleDisk(tester);
 
-    expect(await AppStores(paths: AppPaths(root)).hostKeys.all(), hasLength(1));
+    expect(
+      await tester.runAsync(
+        () => AppStores(paths: AppPaths(root)).hostKeys.all(),
+      ),
+      hasLength(1),
+    );
     expect(find.textContaining('SHA256:aaa'), findsOneWidget);
   });
 
   testWidgets('全部清除也要确认，且一次清光', (tester) async {
-    await seed([host('10.0.0.1'), host('10.0.0.2')]);
+    await seed(tester, [host('10.0.0.1'), host('10.0.0.2')]);
     await pumpSection(tester);
 
     await tester.tap(find.byKey(const ValueKey('known-hosts-clear-all')));
@@ -4594,7 +4616,12 @@ void main() {
       () => find.textContaining('还没有任何已知主机密钥').evaluate().isNotEmpty,
     );
 
-    expect(await AppStores(paths: AppPaths(root)).hostKeys.all(), isEmpty);
+    expect(
+      await tester.runAsync(
+        () => AppStores(paths: AppPaths(root)).hostKeys.all(),
+      ),
+      isEmpty,
+    );
     expect(find.textContaining('还没有任何已知主机密钥'), findsOneWidget);
   });
 
@@ -4602,7 +4629,9 @@ void main() {
     // **必须 `await`。** 少这个 await，`writeAsString` 就与下面的
     // `pumpSection` 赛跑：`_readFromDisk` 先看到"文件不存在"就返回空 map，
     // 界面显示的是空态而不是"无法读取"，用例红在一个看起来像实现错的地方。
-    await File('${root.path}/known_hosts.json').writeAsString('{ not json');
+    await tester.runAsync(
+      () => File('${root.path}/known_hosts.json').writeAsString('{ not json'),
+    );
 
     await pumpSection(tester);
 
