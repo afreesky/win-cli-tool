@@ -2417,10 +2417,13 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 **为什么做：** spec §7.3 规定设备列表的右键菜单是**四项**（连接 / 断开 / 编辑 / 删除），今天只有「删除」。同时把 `_addDevice` 那个占位（弹「设备编辑对话框将在 5b-2 提供」）换成真对话框 —— 那是这个应用**唯一的**添加入口。
 
 **Files:**
-- Modify: `lib/ui/panels/device_list_panel.dart:120-175`
-- Modify: `lib/ui/main_window.dart:194-200`
+- Modify: `lib/ui/panels/device_list_panel.dart:120-174`
+- Modify: `lib/ui/main_window.dart:211-217`
 - Test: `test/ui/device_list_panel_test.dart`（追加）
 - Test: `test/ui/main_window_test.dart`（追加）
+
+（上面这两个行号按本计划评审时的源码写的；文件后来长大过，**以 grep 到的
+`_showMenu` / `_addDevice` 实际位置为准**。`_addDevice` 现在在 211 行。）
 
 - [ ] **Step 1：写失败的测试**
 
@@ -2472,7 +2475,9 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
   });
 ```
 
-这两个用例要用两个新的辅助函数。**它们依赖 `device_list_panel_test.dart` 里已有的 `pumpPanel`**（铺一台叫「核心交换机」、host `10.0.0.1` 的设备并 `settleDisk`）。若该文件里的辅助函数名不是 `pumpPanel`，就按它的实际名字改这两处调用 —— **只改名字，别改断言**。
+这两个用例要用两个新的辅助函数。**它们依赖 `device_list_panel_test.dart` 里已有的辅助函数 —— 它的实际名字是 `pumpList`**（铺两台设备：`fakeProfile(id: 'd1', name: '核心交换机')` 与 `d2/边界防火墙`，`fakeProfile` 的默认 host 就是 `10.0.0.1`）。上面代码块里写的 `pumpPanel` 按 `pumpList` 调用，**只改名字，别改断言**。
+
+**`import 'package:flutter/gestures.dart';` 不用加** —— 该文件第 3 行已经有了。再加一行是 `duplicate_import`，会打掉「`dart analyze` 干净」这条验收项。
 
 在同一个文件的 `main()` **顶部**（`late Directory root;` 之后）追加：
 
@@ -2492,11 +2497,14 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
   }
 ```
 
-文件顶部加 import：
+（`kSecondaryMouseButton` 与文件里已有的 `kSecondaryButton` 是**同一个常量**
+—— `events.dart:81` 就是 `const int kSecondaryMouseButton = kSecondaryButton;`
+—— 所以两处写法混用没有行为差别，不必"统一"。）
 
-```dart
-import 'package:flutter/gestures.dart';
-```
+**这一条用例会留着 d1 连着的状态到用例结束，但不会撞上地基第 3 条的挂起定时器**：
+`fakeProfile` 的 `postLogin` 默认是 `const []`，而 `ConnectionManager` 只在
+`profile.postLoginCommands.isNotEmpty` 时才 `enqueue`（`connection_manager.dart:334`），
+所以这里根本没有超时定时器要推。（同文件已有的「连上之后状态点变绿」用例也是这么活的。）
 
 - [ ] **Step 2：跑测试，确认它红**
 
@@ -2619,10 +2627,10 @@ import 'dialogs/device_edit_dialog.dart';
   });
 ```
 
-`pumpWindow` 是那个文件里已有的辅助函数（铺一台「核心交换机」与一台「边界防火墙」）。**它现在会打开一个对话框，而不是弹 SnackBar** —— 如果那里原本有用例断言「设备编辑对话框将在 5b-2 提供」，把它删掉（那句话已经不再是产品的行为）。
+`pumpWindow` 是那个文件里已有的辅助函数（铺一台「核心交换机」与一台「边界防火墙」，其中 d1 是 `autoConnect: true`）。**Step 4 之后 `＋` 会打开一个对话框，而不是弹 SnackBar**。
 
-Run: `grep -n "5b-2" test/ui/main_window_test.dart`
-Expected: 无输出。有输出就是还有残留断言，删掉它。
+Run: `grep -rn "5b-2" test/ lib/`
+Expected: 只剩 `lib/ui/main_window.dart` 里那两行**注释与 SnackBar 文案**，而它们正是 Step 4 要整个删掉的；`test/` 下应该一条都没有。（评审时已核过：现在就没有任何用例断言那句占位文案，所以删掉它不会让别的用例变红。）删完之后再跑一次，Expected: 无输出。
 
 - [ ] **Step 6：跑测试，确认全绿**
 
