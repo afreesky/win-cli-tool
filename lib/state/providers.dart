@@ -9,6 +9,7 @@ import '../data/load_issue.dart';
 import '../models/app_settings.dart';
 import '../models/device_profile.dart';
 import 'app_stores.dart';
+import 'host_key_prompt.dart';
 import 'output_buffer.dart';
 import 'session_controller.dart';
 
@@ -66,6 +67,13 @@ final sessionFactoryProvider = Provider<SessionFactory>((ref) {
     connectTimeout: Duration(milliseconds: settings.connectTimeoutMs),
     // NFR-S-03 / FR-C-11：**默认开启**，用户可在设置里关掉。
     verifyHostKey: settings.verifySshHostKey,
+      // FR-C-11 / NFR-S-03：**首次连接某主机时问用户。** 少了这一行，
+      // `SessionFactory.onUnknownHostKey` 就是 null，而 `SshSession` 里那句
+      // `await onUnknownHostKey?.call(candidate) ?? false` 于是恒为 false ——
+      // 没有主机密钥能被登记，任何一台新设备都连不上。校验开着（默认）却
+      // 谁也连不上，是这一版里最严重的一条。
+      onUnknownHostKey: (host) =>
+          ref.read(hostKeyPromptProvider.notifier).ask(host),
   );
 });
 

@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'models/app_settings.dart';
 import 'state/providers.dart';
 import 'ui/main_window.dart';
+import 'ui/widgets/host_key_prompt_host.dart';
 
 /// 应用外壳：主题、`MaterialApp`、以及启动后**一次**的副作用。
 ///
@@ -49,7 +50,9 @@ class _WinCliToolAppState extends ConsumerState<WinCliToolApp> {
           brightness: Brightness.dark,
         ),
       ),
-      home: const MainWindow(),
+      // 指纹确认要能在**任何**界面之上弹出来（它由图外的事件触发），
+      // 所以宿主包在 `MainWindow` 外面。
+      home: const HostKeyPromptHost(child: MainWindow()),
     );
   }
 }
