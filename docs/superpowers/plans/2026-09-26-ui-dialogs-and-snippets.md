@@ -2740,6 +2740,11 @@ void main() {
       root: root,
       buttonLabel: '打开',
       extra: readerOf(bytes),
+      // `ImportDialog.show` 返回 `Future<ImportRequest?>`，而 `pumpDialogHost` 的
+      // `open` 要的是 `Future<void> Function(BuildContext)` —— 这是合法的
+      // （`Future<T> <: Future<void>`，任何类型都是 `void` 的子类型）。若分析器
+      // 不认，改成 `open: (context) async { await ImportDialog.show(context); }`
+      // 即可，**这属于脚手架，改完照实报告**。
       open: (context) => ImportDialog.show(context),
     );
     await tester.tap(find.text('打开'));
@@ -3035,7 +3040,7 @@ class _ImportDialogState extends ConsumerState<ImportDialog> {
 
 - [ ] **Step 5：接到编辑区上**
 
-在 `lib/ui/panels/editor_panel.dart` 的 `_toolbar` 里，**Task 3 加的那个「命令库」按钮之后**插入：
+在 `lib/ui/panels/editor_panel.dart` 的 `_toolbar` 里，**Task 3 加的那个「命令库」`IconButton` 与紧跟其后的 `const Spacer(),` 之间**插入（即插在 `Spacer` 之前，进度文案仍然靠右）：
 
 ```dart
           IconButton(
@@ -3067,6 +3072,20 @@ class _ImportDialogState extends ConsumerState<ImportDialog> {
 ```dart
 import '../dialogs/import_dialog.dart';
 ```
+
+**两条已经核过、不用再担心的：**
+
+1. **这里的 `switch` 不写 `break` 是对的。** Dart 3 起，`switch` 语句里非空 case 体
+   会自动 break（只有空 case 才允许贯穿）—— 本仓已有先例：`session_controller.dart:209`
+   的 `switch (event)` 就是多行 case 体、一个 `break` 都没有，而 `dart analyze` 干净。
+   **别"顺手"补上 `break`，也别改成 switch 表达式**（这里要的是执行副作用，不是取值）。
+2. **不会撞上地基第 3 条的挂起定时器。** `_importFile` 改文本会经 `_setText` →
+   `_onTextChanged` → `_autosave.schedule(...)`，起一个 500ms 的落盘防抖 `Timer`；
+   但 `EditorPanelState.dispose()` 会 `_autosave.dispose()`，而它的 `dispose()`
+   第一件事就是 `_timer?.cancel()`（`draft_autosave.dart`）—— 面板随 widget 树一起
+   被拆，定时器跟着没了。**Task 5 那种情况之所以会漏，是因为那个定时器属于
+   `CommandDispatcher`，根本不在 widget 树里。** 本任务的用例没有连会话，也没有
+   任何定时器活在树外。
 
 - [ ] **Step 6：跑测试，确认全绿**
 
@@ -5859,7 +5878,8 @@ Expected：PNG 是 1280x720 的真图（不是 586 字节、2 色的空白图）
 - **`findsOneWidget` 撞上"同一句话说了两遍"（Task 4）。** 「NFR-S-02 的警告就在对话框里」初稿写的是 `find.textContaining('明文')`，而设计里**有意**在两个地方点了「明文」：那条警告，和密码框的标签「密码（明文保存）」。实测（本机 3.44.4，用一个只含这两样东西的 scratch 用例跑出来的）：`Found 2 widgets with text containing 明文`，`findsOneWidget` 直接红。**断言用宽泛的短语去数一个"有意重复出现"的词，是这一类红的来源。**
 - **构造函数里没写出来的字段会走默认值，编辑对话框于是变成"静默清字段"（Task 4）。** `DeviceProfile` 除了对话框要编辑的那十来项，还有 `jumpHostIds`（默认 `const []`）。`_submit` 里那份 `DeviceProfile(...)` 初稿没写它 —— 于是编辑任何一台设备都会把盘上那条跳板机链抹成空，没有任何提示。`snippets` 那一行本来就带着注释说"不让 update 把它抹掉"，`jumpHostIds` 是同一个坑漏掉的一个。**写编辑类对话框时，把模型的字段表对着构造函数数一遍。**
 - **长对话框在默认窗口里点不到靠下的控件；等 SnackBar 不能靠推帧（Task 4）。** 这两条各让 2 条和 1 条用例红在**对话框之外**（`tap` 空点、SnackBar 没等到），而代码是对的 —— 也就是说**红的位置会指向错误的方向**。修法分别是 `useTallSurface` 与 `pumpUntilSnackBar`（都在 `ui_harness.dart`），细节见前面「测对话框之前必须先知道的两件事」。Task 5/6/7/9 的用例照用。
-- **让会话保持连接到用例结束的用例，收尾要 `drainCommandTimeout(tester)`（Task 5）。** 同样红在断言之外：`flutter_test` 在用例体跑完后断言 `!timersPending`，而连接时排进队列的 `postLoginCommands` 起了一个 10s 命令超时定时器，`FakeSession` 不吐提示符所以它一直挂着。**同一个文件里"会断开的用例绿、不断开的用例红"就是它的指纹** —— 代码和断言都是对的。见地基第 3 条。Task 6 的「连接」菜单用例尤其要当心。
+- **让会话保持连接到用例结束的用例，收尾要 `drainCommandTimeout(tester)`（Task 5）。** 同样红在断言之外：`flutter_test` 在用例体跑完后断言 `!timersPending`，而连接时排进队列的 `postLoginCommands` 起了一个 10s 命令超时定时器，`FakeSession` 不吐提示符所以它一直挂着。**同一个文件里"会断开的用例绿、不断开的用例红"就是它的指纹** —— 代码和断言都是对的。见地基第 3 条。**只有活在 widget 树之外的定时器才会漏** —— `DraftAutosave` 那个 500ms 落盘防抖是 `EditorPanelState.dispose()` 取消的，所以不受影响（Task 7 已核）。
+- **右键菜单的 `live` 是"右键那一刻"的快照（Task 6，已知并接受）。** 菜单开着时若会话掉了，「断开」仍是可点的。实测 `ConnectionManager.disconnect()` 对已断开的会话是幂等的（只置 `_userClosed`、拆一条已经不存在的会话），而且"用户明确点了断开"本来就应该压住 FR-C-07 的自动重连 —— 所以这是**行为正确、只是有点陈旧**，不修。记在这里免得后来的人重新论证一遍。
 
 **一条通用教训（值得单独记着）：** 「分析器干净」这条验收门比它看起来严 —— `unnecessary_null_comparison`（warning）与 `unrelated_type_equality_checks`（**info**）都会让 `dart analyze` 打印 `1 issue found` 而不是 `No issues found!`。写断言时对**静态类型已知**的比较（非空对象与 `null`、无关类型之间）要格外小心。
 
