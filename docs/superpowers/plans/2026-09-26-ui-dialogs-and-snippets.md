@@ -4443,7 +4443,10 @@ void main() {
       root: root,
       child: const SizedBox(height: 400, child: KnownHostsSection()),
     );
-    await settleDisk(tester);
+    // 这一段 `initState` 就 `await all()` 读盘（真 I/O），`settleDisk` 的
+    // 12×5ms 是碰运气。等它离开"读取中…"——**空、有记录、读失败**三种收尾
+    // 都不再是它，所以这一句对七条用例都成立。
+    await pumpUntilTrue(tester, () => find.text('读取中…').evaluate().isEmpty);
   }
 
   testWidgets('空的时候说清楚，不是一片空白', (tester) async {
@@ -4490,16 +4493,20 @@ void main() {
     expect(find.text('清除这条已知主机密钥？'), findsOneWidget);
 
     await tester.tap(find.text('确认清除'));
-    await settleDisk(tester);
+    // **不能只 `settleDisk`。** `_remove` 是 `await remove()` → `await _reload()`，
+    // 两次真 I/O（`remove` 走 `_readFromDisk` + `writeJsonObject`，两个 chmod
+    // 真进程）。而且这里**盯"确认框关了"没用** —— 那个框在**写之前**就 pop 了。
+    // 能当信号的是"列表自己刷新掉了那一行"：它只在 `remove()` 返回之后才可能
+    // 发生。等到之后再断言，两条断言（盘上、界面上）都不会红在"还没轮到"上。
+    await pumpUntilTrue(
+      tester,
+      () => find.textContaining('SHA256:ed').evaluate().isEmpty,
+    );
 
     final left = await AppStores(paths: AppPaths(root)).hostKeys.all();
     expect(left, hasLength(1));
     expect(left.single.host, '10.0.0.2');
-    expect(
-      find.textContaining('SHA256:ed'),
-      findsNothing,
-      reason: '列表要跟着刷新',
-    );
+    expect(find.textContaining('SHA256:ed'), findsNothing, reason: '列表要跟着刷新');
   });
 
   testWidgets('清除时点取消：盘上一条都不少', (tester) async {
@@ -4522,13 +4529,21 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('known-hosts-clear-all')));
     await tester.pumpAndSettle();
     await tester.tap(find.text('确认清除'));
-    await settleDisk(tester);
+    // 同「逐条清除」：等界面自己刷成空态，而不是赌那 60ms 真实时间。
+    // 两条 `remove` 是**串行 await** 的，所以刷成空态就意味着两条都写完了。
+    await pumpUntilTrue(
+      tester,
+      () => find.textContaining('还没有任何已知主机密钥').evaluate().isNotEmpty,
+    );
 
     expect(await AppStores(paths: AppPaths(root)).hostKeys.all(), isEmpty);
     expect(find.textContaining('还没有任何已知主机密钥'), findsOneWidget);
   });
 
   testWidgets('文件坏了：说出来，不把设置对话框炸掉', (tester) async {
+    // **必须 `await`。** 少这个 await，`writeAsString` 就与下面的
+    // `pumpSection` 赛跑：`_readFromDisk` 先看到"文件不存在"就返回空 map，
+    // 界面显示的是空态而不是"无法读取"，用例红在一个看起来像实现错的地方。
     await File('${root.path}/known_hosts.json').writeAsString('{ not json');
 
     await pumpSection(tester);
@@ -4735,6 +4750,11 @@ Run: `flutter test test/ui/known_hosts_section_test.dart test/ui/settings_dialog
 Expected: PASS
 
 一条容易红的：`全部清除也要确认，且一次清光` 里的两条 `remove` 是**串行 await** 的 —— 若改成 `Future.wait` 并发，`FileHostKeyStore` 的"读-改-写"会互相覆盖（它每次真读盘，两个并发调用各读到同一份快照，后写的把先写的盖回去）。**保持串行。**
+
+另外两处的机制已经核对过，实施时不用再怀疑：
+
+- `{ not json` 会在 `readJsonObject` 的 `jsonDecode` 上抛 `FormatException`（`json_file.dart:24`，`readJsonObject` 自己不接），**不会**被留档、也不会被降级成空 map —— 所以 `_reload` 的 catch 一定进得去，"无法读取"一定出得来。
+- `AppStores.hostKeys` 的静态类型就是 `FileHostKeyStore`（`app_stores.dart` 里显式写的），而 `all()` **刻意只加在这个具体类上、不在 `HostKeyStore` 接口里**（`host_key_store.dart:55` 那段文档）。这里是从具体类型直接调，不涉及向下转型 —— 正是 spec §13.5 允许的那一种。
 
 - [ ] **Step 6：跑一遍全仓**
 
