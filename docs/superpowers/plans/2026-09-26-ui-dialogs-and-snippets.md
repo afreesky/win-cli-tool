@@ -1274,8 +1274,14 @@ void main() {
   testWidgets('NFR-S-02：明文存储的警告就在对话框里', (tester) async {
     await open(tester);
 
-    expect(find.textContaining('明文'), findsOneWidget);
-    expect(find.textContaining('devices.json'), findsOneWidget);
+    // **不能写成 `find.textContaining('明文')`。** 对话框里有**两个** Text 含
+    // 「明文」：这条警告，和密码输入框的标签「密码（明文保存）」。本机
+    // flutter 3.44.4 实测（起一个只有这两样东西的 scratch 用例跑出来的）：
+    //   Expected: exactly one matching candidate
+    //     Actual: Found 2 widgets with text containing 明文
+    // 所以断言要挑那句独特的话，两处各断一次。
+    expect(find.textContaining('明文保存在 devices.json'), findsOneWidget);
+    expect(find.text('密码（明文保存）'), findsOneWidget);
   });
 
   testWidgets('新增：填完保存，设备进了列表（FR-D-01/FR-D-02）', (tester) async {
@@ -1697,6 +1703,11 @@ class _DeviceEditDialogState extends ConsumerState<DeviceEditDialog> {
       autoConnect: _autoConnect,
       // **片段只在命令库里改**，对话框不碰它。带上原值是为了不让 update 把它抹掉。
       snippets: widget.existing?.snippets ?? const [],
+      // 同理，而且这一条更要紧：这一版的界面里根本没有跳板机这一项（整条链路
+      // 已在别处砍掉），但 `jumpHostIds` 是**会持久化的字段**，在构造函数里
+      // 默认 `const []`。不带上原值的话，编辑任何一台设备都会把盘上那条链
+      // **静默抹成空** —— 对话框不会提示，用户也不会知道。
+      jumpHostIds: widget.existing?.jumpHostIds ?? const [],
     );
 
     setState(() {
@@ -5696,6 +5707,8 @@ Expected：PNG 是 1280x720 的真图（不是 586 字节、2 色的空白图）
 - **双击区域里不能包着别的按钮（Task 3）。** `DoubleTapGestureRecognizer` 在第一次按下时会 `gestureArena.hold(pointer)`（`gestures/multitap.dart:330`），把手势竞技场按到双击超时（300ms）为止。所以 `GestureDetector(onDoubleTap:)` 里**但凡裹着一个 `IconButton`**（初稿是把它当 `ListTile.trailing`），那个按钮的单击就要等满 300ms 才生效，双击它还会顺带触发插入。初稿在测试里表现为"点了编辑/删除，对话框 0 个"—— 而 `pumpAndSettle()` 在 ~100ms 后就没帧可等了，hold 还没释放，于是永远等不到。修法是把按钮挪出 `GestureDetector` 的子树（`Row(Expanded(双击区), 按钮, 按钮)`）。**这是 Task 3 实施者实测报上来的。**
 - **改编辑区工具栏的 Task 一次要重生成三张 golden**，不是一张：`main_window_light.png` 与 `main_window_dark.png` 里也含着那条工具栏（实测三张各差 226 像素）。Task 3/7/8 的 `git add` 清单都已按这个改过 —— 漏掉的那两张会以"改了但没进提交"的形式留在工作区，然后被下一次 `--update-goldens` 悄悄吞掉。
 - **断言要问"组件在不在"，不是"里面某句文案在不在"（Task 3）。** 初稿用 `find.text('还没有命令片段')` 来证明抽屉关上了，而被测设备**有**片段，那句话在它的抽屉里根本不会渲染 —— 这条断言恒真，抽屉关没关都绿。正确的问法是 `find.byType(SnippetDrawer)`。和上面 Task 1 那条是同一类病：**断言在测空气。**
+- **`findsOneWidget` 撞上"同一句话说了两遍"（Task 4）。** 「NFR-S-02 的警告就在对话框里」初稿写的是 `find.textContaining('明文')`，而设计里**有意**在两个地方点了「明文」：那条警告，和密码框的标签「密码（明文保存）」。实测（本机 3.44.4，用一个只含这两样东西的 scratch 用例跑出来的）：`Found 2 widgets with text containing 明文`，`findsOneWidget` 直接红。**断言用宽泛的短语去数一个"有意重复出现"的词，是这一类红的来源。**
+- **构造函数里没写出来的字段会走默认值，编辑对话框于是变成"静默清字段"（Task 4）。** `DeviceProfile` 除了对话框要编辑的那十来项，还有 `jumpHostIds`（默认 `const []`）。`_submit` 里那份 `DeviceProfile(...)` 初稿没写它 —— 于是编辑任何一台设备都会把盘上那条跳板机链抹成空，没有任何提示。`snippets` 那一行本来就带着注释说"不让 update 把它抹掉"，`jumpHostIds` 是同一个坑漏掉的一个。**写编辑类对话框时，把模型的字段表对着构造函数数一遍。**
 
 **一条通用教训（值得单独记着）：** 「分析器干净」这条验收门比它看起来严 —— `unnecessary_null_comparison`（warning）与 `unrelated_type_equality_checks`（**info**）都会让 `dart analyze` 打印 `1 issue found` 而不是 `No issues found!`。写断言时对**静态类型已知**的比较（非空对象与 `null`、无关类型之间）要格外小心。
 
