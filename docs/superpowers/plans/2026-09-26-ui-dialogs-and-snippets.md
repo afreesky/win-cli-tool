@@ -3727,6 +3727,15 @@ void main() {
     WidgetTester tester, {
     AppSettings settings = const AppSettings(),
   }) async {
+    // **这张对话框必须调 `useTallSurface`，而且十三条用例一条都躲不开。**
+    // 内容是十来个控件摞起来的（三个带 helperText 的输入框 + 正则 + 三行的
+    // 翻页框 + 两个 SwitchListTile + 日志目录 + 主题下拉 + 滑杆），实测高度
+    // 远超过默认 800×600 窗口给对话框正文的那点地方 —— 而正文是包在
+    // `SingleChildScrollView` 里的，**装不下不会报错，只会把靠下的控件挪到
+    // 视口外面**：`tap` 空点一下、`enterText` 落不到那个框上，用例红在一句
+    // 与它要验的东西毫无关系的断言上（Task 4 在设备编辑对话框上量到过同一
+    // 件事：开关在 y=866，视口只有 384）。所以放在这个口上，一处管全部。
+    await useTallSurface(tester);
     await pumpDialogHost(
       tester,
       root: root,
@@ -3741,9 +3750,19 @@ void main() {
   Future<void> fill(WidgetTester tester, String key, String text) =>
       tester.enterText(find.byKey(ValueKey(key)), text);
 
+  /// 点「保存」并**等到对话框真的关掉**。
+  ///
+  /// **不能只 `settleDisk`。** `_submit` 是**先 `await update(next)`、再
+  /// `pop()`**，所以"对话框关了"这件事本身就证明了设置已经写完了整条路径。
+  /// `SettingsStore.save` 走 `writeJsonObject` → `writeFileAtomically`
+  /// （建目录 → 写 `.tmp` → **两次 `chmod` 真进程** → rename），全是推不动
+  /// 假时钟的真 I/O，`settleDisk` 那 12×5ms 够不够看机器当下忙不忙。
+  ///
+  /// 挡下的那几条用例（超时非法、正则编译不了……）**不走这个口** —— 它们
+  /// 对话框不该关，自己 `tap` + `pumpAndSettle`。所以这里等"关掉"是安全的。
   Future<void> save(WidgetTester tester) async {
     await tester.tap(find.text('保存'));
-    await settleDisk(tester);
+    await pumpUntilTrue(tester, () => find.text('保存').evaluate().isEmpty);
   }
 
   testWidgets('对话框里的初值就是当前设置（FR-G-01）', (tester) async {
@@ -4311,7 +4330,12 @@ import 'dialogs/settings_dialog.dart';
     await tester.tap(find.byTooltip('设置'));
     await tester.pumpAndSettle();
 
-    expect(find.text('设置'), findsWidgets, reason: '标题与 tooltip 都会命中');
+    // **只可能是对话框标题那一个。** AppBar 上那个 `IconButton` 的
+    // `tooltip: '设置'` 不算 —— `Tooltip` 没展开时**不渲染它的文字**
+    // （这正是 Task 6 里删掉一条同类断言的原因：当时写的理由是"标题与 tooltip
+    // 都会命中"，而那个机制根本不存在）。所以这里用 `findsOneWidget`；若真
+    // 数出两个，那是树上多了别的东西，要查，不是放宽断言。
+    expect(find.text('设置'), findsOneWidget, reason: '对话框标题');
     expect(
       find.byKey(const ValueKey('settings-command-timeout')),
       findsOneWidget,
