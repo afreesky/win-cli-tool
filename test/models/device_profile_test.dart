@@ -244,42 +244,68 @@ void main() {
     });
 
     test('值相等：三个字段全同才相等（spec §13.7）', () {
-      const a = Snippet(id: 's1', name: '看版本', content: 'display version');
-      const b = Snippet(id: 's1', name: '看版本', content: 'display version');
+      // **两个操作数都必须是非 const 构造，这不是风格问题。** Dart 会把参数
+      // 相同的 `const` 字面量**规范化成同一个实例**，而 `Object.==` 是按身份
+      // 答的 —— 写成 `const a = Snippet(...); const b = Snippet(同样参数);`
+      // 的话 `a == b` 在**没有** `==` 的时候也是 true，这四条用例会全部变绿，
+      // 于是它们守不住任何东西（实测：那种写法下四条全绿，连删掉本任务加的
+      // `==` 都不红）。`fromJson` 是运行期构造，拿到的一定是新实例，只有
+      // **值相等**才能让它绿 —— 这也正是本任务"为什么做"里说的那个场景。
+      final a = Snippet.fromJson(
+        const Snippet(id: 's1', name: '看版本', content: 'display version')
+            .toJson(),
+      );
+      final b = Snippet.fromJson(
+        const Snippet(id: 's1', name: '看版本', content: 'display version')
+            .toJson(),
+      );
 
+      // 把"这是两个不同实例"也断言出来：否则将来有人把上面改回 const，
+      // 用例会安安静静地退化成恒真，没人会注意到。
+      expect(identical(a, b), isFalse, reason: '前提：两个不同的实例');
       expect(a, equals(b));
       expect(a.hashCode, equals(b.hashCode));
     });
 
     test('缺任一字段就不相等', () {
       const base = Snippet(id: 's1', name: '看版本', content: 'display version');
+      final copy = Snippet.fromJson(base.toJson());
 
-      expect(base, isNot(equals(base.copyWith(name: '看接口'))));
-      expect(base, isNot(equals(base.copyWith(content: 'display interface'))));
+      expect(copy, equals(base), reason: '前提：字段全同的副本是相等的');
+      expect(copy.copyWith(name: '看接口'), isNot(equals(copy)));
+      expect(copy.copyWith(content: 'display interface'), isNot(equals(copy)));
       expect(
-        base,
-        isNot(
-          equals(
-            const Snippet(id: 's2', name: '看版本', content: 'display version'),
-          ),
-        ),
+        Snippet(id: 's2', name: '看版本', content: 'display version'),
+        isNot(equals(copy)),
         reason: 'id 也是身份的一部分：两条同名片段是允许的',
       );
     });
 
     test('List.contains / Set 按值判（命令库据此判重）', () {
       const a = Snippet(id: 's1', name: 'x', content: 'y');
-      const b = Snippet(id: 's1', name: 'x', content: 'y');
+      final b = Snippet.fromJson(a.toJson());
 
+      expect(identical(a, b), isFalse, reason: '前提：两个不同的实例');
       expect(<Snippet>[a].contains(b), isTrue);
       expect(<Snippet>{a}.contains(b), isTrue);
+      expect(<Snippet>{a, b}, hasLength(1), reason: '值相等 → Set 里塌成一条');
     });
 
     test('与别的类型比不相等，且不抛', () {
-      const a = Snippet(id: 's1', name: 'x', content: 'y');
+      final a = Snippet.fromJson(
+        const Snippet(id: 's1', name: 'x', content: 'y').toJson(),
+      );
 
-      expect(a, isNot(equals('s1')));
-      expect(a == null, isFalse);
+      // **`a == Object()` 里的括号不能省，也不能换成 `a == 's1'`。**
+      // 三种写法的分析器结果（在 flutter 3.44.4 上实测）：
+      //   - `a == null`  → `unnecessary_null_comparison`（`Snippet` 非空，
+      //                    恒为 false）—— 会打破 Step 5 的"分析器干净"；
+      //   - `a == 's1'`  → `unrelated_type_equality_checks`（info）—— 同样打破；
+      //   - `a == Object()` → **干净**（`Object` 是 `Snippet` 的超类型，
+      //                    那条 lint 不管）。
+      // 它守的是"别把类型判断漏掉"：若实现写成 `(other as Snippet).id == id`
+      // 少了 `other is Snippet`，这一句会抛 `CastError`。
+      expect(a == Object(), isFalse);
     });
   });
 }
