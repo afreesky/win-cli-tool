@@ -993,8 +993,11 @@ class EnableSequence {
 
   /// 会话输出，由 `ConnectionManager` 在它的 output 订阅里喂进来。
   ///
-  /// 在 [start] 之前喂进来的输出**只是攒着**（建连横幅就是这种），
-  /// 第一次 [_writeAndWait] 会把它清掉。
+  /// **在 [start] 之前喂进来的输出被直接丢弃**（`_done` 还没建，下面第一行
+  /// 就返回了），不是攒着。建连横幅（`Ruijie>`）正是这种 —— 丢掉它是对的：
+  /// 本类只关心我们写下 `en` **之后**设备说了什么。真正需要防的是横幅在
+  /// **`start()` 之后**才落地（订阅先于 `start()` 挂上，见 Task 4），那由
+  /// [settleDelay] + [_writeAndWait] 的清缓冲兜住。
   void onOutput(String chunk) {
     if (_done == null || _finished) return;
     _buffer += chunk;
