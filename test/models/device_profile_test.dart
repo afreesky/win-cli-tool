@@ -177,6 +177,54 @@ void main() {
       expect(restored.autoConnect, isFalse);
       expect(restored.snippets, isEmpty);
     });
+
+    test('提权字段：往返保留，缺省为 null', () {
+      const full = DeviceProfile(
+        id: 'd1',
+        name: '汇聚交换机',
+        protocol: DeviceProtocol.ssh,
+        host: '10.0.0.1',
+        port: 22,
+        username: 'admin',
+        enableCommand: 'en',
+        enablePassword: 'enable-secret',
+      );
+      final back = DeviceProfile.fromJson(full.toJson());
+      expect(back.enableCommand, 'en');
+      expect(back.enablePassword, 'enable-secret');
+
+      // 老文件里没有这两个键 —— 必须读成 null（"不提权"），不是空串。
+      final legacy = DeviceProfile.fromJson(
+        Map<String, Object?>.of(full.toJson())
+          ..remove('enableCommand')
+          ..remove('enablePassword'),
+      );
+      expect(legacy.enableCommand, isNull);
+      expect(legacy.enablePassword, isNull);
+    });
+
+    test('提权字段的 null 有语义，copyWith 不能被 `??` 吞掉', () {
+      const profile = DeviceProfile(
+        id: 'd1',
+        name: 'x',
+        protocol: DeviceProtocol.ssh,
+        host: 'h',
+        port: 22,
+        username: 'u',
+        enableCommand: 'en',
+        enablePassword: 'pw',
+      );
+      // 必须传 Object? 哨兵才能清空 —— 传 null 表示"我就是要清空"。
+      final cleared = profile.copyWith(
+        enableCommand: null,
+        enablePassword: null,
+      );
+      expect(cleared.enableCommand, isNull, reason: '清空提权命令不能被 ?? 吃掉');
+      expect(cleared.enablePassword, isNull, reason: '清空提权口令不能被 ?? 吃掉');
+
+      // 不传则保持原值。
+      expect(profile.copyWith(name: 'y').enableCommand, 'en');
+    });
   });
 
   group('JumpHost', () {

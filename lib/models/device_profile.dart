@@ -138,6 +138,8 @@ class DeviceProfile {
     required this.username,
     this.password,
     this.privateKeyPath,
+    this.enableCommand,
+    this.enablePassword,
     this.jumpHostIds = const [],
     this.lineEnding = '\n',
     this.promptRegex,
@@ -154,6 +156,18 @@ class DeviceProfile {
   final String username;
   final String? password;
   final String? privateKeyPath;
+
+  /// 登录后自动执行的**提权命令**（如 `en`）。null 表示这台设备不提权。
+  ///
+  /// **null 与空串不同**：空串会真的往设备发一个空行。与 [password] 同理，
+  /// 它的 null 是有语义的，所以 [copyWith] 用哨兵而不是 `?? this.x`。
+  final String? enableCommand;
+
+  /// 提权口令。null 表示设备不问口令（Cisco 形态的 `en` 直达 `#`）。
+  ///
+  /// **它是凭据，不是普通字段**：存盘时由 `CredentialStore` 负责从记录里
+  /// 剥掉（NFR-S-01），读取时再由它填回来 —— 与 [password] 走同一条路。
+  final String? enablePassword;
 
   /// 跳板机链，有序。空表示直连。
   final List<String> jumpHostIds;
@@ -178,6 +192,8 @@ class DeviceProfile {
     String? username,
     Object? password = _unset,
     Object? privateKeyPath = _unset,
+    Object? enableCommand = _unset,
+    Object? enablePassword = _unset,
     List<String>? jumpHostIds,
     String? lineEnding,
     Object? promptRegex = _unset,
@@ -197,6 +213,12 @@ class DeviceProfile {
         privateKeyPath: identical(privateKeyPath, _unset)
             ? this.privateKeyPath
             : privateKeyPath as String?,
+        enableCommand: identical(enableCommand, _unset)
+            ? this.enableCommand
+            : enableCommand as String?,
+        enablePassword: identical(enablePassword, _unset)
+            ? this.enablePassword
+            : enablePassword as String?,
         jumpHostIds: jumpHostIds ?? this.jumpHostIds,
         lineEnding: lineEnding ?? this.lineEnding,
         promptRegex: identical(promptRegex, _unset)
@@ -216,6 +238,8 @@ class DeviceProfile {
         username: json['username']! as String,
         password: json['password'] as String?,
         privateKeyPath: json['privateKeyPath'] as String?,
+        enableCommand: json['enableCommand'] as String?,
+        enablePassword: json['enablePassword'] as String?,
         jumpHostIds: (json['jumpHostIds'] as List<Object?>? ?? const [])
             .cast<String>(),
         lineEnding: json['lineEnding'] as String? ?? '\n',
@@ -238,6 +262,8 @@ class DeviceProfile {
         'username': username,
         'password': password,
         'privateKeyPath': privateKeyPath,
+        'enableCommand': enableCommand,
+        'enablePassword': enablePassword,
         'jumpHostIds': jumpHostIds,
         'lineEnding': lineEnding,
         'promptRegex': promptRegex,
