@@ -7,6 +7,7 @@ import '../command/more_pager.dart';
 import '../command/prompt_detector.dart';
 import '../models/device_profile.dart';
 import 'connection_failure.dart';
+import 'enable_sequence.dart';
 import 'session.dart';
 import 'session_factory.dart';
 
@@ -154,6 +155,14 @@ class ConnectionManager {
   Session? _session;
   CommandDispatcher? _dispatcher;
   StreamSubscription<String>? _outputSub;
+
+  /// 本次连接正在跑的提权序列。null 表示这台设备不提权，或提权已经结束。
+  ///
+  /// 生命周期与 `_session` / `_outputSub` / `_dispatcher` **同进同退** ——
+  /// 拆除时一并置空（见 [_teardownSession]），否则下一次连接会把输出喂给一个
+  /// 属于上一条会话的状态机。
+  EnableSequence? _enable;
+
   Timer? _retryTimer;
   var _state = DeviceConnectionState.disconnected;
   var _attempt = 0;
@@ -296,6 +305,23 @@ class ConnectionManager {
       return;
     }
 
+    // 提权与命令派发**共用同一个提示符检测器**：两者的判据必须是同一套
+    // （用户可能给这台设备自定义过 `promptRegex`），各建一个实例迟早会漂移。
+    final detector = promptDetector ?? PromptDetector();
+    final enableCommand = profile.enableCommand;
+    final enable = enableCommand == null
+        ? null
+        : EnableSequence(
+            write: session.write,
+            promptDetector: detector,
+            command: enableCommand,
+            password: profile.enablePassword,
+            lineEnding: profile.lineEnding,
+          );
+    // **先建好再订阅。** 反过来的话，订阅建立到赋值之间到达的输出会被丢掉
+    // （`session.output` 是广播流，没有订阅者就扔）—— 而那段正是 `en` 的回显。
+    _enable = enable;
+
     // `onError` 是保险，不是通道：两个真实实现都把 output 上的错误转成了 `done`
     // 的**完成**（`_onError` → `_onDisconnected`），output 本身不会以错误结束。
     // 真要有错误漏到这里，它是**静默**吞掉的 —— 没有事件、没有日志、没有状态
@@ -303,11 +329,12 @@ class ConnectionManager {
     _outputSub = session.output.listen((chunk) {
       if (!_output.isClosed) _output.add(chunk);
       _dispatcher?.onOutput(chunk);
+      _enable?.onOutput(chunk);
     }, onError: (Object _) {});
 
     _dispatcher = CommandDispatcher(
       write: session.write,
-      promptDetector: promptDetector ?? PromptDetector(),
+      promptDetector: detector,
       morePager: morePager ?? MorePager(),
       lineEnding: profile.lineEnding,
     );
@@ -318,6 +345,34 @@ class ConnectionManager {
     // spec §13.12 / §13.20）。
     // 代号随会话一起捕获：这条会话的落幕只对它自己那一代有效。
     session.done.then((_) => _onSessionDone(gen, session.lastError));
+
+    // FR-C-08 的前置一步：提权必须在 `SessionReady` **之前**跑完。
+    // 见 `EnableSequence` 的类文档：这期间设备停在口令提示符上，
+    // dispatcher 一旦开始发用户命令，命令就会被当成口令喂进去。
+    if (enable != null) {
+      final failure = await enable.start();
+      // **靠身份判断这次提权还算不算数。** 这期间用户可能断开了、退出了、
+      // 又连了一次，`_teardownSession` 会把 `_enable` 置空（并 dispose 掉这个
+      // 序列，它以 null 完成 future —— 那个 null 不是"成功"）。
+      if (!identical(_enable, enable)) return;
+      _enable = null;
+
+      if (failure != null) {
+        if (_disposed || _userClosed || gen != _generation) return;
+        unawaited(_teardownSession());
+        if (!_events.isClosed) _events.add(ConnectionFailed(failure));
+        // **口令被拒是确定性失败，不排程重连。** FR-C-07 会一直重试下去
+        // （退避到 30s 封顶后无限期），而每次重连都会把同一条错误口令再喂给
+        // 设备一遍 —— 很多设备会因此锁定账号。提权超时不在此列：那多半是
+        // 设备慢或命令写法不对，重试是合理的。
+        if (failure.kind == ConnectionFailureKind.authFailed) {
+          _setState(DeviceConnectionState.failed);
+        } else {
+          _scheduleRetry(gen);
+        }
+        return;
+      }
+    }
 
     final wasReconnect = _attempt > 0;
     if (wasReconnect) {
@@ -451,6 +506,11 @@ class ConnectionManager {
     _session = null;
     _outputSub = null;
     _dispatcher = null;
+    // 提权序列与它们同进同退：留着的话，下一次连接的输出会被喂给一个属于
+    // 上一条会话的状态机。dispose 会以 null 完成它的 future —— 调用方靠
+    // `identical(_enable, enable)` 认出"这次提权已经作废"，不看那个返回值。
+    _enable?.dispose();
+    _enable = null;
 
     await outputSub?.cancel();
 

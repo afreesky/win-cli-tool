@@ -165,6 +165,28 @@ DeviceProfile _profile({
   lineEnding: lineEnding,
 );
 
+/// 一台**要提权**的设备。
+///
+/// 与 [_profile] 分开写而不是给它加参数：`_profile` 的
+/// `postLogin: ['enable']` 被 20 多条现有用例依赖，默认值一个字都不能动。
+///
+/// `postLogin` 用 `['show version']` 而不是 `['enable']`：`enable` 这个词
+/// 同时出现在提权命令与登录后命令上，断言 `written` 时分不清哪一笔是谁发的。
+DeviceProfile _enableProfile({
+  List<String> postLogin = const ['show version'],
+  String? enablePassword = 'pw',
+}) => DeviceProfile(
+  id: 'd1',
+  name: '核心交换机',
+  protocol: DeviceProtocol.ssh,
+  host: '10.0.0.1',
+  port: 22,
+  username: 'admin',
+  enableCommand: 'en',
+  enablePassword: enablePassword,
+  postLoginCommands: postLogin,
+);
+
 void main() {
   test('connect() 成功后状态为 connected，并下发登录后命令', () async {
     final sessions = <_FakeSession>[];
@@ -1161,5 +1183,136 @@ void main() {
     await Future<void>.delayed(Duration.zero);
 
     expect(received, ['out1'], reason: '旧会话的订阅必须已经被摘掉');
+  });
+
+  test('提权成功之前不发 SessionReady，也不下发登录后命令', () {
+    fakeAsync((async) {
+      final sessions = <_FakeSession>[];
+      final mgr = ConnectionManager(
+        profile: _enableProfile(),
+        factory: _FakeFactory(sessions),
+      );
+      final events = <ConnectionEvent>[];
+      mgr.events.listen(events.add);
+
+      mgr.connect();
+      async.flushMicrotasks();
+      final session = sessions.single;
+
+      // 建连横幅先到 —— 它也以 `>` 结尾，绝不能被当成提权成功。
+      session.emit('Ruijie>');
+      async.elapse(const Duration(milliseconds: 400));
+      expect(
+        events.whereType<SessionReady>(),
+        isEmpty,
+        reason: '设备还停在登录提示符上，会话不该就绪',
+      );
+      expect(session.written, ['en\n'], reason: 'settleDelay 到点后才发提权命令');
+
+      session.emit('en\r\r\n');
+      session.emit('\r\r\nPassword:');
+      async.flushMicrotasks();
+      expect(session.written, ['en\n', 'pw\n']);
+
+      // 真机实录里这两段是分开到达的（`\r\r\n` 然后 `Ruijie#`）。
+      session.emit('\r\r\n');
+      session.emit('Ruijie#');
+      async.flushMicrotasks();
+      expect(events.whereType<SessionReady>(), hasLength(1));
+      expect(mgr.state, DeviceConnectionState.connected);
+
+      // FR-C-08：登录后命令在 `SessionReady` **之后**才入队。
+      async.elapse(const Duration(seconds: 1));
+      async.flushMicrotasks();
+      expect(session.written, ['en\n', 'pw\n', 'show version\n']);
+
+      mgr.dispose();
+      async.flushMicrotasks();
+    });
+  });
+
+  test('提权失败：报 ConnectionFailed、不进已连接、不下发登录后命令', () {
+    fakeAsync((async) {
+      final sessions = <_FakeSession>[];
+      final mgr = ConnectionManager(
+        profile: _enableProfile(),
+        factory: _FakeFactory(sessions),
+      );
+      final events = <ConnectionEvent>[];
+      mgr.events.listen(events.add);
+
+      mgr.connect();
+      async.flushMicrotasks();
+      final session = sessions.single;
+      async.elapse(const Duration(milliseconds: 400));
+      expect(session.written, ['en\n']);
+
+      // 口令被拒两轮：每轮"设备要口令 → 我们发 → 又被要"。
+      // **每次喂"要口令"，状态机就同步发出下一笔**（发口令或重发 `en`），
+      // 所以这里只喂"要口令"，不必再喂 `en` 的回显。
+      session.emit('\r\r\nPassword:'); // 第 1 轮：发口令
+      async.flushMicrotasks();
+      session.emit('\r\r\nPassword:'); // 又被要 → 重发 en
+      async.flushMicrotasks();
+      session.emit('\r\r\nPassword:'); // 第 2 轮：发口令
+      async.flushMicrotasks();
+      session.emit('\r\r\nPassword:'); // 又被要 → 两次用完，报错
+      async.flushMicrotasks();
+
+      expect(session.written, ['en\n', 'pw\n', 'en\n', 'pw\n']);
+
+      final failures = events.whereType<ConnectionFailed>().toList();
+      expect(failures, hasLength(1));
+      expect(
+        failures.single.failure.kind,
+        ConnectionFailureKind.authFailed,
+        reason: '口令错 → authFailed（不新增枚举值）',
+      );
+      expect(events.whereType<SessionReady>(), isEmpty);
+      expect(
+        session.written,
+        isNot(contains('show version\n')),
+        reason: '没进特权模式就下发命令，命令会被设备当口令吃掉',
+      );
+      expect(mgr.state, DeviceConnectionState.failed);
+
+      mgr.dispose();
+      async.flushMicrotasks();
+    });
+  });
+
+  test('提权口令被拒时不再自动重连（每次重连都会再喂一遍错口令）', () {
+    fakeAsync((async) {
+      final sessions = <_FakeSession>[];
+      final mgr = ConnectionManager(
+        profile: _enableProfile(),
+        factory: _FakeFactory(sessions),
+      );
+
+      mgr.connect();
+      async.flushMicrotasks();
+      async.elapse(const Duration(milliseconds: 400));
+
+      // 一路喂到两轮用完（4 次"要口令"）。第二轮里重发 `en` 是**同步**发生的
+      // （`_check` 在 `_passwordPromptSeen` 那一支里直接 `_writeAndWait`），
+      // 所以这里只需要喂"要口令"，不用再喂 `en` 的回显。
+      for (var i = 0; i < 4; i++) {
+        sessions.single.emit('\r\r\nPassword:');
+        async.flushMicrotasks();
+      }
+
+      // FR-C-07 的退避是 1s 起。等够 5s，确认**没有**再建会话。
+      async.elapse(const Duration(seconds: 5));
+      async.flushMicrotasks();
+      expect(
+        sessions,
+        hasLength(1),
+        reason: '口令被拒是确定性失败，重连只会把账号锁掉',
+      );
+      expect(mgr.state, DeviceConnectionState.failed);
+
+      mgr.dispose();
+      async.flushMicrotasks();
+    });
   });
 }
