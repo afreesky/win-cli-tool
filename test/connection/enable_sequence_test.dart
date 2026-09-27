@@ -16,6 +16,14 @@ const _bannerTail =
     'Last login: Oct  1 2000 00:04:29 from 10.166.96.30 through ssh.\r\r\n'
     'Ruijie>';
 
+/// 横幅尾巴 + `en` 回显 + 设备的拒绝信息，**全在同一个 chunk 里** —— 真机
+/// 第二次翻车时的投递形状（2026-09-27，锐捷 S6990）。设备提示符不带换行，
+/// 所以回显紧贴在 `Ruijie>` 后面。见下面那条回归用例。
+const _coalescedBlocked = '$_bannerTail'
+    'en\r\r\n'
+    '% User:admin has been blocked!\r\r\n'
+    'Ruijie>';
+
 void main() {
   test('有口令：发 en → 等口令提示 → 发口令 → 等特权提示符', () {
     fakeAsync((async) {
@@ -332,6 +340,55 @@ void main() {
       expect(result, isNotNull, reason: '退回用户模式提示符绝不能算提权成功');
       expect(result!.kind, ConnectionFailureKind.authFailed);
       expect(result!.message, contains('提权口令被拒'));
+      async.elapse(const Duration(minutes: 1));
+    });
+  });
+
+  test('横幅尾巴与 en 回显同处一个 chunk 时，基准照样记得下来', () {
+    // **真机第二次翻车的那一条**（2026-09-27，锐捷 S6990，10.166.96.41）。
+    //
+    // 同一份代码，第一次连接横幅与回显分两个 chunk 到，判对了「提权超时」；
+    // 紧接着的重连两者**合并成一个 chunk**，于是记基准那一步被
+    // 「见过回显就整个放弃」挡掉 —— `_loginPrompt` 永远是 null，第二道闸门
+    // **静默失效**。设备回的 `% User:admin has been blocked!` + `Ruijie>` 就此
+    // 被判成「重连成功」，界面亮绿灯，紧接着 `show clock` 吃
+    // `% User doesn't have sufficient privilege`。
+    //
+    // 修法是按**位置**切分：只拿回显**之前**的那一段去找提示符，于是两种
+    // 投递形状都能记下基准。
+    fakeAsync((async) {
+      final written = <String>[];
+      final seq = EnableSequence(
+        write: written.add,
+        promptDetector: PromptDetector(),
+        command: 'en',
+        password: 'enable-secret',
+      );
+
+      ConnectionFailure? result;
+      var completed = false;
+      seq.start().then((f) {
+        result = f;
+        completed = true;
+      });
+      async.elapse(const Duration(milliseconds: 300));
+      expect(written, ['en\n']);
+
+      seq.onOutput(_coalescedBlocked);
+      async.flushMicrotasks();
+      expect(completed, isFalse, reason: '退回登录提示符不是提权成功');
+
+      // 两次尝试都撞上同一句拒绝 → 超时，而不是"成功"。
+      async.elapse(const Duration(seconds: 6));
+      expect(written, ['en\n', 'en\n'], reason: '设备没反应就重发一次');
+      seq.onOutput(_coalescedBlocked);
+      async.flushMicrotasks();
+      expect(completed, isFalse, reason: '第二次也一样，绝不能误报成功');
+
+      async.elapse(const Duration(seconds: 6));
+      expect(completed, isTrue);
+      expect(result, isNotNull);
+      expect(result!.kind, ConnectionFailureKind.timeout);
       async.elapse(const Duration(minutes: 1));
     });
   });

@@ -54,6 +54,14 @@ enum _Phase {
 /// 区别**只有**这个基准能给：spec §5.2 只有一个 `promptRegex`，没有
 /// "特权提示符"这个概念。
 ///
+/// **基准本身要记牢，第二道闸门才有意义。** 记基准时只取 [command] 回显
+/// **之前**的那一段（见 [_noteLoginPrompt]）—— 回显之后是设备对 `en` 的反应，
+/// 那里的提示符是"提权后"的。真机实测（2026-09-27，同上一台）第二次连接时
+/// 横幅尾巴与回显**被合并进一个 chunk**：若按"见过回显就整个放弃"来记，基准
+/// 永远记不下来，第二道闸门**静默失效** —— 同一份代码第一次判对"超时"、
+/// 紧接着的重连却把 `% User:admin has been blocked!` 之后的 `Ruijie>` 判成
+/// "重连成功"，亮绿灯而设备仍在用户模式。按位置切分两种投递方式都能记下。
+///
 /// `awaitingPassword` 阶段**不**要求回显（口令本来就不回显，那一段的缓冲区
 /// 必然是 `\r\r\nRuijie#` 这个形状），但**同样要求**提示符与基准不同。
 ///
@@ -174,22 +182,33 @@ class EnableSequence {
   /// 记下提权**之前**的提示符，作为"到底提权成功没有"的基准。
   ///
   /// **只在"还没发过口令"的阶段记**：`idle`（横幅早到）与 `awaitingEnable`
-  /// （横幅晚到，但 `en` 的回显还没出现，见 [onOutput]）。那一刻设备还没
-  /// 处理完我们的命令，缓冲区里出现的提示符只可能是登录/建连横幅的
-  /// （`Ruijie>`）。
+  /// （横幅晚到）。`awaitingPassword` 必须排除 —— 那时缓冲区里是**口令的回显**
+  /// 或设备的拒绝信息，而回显可能自己就以 `#` / `>` 结尾（口令 `abc#`），
+  /// 一旦被记成基准，"提权后提示符必须与基准不同"这条就永远不成立，提权成功
+  /// 也会被判成失败（用例「口令以 # 结尾也不会被回显骗成成功」正是踩这个）。
   ///
-  /// **`awaitingPassword` 必须排除。** 那时缓冲区里是**口令的回显**或设备的
-  /// 拒绝信息，不是基准 —— 而回显可能自己就以 `#` / `>` 结尾（口令 `abc#`），
-  /// 一旦被记成基准，"提权后提示符必须与基准不同"这条就永远不成立，
-  /// 提权成功也会被判成失败（本类的用例
-  /// 「口令以 # 结尾也不会被回显骗成成功」正是踩这个）。
+  /// **只取 [command] 回显之前的那一段**（[_echoAt] 之前）。回显之后是设备对
+  /// `en` 的反应（`Password:`、`Ruijie#`、或拒绝信息），那里的提示符是"提权后"
+  /// 的，不能当基准 —— 而无回显时（`idle` 阶段，我们还没写过东西）整个缓冲区
+  /// 都是提权前的内容，整段都算。
+  ///
+  /// **按位置切分，而不是"见过回显就整个放弃"。** 后者曾经是这么写的，真机上
+  /// 翻过车（2026-09-27，锐捷 S6990）：横幅的尾巴与 `en` 的回显**被合并进同一个
+  /// chunk** 投递，于是第一次 [_noteLoginPrompt] 进来时 `_echoSeen` 已经是 true，
+  /// 缓冲区被整个放弃 —— 基准永远记不下来，第二道闸门就此失效。同一份代码在
+  /// 第一次连接（横幅与回显分两个 chunk 到）判对了"超时"，在紧接着的重连
+  /// （合并成一个 chunk）却把设备回的 `% User:admin has been blocked!` + `Ruijie>`
+  /// 判成了"重连成功"，界面亮绿灯而设备还在用户模式。
   ///
   /// 一成不变地取"最后一个非空行"也不行：横幅自己的消息行（`Last login: …`）
   /// 会先落地，它不是提示符。所以还要求这一行**匹配提示符正则**。
   void _noteLoginPrompt() {
     if (_loginPrompt != null || _phase == _Phase.awaitingPassword) return;
-    if (_echoSeen) return;
-    final line = PromptDetector.lastNonEmptyLine(_buffer);
+    // `idle` 阶段还没写过任何东西，缓冲区里的一字一句都是提权前的；其余阶段
+    // 按回显位置切开。
+    final at = _phase == _Phase.idle ? -1 : _echoAt;
+    final head = at >= 0 ? _buffer.substring(0, at) : _buffer;
+    final line = PromptDetector.lastNonEmptyLine(head);
     if (line != null && _promptDetector.matches(line)) _loginPrompt = line;
   }
 
@@ -315,13 +334,22 @@ class EnableSequence {
   bool get _returnedToLoginPrompt =>
       _passwordSent && _isLoginPromptLine(_buffer);
 
-  /// 设备是否已经把我们写下的 [command] 回显出来了。
+  /// 设备回显 [command] 的**位置**，找不到是 -1。
   ///
   /// 大小写不敏感：部分设备会把输入转成大写再回显。
-  bool get _echoSeen {
-    if (command.isEmpty) return true;
-    return _buffer.toLowerCase().contains(command.toLowerCase());
+  ///
+  /// 用大小写不敏感的正则、而不是 `toLowerCase()` 之后 `indexOf`：下标要能
+  /// 直接用在**原串**上（[_noteLoginPrompt] 拿它切前段），而 `toLowerCase()`
+  /// 在部分字符上会改变长度，两边下标就对不上了。
+  int get _echoAt {
+    if (command.isEmpty) return -1;
+    final match =
+        RegExp(RegExp.escape(command), caseSensitive: false).firstMatch(_buffer);
+    return match?.start ?? -1;
   }
+
+  /// 设备是否已经把我们写下的 [command] 回显出来了。
+  bool get _echoSeen => command.isEmpty || _echoAt >= 0;
 
   bool _passwordPromptSeen() {
     final line = PromptDetector.lastNonEmptyLine(_buffer);
