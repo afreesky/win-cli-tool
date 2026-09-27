@@ -261,6 +261,24 @@ class DeviceSecrets {
 
   /// 提权（`en`）口令。null 表示设备不问口令。
   final String? enablePassword;
+
+  /// 值相等（与 `Snippet` 同一个理由：spec §13.7）。
+  ///
+  /// 存在的直接理由：接口契约用例要拿一个"什么都没取到"的结果去比
+  /// （`expect(vault.secretFor('d1'), const DeviceSecrets())`），没有 `==`
+  /// 那就是身份比较，永远红。
+  ///
+  /// **刻意不覆写 `toString()`。** `expect` 失败时会把实际值打出来，
+  /// 而这个类的字段就是口令。默认的 `Instance of 'DeviceSecrets'` 什么都不泄露；
+  /// 好心加一个"方便调试"的 `toString()` 会把口令写进测试日志与 CI 输出。
+  @override
+  bool operator ==(Object other) =>
+      other is DeviceSecrets &&
+      other.password == password &&
+      other.enablePassword == enablePassword;
+
+  @override
+  int get hashCode => Object.hash(password, enablePassword);
 }
 
 /// 凭据存储。**NFR-S-01 的落脚点**：V1 明文存盘是被接受的决策，但"明文"
@@ -387,7 +405,72 @@ class PlaintextCredentialStore implements CredentialStore {
       );
 ```
 
-- [ ] **Step 5: 改四个测试假实现**
+- [ ] **Step 5: 改 `credential_store_test.dart` 里**原有**的 8 条用例**
+
+**这一步是写计划时漏掉的，别跳过。** `read` 的返回类型从 `String?` 变成了
+`DeviceSecrets`，所以该文件里原有的这几条会编译不过或断言失败。**逐条按下面的
+新形状改，一条都不许删、不许弱化** —— 它们各自钉着一个边界：
+
+```dart
+    test('read 取出 password 字段', () {
+      expect(
+        store.read({'id': 'd1', 'password': 'hunter2'}).password,
+        'hunter2',
+      );
+    });
+
+    test('read 在没有该字段时返回 password 为 null 的结果', () {
+      // **不再是 `isNull`。** 现在返回的是一个值对象，"没取到"表现为它
+      // 两个字段都是 null，而不是结果本身为 null —— 这样调用方不必对
+      // 返回值做空判断（NFR-S-01：换成密钥库实现时，多一个秘密不该多一层解包）。
+      expect(store.read({'id': 'd1'}).password, isNull);
+      expect(store.read({'id': 'd1'}).enablePassword, isNull);
+    });
+
+    test('read 在字段显式为 null 时返回 password 为 null 的结果', () {
+      expect(store.read({'id': 'd1', 'password': null}).password, isNull);
+    });
+
+    test('write 一个非 null 值会写进字段', () {
+      final record = <String, Object?>{'id': 'd1'};
+      store.write(record, const DeviceSecrets(password: 'secret'));
+      expect(record['password'], 'secret');
+    });
+
+    test('write null 是**删掉字段**，不是写一个 null 进去', () {
+      final record = <String, Object?>{'id': 'd1', 'password': 'old'};
+      store.write(record, const DeviceSecrets());
+      expect(
+        record.containsKey('password'),
+        isFalse,
+        reason: '留一个 "password": null 会让换密钥库后的文件看起来"还是有密码"',
+      );
+    });
+```
+
+`strip` 那三条（去掉凭据且不改原记录 / 返回副本 / 对没有凭据的记录安全）**断言
+一个字都不用动** —— `strip` 的签名没变。只要把 `credential_store_test.dart:5`
+那段 group 里其余用例按上面的形状改完即可。
+
+契约 group 里那条"一个不写文件的实现可以让存盘结果里根本没有 password 键"
+按下面改：
+
+```dart
+    test('一个不写文件的实现可以让存盘结果里根本没有 password 键', () {
+      final vault = _FakeVault();
+      final record = <String, Object?>{'id': 'd1', 'port': 22};
+      vault.write(record, const DeviceSecrets(password: 'secret'));
+      expect(
+        record.containsKey('password'),
+        isFalse,
+        reason: '密钥库实现把密码放在记录之外 —— 这正是接口存在的意义',
+      );
+      expect(vault.secretFor('d1'), const DeviceSecrets(password: 'secret'));
+      expect(vault.read(record).password, 'secret');
+    });
+```
+
+- [ ] **Step 6: 改四个测试假实现**
 
 这四个类 `implements CredentialStore`，接口一变就必须跟着改。逐个替换成下面的形状（各自保留原有的记录/返回值逻辑，只换签名）：
 
@@ -451,16 +534,96 @@ class _Vault implements CredentialStore {
 
 `test/data/device_store_save_test.dart` 的 `_Vault` 与 `test/state/app_stores_test.dart` 的 `_Vault`：`read` 返回 `const DeviceSecrets()`，`write` 空实现，`strip` 同上。（`device_store_save_test.dart` 那个原来 `read` 返回 `'来自密钥库'`；它只被存盘路径用到，存盘路径不读，改成 `const DeviceSecrets()` 不影响任何断言。）
 
-- [ ] **Step 6: 跑测试确认通过**
+- [ ] **Step 7: 跑测试确认通过**
 
 Run: `flutter test test/data/ test/state/app_stores_test.dart`
-Expected: PASS。
+Expected: PASS。**`device_store_load_test.dart` 与 `device_store_save_test.dart` 里原有的"凭据不进文件"用例必须全绿** —— 它们正是 NFR-S-01 的守卫，接口改动若让其中一个变红，是改动错了，不是用例错了。
 
-- [ ] **Step 7: 提交**
+- [ ] **Step 8: 提交**
 
 ```bash
 git add lib/data/credential_store.dart lib/data/device_store.dart test/data/credential_store_test.dart test/data/device_store_load_test.dart test/data/device_store_save_test.dart test/state/app_stores_test.dart
 git commit -m "refactor(data): 凭据接口携带登录+提权两个秘密（NFR-S-01）"
+```
+
+- [ ] **Step 9: 补一条端到端守卫（**写计划时漏了，必须补**）**
+
+上面只钉住了"`strip` 会剥掉 `enablePassword`"这一个**单元**行为。真正要保证的是
+**端到端**：提权口令能存能读，且在任何实现下都不落进 `devices.json`。
+两者之间隔着 `DeviceStore.save` / `load` 的调用点 —— 那里少传一个字段，
+`strip` 再正确也没用，而**没有任何用例会发现**。
+
+`test/data/device_store_save_test.dart` 里已有两条守卫
+（「明文实现：密码出现在文件里」「密钥库实现：文件里根本没有 password 键」），
+新的一条与它们并列。先给该文件的 `profile` 辅助加一个可选参数（默认 null，
+现有用例行为不变）：
+
+```dart
+  DeviceProfile profile(
+    String id, {
+    String? name,
+    String? password,
+    String? enablePassword,
+    List<String> hops = const [],
+    List<Snippet> snippets = const [],
+  }) =>
+      DeviceProfile(
+        // …原有字段不动…
+        password: password,
+        enablePassword: enablePassword,
+        // …
+      );
+```
+
+然后追加用例：
+
+```dart
+  test('提权口令与登录口令一起往返，且密钥库实现下都不落文件（NFR-S-01）', () async {
+    // ① 明文实现：两个秘密都要能存能读。提权口令走的是与登录口令同一条
+    //    剥/写路径（`credentials.strip` → `credentials.write`），
+    //    任何一头漏了都会在这里断。
+    final plain = profile(
+      'd1',
+      password: 'login-secret',
+      enablePassword: 'enable-secret',
+    );
+    await store().save([plain]);
+
+    final back = (await store().load()).devices.single;
+    expect(back.password, 'login-secret');
+    expect(
+      back.enablePassword,
+      'enable-secret',
+      reason: '存盘→读盘往返不能丢提权口令（save/load 的调用点少传了字段）',
+    );
+
+    final raw = await file.readAsString();
+    expect(raw, contains('login-secret'));
+    expect(
+      raw,
+      contains('enable-secret'),
+      reason: '明文实现下两个都落在文件里 —— 这是 V1 已接受的决策',
+    );
+
+    // ② 密钥库实现：两个都**不许**出现在文件里。这条才是 NFR-S-01 的守卫。
+    final vaultFile = File('${root.path}/vault.json');
+    await DeviceStore(file: vaultFile, credentials: _Vault()).save([plain]);
+    final vaultRaw = await vaultFile.readAsString();
+    expect(vaultRaw, isNot(contains('login-secret')));
+    expect(
+      vaultRaw,
+      isNot(contains('enable-secret')),
+      reason: 'strip 漏剥 enablePassword ⇒ 提权口令明文落进 devices.json',
+    );
+  });
+```
+
+Run: `flutter test test/data/device_store_save_test.dart`
+Expected: PASS。
+
+```bash
+git add test/data/device_store_save_test.dart
+git commit -m "test(data): 提权口令的存读往返与不落盘守卫（NFR-S-01）"
 ```
 
 ---
