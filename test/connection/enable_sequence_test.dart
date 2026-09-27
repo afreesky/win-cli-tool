@@ -265,4 +265,74 @@ void main() {
       async.elapse(const Duration(minutes: 1));
     });
   });
+
+  test('口令被拒后退回登录提示符：报认证失败，绝不误报已提权', () {
+    // **真机实测翻车的第二条**（2026-09-27，锐捷 S6990，10.166.96.41）。
+    //
+    // 口令错时锐捷**不会**再要一次口令，而是打印 `% Access denied` 之后
+    // 直接回到**用户模式**提示符 `Ruijie>`。而默认提示符正则 `[>#\]]\s*$`
+    // 对 `>` 与 `#` 一视同仁 —— 只判"最后一个非空行是提示符"就会把
+    // "被退回用户模式"判成"提权成功"：界面进"已连接"、按钮是绿的，
+    // 而用户随后每条命令都吃 `% User doesn't have sufficient privilege`。
+    //
+    // 判据只能来自**基准**：提权前那个提示符是 `Ruijie>`，提权成功后必须
+    // 换一个（`Ruijie#`）；又看到 `Ruijie>` 就说明没提上去。
+    fakeAsync((async) {
+      final written = <String>[];
+      final seq = EnableSequence(
+        write: written.add,
+        promptDetector: PromptDetector(),
+        command: 'en',
+        password: 'definitely-wrong',
+      );
+
+      ConnectionFailure? result;
+      var completed = false;
+      seq.start().then((f) {
+        result = f;
+        completed = true;
+      });
+      async.elapse(const Duration(milliseconds: 300));
+      expect(written, ['en\n']);
+
+      // 横幅的尾巴晚到（真机如此）—— 它给出 `Ruijie>` 这个基准。
+      seq.onOutput(_bannerTail);
+      async.flushMicrotasks();
+      expect(completed, isFalse);
+
+      // 第一次：要口令 → 发错口令 → 设备**又**要一次。
+      seq.onOutput(_echoEn);
+      seq.onOutput(_passwordPrompt);
+      async.flushMicrotasks();
+      expect(written, ['en\n', 'definitely-wrong\n']);
+
+      seq.onOutput(_passwordPrompt);
+      async.flushMicrotasks();
+      expect(
+        written,
+        ['en\n', 'definitely-wrong\n', 'en\n'],
+        reason: '口令被拒要重来一遍',
+      );
+
+      // 第二次：设备不再要口令，而是打印拒绝信息后**退回用户模式**。
+      seq.onOutput(_echoEn);
+      seq.onOutput(_passwordPrompt);
+      async.flushMicrotasks();
+      expect(written, [
+        'en\n',
+        'definitely-wrong\n',
+        'en\n',
+        'definitely-wrong\n',
+      ]);
+
+      seq.onOutput('\r\r\n% Access denied\r\r\nRuijie>');
+      async.flushMicrotasks();
+
+      expect(completed, isTrue);
+      expect(result, isNotNull, reason: '退回用户模式提示符绝不能算提权成功');
+      expect(result!.kind, ConnectionFailureKind.authFailed);
+      expect(result!.message, contains('提权口令被拒'));
+      async.elapse(const Duration(minutes: 1));
+    });
+  });
 }

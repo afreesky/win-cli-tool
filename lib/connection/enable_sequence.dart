@@ -25,28 +25,41 @@ enum _Phase {
 /// **纯逻辑，零 IO**：只经 [write] 往设备写字，输出由调用方经 [onOutput] 喂
 /// 进来。所以它可以脱离 socket 单测（`test/connection/enable_sequence_test.dart`）。
 ///
-/// ## 回显闸门
+/// ## 两道闸门
 ///
 /// 建连横幅（`Ruijie>`）与我们发 `en` 之后设备回的提示符，在缓冲区里长得
 /// 一样 —— 直接拿"最后一行是不是提示符"当判据，横幅一到就会宣布提权成功，
-/// 而那时口令一个字都还没发。所以 `awaitingEnable` 阶段的成功判据是：
-/// **缓冲区里既有换行、又能看到 `en` 的回显，且换行之后的那一段以提示符
-/// 结尾**。理由是设备的回显必然在第一行：我们写下 `en`，设备先回
-/// `en\r\r\n`，之后才是 `Password:` 或 `Ruijie#`。
+/// 而那时口令一个字都还没发。挡这件事的是两道闸门：
+///
+/// **一、回显闸门（`awaitingEnable` 阶段）。** 成功判据是：**缓冲区里既有
+/// 换行、又能看到 `en` 的回显，且换行之后的那一段以提示符结尾**。理由是设备的
+/// 回显必然在第一行：我们写下 `en`，设备先回 `en\r\r\n`，之后才是 `Password:`
+/// 或 `Ruijie#`。
 ///
 /// **"看到回显"这一条不是多余的。** [_writeAndWait] 的清缓冲挡不住横幅 ——
 /// 横幅完全可能在清完之后才落地，而它自带的换行与提示符足以骗过"有换行 +
 /// 后面是提示符"这个近似判据。真机实测就是这么翻的车
 /// （2026-09-27，锐捷 S6990，10.166.96.41）：横幅的尾巴比 [settleDelay]
 /// 晚约 15ms 落地，当场被判成提权成功，口令一个字都没发出去，界面却进了
-/// "已连接"。详见 [_promptSeen]。
+/// "已连接"。
 ///
-/// `awaitingPassword` 阶段**不**要求回显 —— 口令本来就不回显，那一段的
-/// 缓冲区必然是 `\r\r\nRuijie#` 这个形状。
+/// **二、登录提示符基准（两个阶段都管）。** 只有"**换了**提示符"才算提权
+/// 成功：提权前的那个提示符（`Ruijie>`）由 [_noteLoginPrompt] 记下，之后若又
+/// 看到**一模一样**的提示符，那不是成功 —— 设备是把我们退回了用户模式。
 ///
-/// 代价是**不回显的设备走不通这条路**。它由 [echoGrace] 兜底：到那一刻仍没见过
-/// 换行，就退回看整个缓冲区。这个口子开得有限 —— 横幅若被延迟投递，紧接着
-/// 设备的回应就到了，最后一行会被它顶掉。
+/// 真机实测：口令错时锐捷**不会**再要一次口令，而是打印 `% Access denied`
+/// 后直接回到 `Ruijie>`。只判 `[>#\]]` 会把这判成提权成功，界面进"已连接"，
+/// 而设备还在用户模式 —— 用户随后每一条命令都吃
+/// `% User doesn't have sufficient privilege`。在这台设备上 `>` 与 `#` 的
+/// 区别**只有**这个基准能给：spec §5.2 只有一个 `promptRegex`，没有
+/// "特权提示符"这个概念。
+///
+/// `awaitingPassword` 阶段**不**要求回显（口令本来就不回显，那一段的缓冲区
+/// 必然是 `\r\r\nRuijie#` 这个形状），但**同样要求**提示符与基准不同。
+///
+/// 代价是**不回显的设备走不通回显闸门**。它由 [echoGrace] 兜底：到那一刻仍
+/// 没见过换行，就退回看整个缓冲区。这个口子开得有限 —— 横幅若被延迟投递，
+/// 紧接着设备的回应就到了，最后一行会被它顶掉。
 class EnableSequence {
   EnableSequence({
     required this._write,
@@ -104,6 +117,16 @@ class EnableSequence {
   String _buffer = '';
   int _attemptsLeft = 0;
   bool _graceElapsed = false;
+
+  /// 提权**之前**看到的那个提示符（`Ruijie>`），提权成功与否的基准。
+  /// 见类文档的"登录提示符基准"。拿不到时为 null —— 那时只能退回只判
+  /// `[>#\]]`，也就是这道闸门失效。
+  String? _loginPrompt;
+
+  /// 已经往设备发过至少一次口令。用来区分"退回登录提示符"这个信号
+  /// 有没有意义 —— 没发过口令就谈不上"口令被拒"。
+  bool _passwordSent = false;
+
   Timer? _attemptTimer;
   Timer? _settleTimer;
   Timer? _graceTimer;
@@ -133,15 +156,41 @@ class EnableSequence {
 
   /// 会话输出，由 `ConnectionManager` 在它的 output 订阅里喂进来。
   ///
-  /// **在 [start] 之前喂进来的输出被直接丢弃**（`_done` 还没建，下面第一行
-  /// 就返回了），不是攒着。建连横幅（`Ruijie>`）正是这种 —— 丢掉它是对的：
-  /// 本类只关心我们写下 `en` **之后**设备说了什么。真正需要防的是横幅在
-  /// **`start()` 之后**才落地（订阅先于 `start()` 挂上，见 Task 4），那由
-  /// [settleDelay] + [_writeAndWait] 的清缓冲兜住。
+  /// **在 [start] 之前喂进来的输出不判成功也不判失败，但仍会进缓冲区** ——
+  /// 建连横幅（`Ruijie>`）常在这条缝里落地，而它是 [_noteLoginPrompt] 要记的
+  /// 那个"登录提示符"基准。判成功/失败要等 [start]，那之前 `_done` 还是 null。
+  ///
+  /// 横幅在 **`start()` 之后**才落地是另一回事（订阅先于 `start()` 挂上，
+  /// 见 Task 4）：那时它既不进"已清空"的缓冲，也可能自带给提示符 —— 由
+  /// 回显闸门与登录提示符基准两道闸门一起挡（见类文档）。
   void onOutput(String chunk) {
-    if (_done == null || _finished) return;
+    if (_finished) return;
     _buffer += chunk;
+    _noteLoginPrompt();
+    if (_done == null) return;
     _check();
+  }
+
+  /// 记下提权**之前**的提示符，作为"到底提权成功没有"的基准。
+  ///
+  /// **只在"还没发过口令"的阶段记**：`idle`（横幅早到）与 `awaitingEnable`
+  /// （横幅晚到，但 `en` 的回显还没出现，见 [onOutput]）。那一刻设备还没
+  /// 处理完我们的命令，缓冲区里出现的提示符只可能是登录/建连横幅的
+  /// （`Ruijie>`）。
+  ///
+  /// **`awaitingPassword` 必须排除。** 那时缓冲区里是**口令的回显**或设备的
+  /// 拒绝信息，不是基准 —— 而回显可能自己就以 `#` / `>` 结尾（口令 `abc#`），
+  /// 一旦被记成基准，"提权后提示符必须与基准不同"这条就永远不成立，
+  /// 提权成功也会被判成失败（本类的用例
+  /// 「口令以 # 结尾也不会被回显骗成成功」正是踩这个）。
+  ///
+  /// 一成不变地取"最后一个非空行"也不行：横幅自己的消息行（`Last login: …`）
+  /// 会先落地，它不是提示符。所以还要求这一行**匹配提示符正则**。
+  void _noteLoginPrompt() {
+    if (_loginPrompt != null || _phase == _Phase.awaitingPassword) return;
+    if (_echoSeen) return;
+    final line = PromptDetector.lastNonEmptyLine(_buffer);
+    if (line != null && _promptDetector.matches(line)) _loginPrompt = line;
   }
 
   /// 放弃这次提权（会话正在被拆掉时调用）。
@@ -162,6 +211,7 @@ class EnableSequence {
     _buffer = '';
     _graceElapsed = false;
     _phase = phase;
+    if (phase == _Phase.awaitingPassword) _passwordSent = true;
     _write('$text$lineEnding');
     _graceTimer?.cancel();
     _graceTimer = Timer(echoGrace, () {
@@ -186,31 +236,50 @@ class EnableSequence {
           _writeAndWait(pw, _Phase.awaitingPassword);
           return;
         }
-        if (_promptSeen()) _succeed();
-      case _Phase.awaitingPassword:
-        if (_passwordPromptSeen()) {
-          // 又被要了一次口令 ⇒ 刚才那条不对。
-          if (_attemptsLeft > 1) {
-            _attemptsLeft--;
-            _writeAndWait(command, _Phase.awaitingEnable);
-          } else {
-            _fail(_rejectedPasswordFailure());
-          }
+        // `_succeed()` 之后**必须 return**：这里的 switch 不 break（本仓库的
+        // 风格，见 telnet_protocol.dart），落进下面那个 case 会让两道闸门在
+        // 已经成功之后再跑一遍 —— 而那时 `_returnedToLoginPrompt` 可能为真，
+        // 于是刚宣布的成功又被 `_onPasswordRejected()` 推翻。
+        if (_promptSeen()) {
+          _succeed();
           return;
         }
-        if (_promptSeen()) _succeed();
+        if (_returnedToLoginPrompt) _onPasswordRejected();
+      case _Phase.awaitingPassword:
+        if (_passwordPromptSeen()) {
+          _onPasswordRejected();
+          return;
+        }
+        if (_promptSeen()) {
+          _succeed();
+          return;
+        }
+        if (_returnedToLoginPrompt) _onPasswordRejected();
     }
   }
 
-  /// 缓冲区末尾（回显之后的那一段）是否为设备提示符。
+  /// 口令没被接受：还有次数就从头发一遍，没有了就报认证失败。
   ///
-  /// 见类文档的"回显闸门"。
+  /// 两个来源共用它 —— 设备**又要一次口令**（`Password:` 再来一遍），
+  /// 或者**把我们退回登录提示符**（锐捷的真实行为，见类文档第二道闸门）。
+  void _onPasswordRejected() {
+    if (_attemptsLeft > 1) {
+      _attemptsLeft--;
+      _writeAndWait(command, _Phase.awaitingEnable);
+    } else {
+      _fail(_rejectedPasswordFailure());
+    }
+  }
+
+  /// 缓冲区末尾（回显之后的那一段）是否为**提权后**的设备提示符。
+  ///
+  /// 见类文档的"两道闸门"。
   bool _promptSeen() {
     final at = _buffer.indexOf('\n');
     if (at >= 0) {
       final after = _buffer.substring(at + 1);
       if (after.isEmpty) return false;
-      // **`awaitingEnable` 阶段还要求先看到回显。**
+      // 第一道闸门：`awaitingEnable` 阶段要求先看到回显。
       //
       // 只判"有换行 + 后面是提示符"不够：那个换行可能**不是** `en` 的回显，
       // 而是建连横幅自己的。真机实测（2026-09-27，锐捷 S6990）横幅的尾巴
@@ -219,12 +288,32 @@ class EnableSequence {
       // `Ruijie>`，当场被判成提权成功。回显是"设备确实收到并处理了这条命令"
       // 的直接证据，而横幅的尾巴里没有它。
       if (_phase == _Phase.awaitingEnable && !_echoSeen) return false;
-      return _promptDetector.matches(after);
+      // 第二道闸门：必须**换了**提示符。
+      return _promptDetector.matches(after) && !_isLoginPromptLine(after);
     }
     // 到这一刻还没见过换行 ⇒ 设备不回显。只在 echoGrace 过了之后才认，
     // 以免把被延迟投递的建连横幅当成提权结果。
-    return _graceElapsed && _promptDetector.matches(_buffer);
+    return _graceElapsed &&
+        _promptDetector.matches(_buffer) &&
+        !_isLoginPromptLine(_buffer);
   }
+
+  /// 这一段文本的最后一行是否就是提权前那个提示符。
+  ///
+  /// [_loginPrompt] 拿不到时恒为 false —— 这道闸门失效，退回只判 `[>#\]]`。
+  /// 那是本类已知的缺口（横幅若早于订阅到达就无从取基准）。
+  bool _isLoginPromptLine(String text) {
+    final login = _loginPrompt;
+    if (login == null) return false;
+    return PromptDetector.lastNonEmptyLine(text) == login;
+  }
+
+  /// 设备把我们退回了提权前的提示符 ⇒ 口令没被接受。
+  ///
+  /// 没发过口令就谈不上"被拒"（比如 `en` 之后设备直接给了登录提示符，
+  /// 那更像是这台设备不需要提权），所以要求 [_passwordSent]。
+  bool get _returnedToLoginPrompt =>
+      _passwordSent && _isLoginPromptLine(_buffer);
 
   /// 设备是否已经把我们写下的 [command] 回显出来了。
   ///
