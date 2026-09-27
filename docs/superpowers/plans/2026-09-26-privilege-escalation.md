@@ -1706,7 +1706,7 @@ git commit -m "fix(state): 新增设备时补上提权字段（add 逐字段重�
 
 **Files:** 无代码改动。这一条是验收，不是实现。
 
-- [ ] **Step 1: 全量测试**
+- [x] **Step 1: 全量测试**
 
 Run: `flutter test`
 Expected: `All tests passed!`（跳过 3 条 golden）。
@@ -1716,12 +1716,12 @@ Expected: `All tests passed!`（跳过 3 条 golden）。
 > 成因是 `test/ui/ui_harness.dart` 的 `settleDisk` 写死 60ms 真实等待）。
 > 红了先**单跑那个文件**：绿 ⇒ 偶发，重跑全量即可；红了 ⇒ 真问题，去查。
 
-- [ ] **Step 2: 静态检查**
+- [x] **Step 2: 静态检查**
 
 Run: `dart analyze lib/ test/`
 Expected: `No issues found!`（`info` 级也不许有）。
 
-- [ ] **Step 3: 真机验收（锐捷 S6990-128QC2XS-E，10.166.96.41）**
+- [x] **Step 3: 真机验收（锐捷 S6990-128QC2XS-E，10.166.96.41）**
 
 在应用里编辑那台设备，填：
 
@@ -1749,7 +1749,7 @@ Expected: `No issues found!`（`info` 级也不许有）。
    `% User doesn't have sufficient privilege`（提权前实测就是这句）；
 5. 命令回显里能看到 `Ruijie#`。
 
-- [ ] **Step 4: 真机验收 · 反例**
+- [x] **Step 4: 真机验收 · 反例**
 
 把提权口令**改成错的**（如 `wrong`），重连，确认：
 
@@ -1761,7 +1761,7 @@ Expected: `No issues found!`（`info` 级也不许有）。
 
 验收完把口令改回正确的那个。
 
-- [ ] **Step 5: 记录验收结果**
+- [x] **Step 5: 记录验收结果**
 
 把上面两次真机验收的实况（时序、看到的原文）写进
 `docs/superpowers/plans/2026-09-26-privilege-escalation.md` 末尾的
@@ -1776,7 +1776,137 @@ git commit -m "docs(plans): 提权功能真机验收记录"
 
 ## 验收记录
 
-（Task 7 执行后在此填写。）
+**执行日期：** 2026-09-27　**设备：** 锐捷 S6990-128QC2XS-E，`10.166.96.41:22`（仅 SSH）
+**两处口令按本文件约定不落盘**，验收时人工填。
+
+### 结论
+
+三次真机验收各暴露一个缺陷，**三个都已修复并复验**。前两个是"判错"；第三个更
+隐蔽 —— 同一份代码**换个 chunk 边界就从判对变成判错**。
+
+| # | 缺陷 | 修复提交 | 复验 |
+|---|---|---|---|
+| 1 | 建连横幅的尾巴晚于 `en` 落地，被当成提权成功 | `a4fd1e0` | 真机 ✅ |
+| 2 | 口令被拒退回 `Ruijie>`，被当成提权成功 | `cd85f37` | 真机 ✅ |
+| 3 | 登录提示符基准记不下来 ⇒ 第二道闸门**静默失效** | `8b24456` | 单测 ✅（真机未撞上该 chunk 形状） |
+
+### 缺陷 1：横幅的尾巴被当成提权成功
+
+探针实录（`en` 写下去之后横幅尾巴才落地，比 `settleDelay` 晚约 15ms）：
+
+```
+[611 ms] WRITE en\n
+[624 ms] RECV  ...through ssh.\r\r\nRuijie>     ← 横幅的尾巴，落在清缓冲之后
+[624 ms] RECV  en\r\r\n                          ← 真正的回显
+[654 ms] RECV  \r\r\nPassword:
+```
+
+只判"有换行 + 后面是提示符"就会在 624ms 宣布成功，**口令一个字都没发出去**。
+界面进"已连接"，随后 `show clock` 被当成口令喂进去（于是又弹一次 `Password:`），
+10s 后报「执行超时」。修法是 `awaitingEnable` 阶段的成功判据**要求先看到回显**。
+
+### 缺陷 2：口令被拒也报成功
+
+反例实录：口令错时锐捷**不再要一次口令**，而是打印 `% Access denied` 后直接回到
+`Ruijie>`。`% Access denied` 不含 `password`，`_passwordPromptSeen()` 判不出来；
+`Ruijie>` 又满足默认 `promptRegex`，于是被判成提权成功 —— 设备还在用户模式，
+`show clock` 回 `% User doesn't have sufficient privilege`。
+
+根因是 spec §5.2 只有一个 `promptRegex`，没有"特权提示符"的概念。修法按用户选定
+的方案：记下提权**前**的提示符作基准，提权后必须**换了**提示符才算成功。
+
+### 缺陷 3：基准记不下来 ⇒ 闸门静默失效
+
+同一份代码，第一次连接判对「提权超时」，紧接着的重连却把设备回的
+`% User:admin has been blocked!` + `Ruijie>` 判成**「重连成功」**（界面亮绿灯）。
+差别只在 chunk 边界：横幅尾巴与 `en` 回显**合并进同一个 chunk** 时，旧实现里
+`if (_echoSeen) return;` 一上来就成立，整个缓冲区被放弃，基准永远记不下来 ——
+第二道闸门不是"判错"而是**"不判"**，比判错更难发现。
+
+改法：按**位置**切分（`_echoAt` 之前的那一段才是提权前的），两种投递形状都能
+记下基准。回归用例用真机那个 chunk 的逐字节形状做夹具，**已验证会红**：换回旧
+守卫 8 绿 1 红，换回新实现 9/9 绿。
+
+### Step 1 / Step 2：全量测试与静态检查
+
+- `dart analyze lib/ test/` → `No issues found!` ✅
+- `flutter test` → `+630 ~3 -1`。唯一失败的是 `test/ui/device_list_panel_test.dart`
+  ，**单跑 8/8 绿** —— 即 Step 1 注里记的那条 `settleDisk` 偶发，非本次改动引入。
+  另外把 `ssh_session_integration_test.dart` 放进 `test/connection/ test/state/`
+  合跑时也偶发红（`(setUpAll)`/`(tearDownAll)`），单跑 6/6 绿，且该文件**不含任何
+  enable 相关代码**；带本次改动合跑 212/212 全绿。
+
+### Step 3：正例验收
+
+序列级探针（驱动**真实的** `SshSession` + `EnableSequence`，逐字节记录）：
+
+```
+[611 ms] WRITE en\n
+[624 ms] RECV  ...through ssh.\r\r\nRuijie>
+[624 ms] RECV  en\r\r\n
+[654 ms] RECV  \r\r\nPassword:
+[654 ms] WRITE 〈提权口令〉\n
+[664 ms] RECV  Ruijie#
+[664 ms] >>> ENABLE RETURNED null (= success)
+```
+
+界面级（release 构建 + 预置数据，`autoConnect` + `postLoginCommands:["show clock"]`）：
+设备按钮**绿色**、输出区**无**「执行超时」、`show clock` **不再**回
+`% User doesn't have sufficient privilege` —— 符合 Step 3 的 2/3/4 条。
+
+> **第 1 条（主机密钥指纹确认弹窗）未走界面。** 验收数据里
+> `verifySshHostKey:false`（这台机器没有能发合成按键的工具，弹窗点不掉）。
+> 指纹本身已在 2026-09-26 的排查里独立确认过。
+
+> **第 5 条（回显里看到 `Ruijie#`）** 在序列级探针里逐字节可见；界面输出区
+> 未单独截图存证。
+
+### Step 4：反例验收
+
+序列级，**只跑了一次**（理由见下面的锁号事件）：
+
+```
+[670 ms] WRITE 〈错的提权口令〉\n
+[697 ms] RECV  \r\r\nPassword:
+[730 ms] RECV  \r\r\n\r\r\n% Access denied\r\r\n
+[733 ms] RECV  Ruijie>
+[734 ms] >>> ENABLE FAILED: authFailed / 提权口令被拒：…
+```
+
+**在第 733ms 那一行，起作用的正是缺陷 2 的第二道闸门** —— 没有它，
+`_promptSeen()` 会在这里返回 true 并再次误报成功。符合 Step 4 的 1/2 条。
+
+界面级反例**没有重跑**：见下。
+
+### ⚠️ 账号锁号事件（本人造成的，已恢复）
+
+反例（口令故意填错）触发设备侧保护：
+
+```
+% User:admin has been blocked!
+```
+
+- **锁定的是提权路径，不是 SSH 登录** —— 锁号期间 `ssh admin@…` 用正确口令
+  仍能登入并拿到 `Ruijie>`，只有 `en` 被拒。
+- 触发阈值约 **3 次**错误提权口令；本功能 `maxAttempts` 默认 **2**，所以
+  **一次反例验收就逼近阈值**（设备重发 `en` 时若正停在口令提示符上，那笔
+  `en` 本身也会被当成一次口令）。
+- 约 **7 分钟**后自动解除。恢复检查是**稀疏**排程的（420s 一次、900s 一次），
+  因为新的失败会**延长**封锁窗口。
+- 因此界面级反例**只做一次、不做重复回归**：连续跑会把账号又锁上，而这个
+  代价落在用户的设备上。缺陷 3 的修复改由单测覆盖（夹具就是真机那个 chunk）。
+
+### 遗留与提请用户决定
+
+1. **第二道闸门的残余缺口。** `_loginPrompt` 拿不到时闸门失效（类文档已记）。
+   本次真机时序表明横幅没有丢：订阅挂载点与 `await session.connect()` 之间
+   **全是同步代码**，广播流的事件不可能插进去。但 `ConnectionManager` 确实把
+   订阅挂在 `connect()` **之后**，理论上存在窗口。要不要把它前移到 `connect()`
+   之前是**设计决策**（会改变输出缓冲语义），未擅自改。
+2. **`maxAttempts` 默认 2 是否该降到 1。** 见上面的锁号阈值。产品决策，未改。
+3. **`requirements.md` 的同步修订**（§10.1 与 §13 风险表），仍待用户决定。
+4. `_teardownSession` 与 `await enable.start()` 的竞态无测试覆盖（`identical`
+   判据就是为它写的）。
 
 ---
 
