@@ -1467,6 +1467,20 @@ git commit -m "feat(conn): 登录后先提权，成功才进已连接并发登�
 
 ## Task 5: 设备编辑对话框两个输入框
 
+> **⚠️ 任务顺序：这一条必须排在 Task 6 之后（或与它同批落地）。**
+>
+> Task 5 的第一条用例走的是**新增**路径（`open()` 不带 `existing` → `_submit()` →
+> `DevicesNotifier.add`），而 `add` 是**逐字段重建** `DeviceProfile`，在 Task 6 补上
+> 那两个字段之前会把提权设置静默丢掉 —— 于是那条用例断言 `'en'` 却拿到 `null`。
+>
+> **这是本计划作者的排序失误**，执行时才发现（Task 6 本来就是为这个字段丢失写的，
+> 只是没人注意到 Task 5 自己的用例先撞上了）。实际执行顺序是 **Task 6 → Task 5**：
+> `4ee4ad7`（Task 6）先落地，`4bf3982`（Task 5）随后提交，两次提交各自全绿。
+>
+> 教训与 [[verify-plan-against-source-before-dispatch]] 同源：**计划里的任务不是原子的，
+> 它们之间还有依赖**——「每条步骤的预期输出」必须对着**执行到那一步时的仓库状态**成立，
+> 而不是对着"整份计划都做完之后"的状态。
+
 **Files:**
 - Modify: `lib/ui/dialogs/device_edit_dialog.dart`
 - Test: `test/ui/device_edit_dialog_test.dart`、`test/ui/device_params_change_test.dart`
