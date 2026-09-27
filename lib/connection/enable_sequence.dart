@@ -29,13 +29,24 @@ enum _Phase {
 ///
 /// 建连横幅（`Ruijie>`）与我们发 `en` 之后设备回的提示符，在缓冲区里长得
 /// 一样 —— 直接拿"最后一行是不是提示符"当判据，横幅一到就会宣布提权成功，
-/// 而那时口令一个字都还没发。所以成功判据是：**缓冲区里出现过换行，且换行
-/// **之后**的那一段以提示符结尾**。理由是设备的回显必然在第一行：我们写下
-/// `en`，设备先回 `en\r\r\n`，之后才是 `Password:` 或 `Ruijie#`。
+/// 而那时口令一个字都还没发。所以 `awaitingEnable` 阶段的成功判据是：
+/// **缓冲区里既有换行、又能看到 `en` 的回显，且换行之后的那一段以提示符
+/// 结尾**。理由是设备的回显必然在第一行：我们写下 `en`，设备先回
+/// `en\r\r\n`，之后才是 `Password:` 或 `Ruijie#`。
 ///
-/// 代价是**不回显的设备走不通这条路**（缓冲区永远没有换行）。它由 [echoGrace]
-/// 兜底：到那一刻仍没见过换行，就退回看整个缓冲区。这个口子开得有限 ——
-/// 横幅若被延迟投递，紧接着设备的回应就到了，最后一行会被它顶掉。
+/// **"看到回显"这一条不是多余的。** [_writeAndWait] 的清缓冲挡不住横幅 ——
+/// 横幅完全可能在清完之后才落地，而它自带的换行与提示符足以骗过"有换行 +
+/// 后面是提示符"这个近似判据。真机实测就是这么翻的车
+/// （2026-09-27，锐捷 S6990，10.166.96.41）：横幅的尾巴比 [settleDelay]
+/// 晚约 15ms 落地，当场被判成提权成功，口令一个字都没发出去，界面却进了
+/// "已连接"。详见 [_promptSeen]。
+///
+/// `awaitingPassword` 阶段**不**要求回显 —— 口令本来就不回显，那一段的
+/// 缓冲区必然是 `\r\r\nRuijie#` 这个形状。
+///
+/// 代价是**不回显的设备走不通这条路**。它由 [echoGrace] 兜底：到那一刻仍没见过
+/// 换行，就退回看整个缓冲区。这个口子开得有限 —— 横幅若被延迟投递，紧接着
+/// 设备的回应就到了，最后一行会被它顶掉。
 class EnableSequence {
   EnableSequence({
     required this._write,
@@ -198,11 +209,29 @@ class EnableSequence {
     final at = _buffer.indexOf('\n');
     if (at >= 0) {
       final after = _buffer.substring(at + 1);
-      return after.isNotEmpty && _promptDetector.matches(after);
+      if (after.isEmpty) return false;
+      // **`awaitingEnable` 阶段还要求先看到回显。**
+      //
+      // 只判"有换行 + 后面是提示符"不够：那个换行可能**不是** `en` 的回显，
+      // 而是建连横幅自己的。真机实测（2026-09-27，锐捷 S6990）横幅的尾巴
+      // （`…ssh.\r\r\nRuijie>`）比 `settleDelay` 晚约 15ms 落地，于是它落在
+      // `_writeAndWait` 清缓冲**之后** —— 缓冲里有了换行、换行后正好是提示符
+      // `Ruijie>`，当场被判成提权成功。回显是"设备确实收到并处理了这条命令"
+      // 的直接证据，而横幅的尾巴里没有它。
+      if (_phase == _Phase.awaitingEnable && !_echoSeen) return false;
+      return _promptDetector.matches(after);
     }
     // 到这一刻还没见过换行 ⇒ 设备不回显。只在 echoGrace 过了之后才认，
     // 以免把被延迟投递的建连横幅当成提权结果。
     return _graceElapsed && _promptDetector.matches(_buffer);
+  }
+
+  /// 设备是否已经把我们写下的 [command] 回显出来了。
+  ///
+  /// 大小写不敏感：部分设备会把输入转成大写再回显。
+  bool get _echoSeen {
+    if (command.isEmpty) return true;
+    return _buffer.toLowerCase().contains(command.toLowerCase());
   }
 
   bool _passwordPromptSeen() {
