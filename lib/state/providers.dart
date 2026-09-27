@@ -139,6 +139,8 @@ class DevicesNotifier extends Notifier<List<DeviceProfile>> {
       username: draft.username,
       password: draft.password,
       privateKeyPath: draft.privateKeyPath,
+      enableCommand: draft.enableCommand,
+      enablePassword: draft.enablePassword,
       jumpHostIds: draft.jumpHostIds,
       lineEnding: draft.lineEnding,
       promptRegex: draft.promptRegex,

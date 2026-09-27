@@ -304,4 +304,26 @@ void main() {
 
     expect(session.closed, isTrue, reason: '设备都没了，会话不该还插在设备上');
   });
+
+  test('新增设备时提权字段不能丢（add 是逐字段重建的）', () async {
+    final container = await boot();
+    final notifier = container.read(devicesProvider.notifier);
+
+    final created = await notifier.add(
+      const DeviceProfile(
+        id: 'draft-id',
+        name: '汇聚',
+        protocol: DeviceProtocol.ssh,
+        host: '10.0.0.1',
+        port: 22,
+        username: 'admin',
+        enableCommand: 'en',
+        enablePassword: 'enable-secret',
+      ),
+    );
+
+    expect(created.id, isNot('draft-id'), reason: 'id 由本层生成');
+    expect(created.enableCommand, 'en');
+    expect(created.enablePassword, 'enable-secret');
+  });
 }
