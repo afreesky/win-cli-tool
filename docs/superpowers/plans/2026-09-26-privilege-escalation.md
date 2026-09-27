@@ -1861,6 +1861,25 @@ git commit -m "docs(plans): 提权功能真机验收记录"
 > **第 5 条（回显里看到 `Ruijie#`）** 在序列级探针里逐字节可见；界面输出区
 > 未单独截图存证。
 
+### Step 3 复验：缺陷 3 修完之后，在**最终代码**上重跑正例
+
+锁号窗口过去后重跑同一条序列级探针（带缺陷 3 修复的代码）：
+
+```
+[623 ms] WRITE en\n
+[633 ms] RECV  Last login: … through ssh.\r\r\n
+[634 ms] RECV  Ruijie>
+[635 ms] RECV  en\r\r\n
+[663 ms] RECV  \r\r\nPassword:
+[663 ms] WRITE 〈提权口令〉\n
+[672 ms] RECV  Ruijie#
+[672 ms] >>> ENABLE RETURNED null (= success)
+```
+
+这一次同时说明两件事：**账号的提权路径已自行恢复**（不再回 `blocked`），以及
+缺陷 3 的修复**没有伤到正常路径** —— 按位置切分取到的基准仍是 `Ruijie>`，
+`Ruijie#` 与它不同，判定为成功。
+
 ### Step 4：反例验收
 
 序列级，**只跑了一次**（理由见下面的锁号事件）：
