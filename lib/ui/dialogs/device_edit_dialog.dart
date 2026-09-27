@@ -73,6 +73,8 @@ class _DeviceEditDialogState extends ConsumerState<DeviceEditDialog> {
   late final TextEditingController _privateKeyPath;
   late final TextEditingController _promptRegex;
   late final TextEditingController _postLogin;
+  late final TextEditingController _enableCommand;
+  late final TextEditingController _enablePassword;
 
   late DeviceProtocol _protocol;
   late String _lineEnding;
@@ -117,6 +119,12 @@ class _DeviceEditDialogState extends ConsumerState<DeviceEditDialog> {
     _postLogin = TextEditingController(
       text: (existing?.postLoginCommands ?? const []).join('\n'),
     );
+    _enableCommand = TextEditingController(
+      text: existing?.enableCommand ?? '',
+    );
+    _enablePassword = TextEditingController(
+      text: existing?.enablePassword ?? '',
+    );
 
     // 新增时端口不算"填过"：那时它是 FR-D-03 给的默认值，切协议就该跟着换。
     // 编辑一台已有的设备则相反 —— 盘上那个端口是用户的选择。
@@ -136,6 +144,8 @@ class _DeviceEditDialogState extends ConsumerState<DeviceEditDialog> {
       _privateKeyPath,
       _promptRegex,
       _postLogin,
+      _enableCommand,
+      _enablePassword,
     ]) {
       c.dispose();
     }
@@ -217,6 +227,10 @@ class _DeviceEditDialogState extends ConsumerState<DeviceEditDialog> {
       // "不启用密码认证"。留一个空串进去，认证那条路会拿空密码去试。
       password: _emptyToNull(_password.text),
       privateKeyPath: _emptyToNull(_privateKeyPath.text),
+      // 同样是**空串要变成 null**：null 是"不提权"或"设备不问口令"，
+      // 而空串会真的往设备发一个空行。见 `_emptyToNull` 与 `_unset`。
+      enableCommand: _emptyToNull(_enableCommand.text),
+      enablePassword: _emptyToNull(_enablePassword.text),
       lineEnding: _lineEnding,
       promptRegex: promptRegex.isEmpty ? null : promptRegex,
       postLoginCommands: _postLogin.text
@@ -379,6 +393,23 @@ class _DeviceEditDialogState extends ConsumerState<DeviceEditDialog> {
                 controller: _privateKeyPath,
                 decoration: const InputDecoration(
                   labelText: '私钥文件路径（可选，填了就用密钥认证）',
+                ),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                key: const ValueKey('device-enable-command'),
+                controller: _enableCommand,
+                decoration: const InputDecoration(
+                  labelText: '提权命令（可选，如 en；留空表示不提权）',
+                ),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                key: const ValueKey('device-enable-password'),
+                controller: _enablePassword,
+                obscureText: true,
+                decoration: const InputDecoration(
+                  labelText: '提权口令（明文保存，设备不问口令就留空）',
                 ),
               ),
               const SizedBox(height: 8),

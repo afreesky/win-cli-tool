@@ -223,4 +223,18 @@ void main() {
     // 同上：会话还连着，收尾要把那个命令超时定时器推过去。
     await drainCommandTimeout(tester);
   });
+
+  testWidgets('改提权设置算连接参数变更 → 断开（决策①）', (tester) async {
+    // 提权参数不在 `_displayOnlyFields` 里，所以它自动算连接参数。
+    // 这条用例把这个"自动"钉住：哪天有人往白名单里加了 enableCommand，
+    // 改提权设置就会静默地不断线，而界面上设备行看起来已经改好了。
+    await openConnected(tester, device: base());
+    await fill(tester, 'device-enable-command', 'en');
+    await tester.tap(find.text('保存'));
+    // 这条路上有两段真 I/O：`update(draft)` 落盘 + `disconnect()` 收尾
+    // （含 chmod 真进程）。`settleDisk` 不够，要按条件等 SnackBar。
+    await pumpUntilSnackBar(tester);
+
+    expect(find.text('连接参数已改变，已断开该设备，请重新连接'), findsOneWidget);
+  });
 }

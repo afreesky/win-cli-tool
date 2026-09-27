@@ -300,4 +300,37 @@ void main() {
 
     expect(stored(tester).lineEnding, '\r\n');
   });
+
+  testWidgets('提权命令与提权口令能存进设备（FR-D-01）', (tester) async {
+    await open(tester);
+    await fill(tester, 'device-name', '汇聚');
+    await fill(tester, 'device-host', '10.0.0.1');
+    await fill(tester, 'device-username', 'admin');
+    await fill(tester, 'device-enable-command', 'en');
+    await fill(tester, 'device-enable-password', 'enable-secret');
+    await tester.tap(find.text('保存'));
+    // 保存要落盘（真 I/O），假时钟推不动 —— 用本文件既有的 `settleDisk`，
+    // 别用 `pumpAndSettle`。
+    await settleDisk(tester);
+
+    final saved = stored(tester);
+    expect(saved.enableCommand, 'en');
+    expect(saved.enablePassword, 'enable-secret');
+  });
+
+  testWidgets('提权命令留空 → null（表示不提权，而不是空串）', (tester) async {
+    await open(tester);
+    await fill(tester, 'device-name', '接入');
+    await fill(tester, 'device-host', '10.0.0.2');
+    await fill(tester, 'device-username', 'admin');
+    await fill(tester, 'device-enable-command', '   ');
+    await tester.tap(find.text('保存'));
+    await settleDisk(tester);
+
+    expect(
+      stored(tester).enableCommand,
+      isNull,
+      reason: '空串会真的往设备发一个空行；null 才是"不提权"',
+    );
+  });
 }
