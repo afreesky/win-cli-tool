@@ -1,0 +1,211 @@
+import 'package:fake_async/fake_async.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:win_cli_tool/command/prompt_detector.dart';
+import 'package:win_cli_tool/connection/connection_failure.dart';
+import 'package:win_cli_tool/connection/enable_sequence.dart';
+
+/// 真机实录（2026-09-26，锐捷 S6990，10.166.96.41）的时序与字节。
+/// 分块投喂，是为了让"同一 chunk 里同时有回显与口令提示"这条路径也被走到。
+const _echoEn = 'en\r\r\n';
+const _passwordPrompt = '\r\r\nPassword:';
+const _privileged = 'Ruijie#';
+
+void main() {
+  test('有口令：发 en → 等口令提示 → 发口令 → 等特权提示符', () {
+    fakeAsync((async) {
+      final written = <String>[];
+      final seq = EnableSequence(
+        write: written.add,
+        promptDetector: PromptDetector(),
+        command: 'en',
+        password: 'enable-secret',
+      );
+
+      ConnectionFailure? result;
+      var completed = false;
+      seq.start().then((f) {
+        result = f;
+        completed = true;
+      });
+
+      // 建连横幅先到（此时还没发 en）—— 它绝不能被当成提权成功。
+      seq.onOutput('Ruijie>');
+      async.elapse(const Duration(milliseconds: 100));
+      expect(completed, isFalse, reason: '建连横幅不是提权成功');
+
+      // settleDelay 到点 → 发 en。
+      async.elapse(const Duration(milliseconds: 300));
+      expect(written, ['en\n']);
+
+      seq.onOutput(_echoEn);
+      seq.onOutput(_passwordPrompt);
+      async.flushMicrotasks();
+      expect(written, ['en\n', 'enable-secret\n'], reason: '看到口令提示就该发口令');
+
+      seq.onOutput('\r\r\n');
+      seq.onOutput(_privileged);
+      async.flushMicrotasks();
+      expect(completed, isTrue);
+      expect(result, isNull, reason: 'null = 提权成功');
+      // 定时器都清干净了，不然 fakeAsync 会报 "pending timers"。
+      async.elapse(const Duration(minutes: 1));
+    });
+  });
+
+  test('无口令（Cisco 形态 en 直达 #）：不发第二笔', () {
+    fakeAsync((async) {
+      final written = <String>[];
+      final seq = EnableSequence(
+        write: written.add,
+        promptDetector: PromptDetector(),
+        command: 'en',
+        password: null,
+      );
+
+      ConnectionFailure? result;
+      var completed = false;
+      seq.start().then((f) {
+        result = f;
+        completed = true;
+      });
+      async.elapse(const Duration(milliseconds: 300));
+
+      seq.onOutput('en\r\r\n');
+      seq.onOutput('Ruijie#');
+      async.flushMicrotasks();
+
+      expect(completed, isTrue);
+      expect(result, isNull);
+      expect(written, ['en\n'], reason: '设备不问口令就不该有第二笔写入');
+      async.elapse(const Duration(minutes: 1));
+    });
+  });
+
+  test('设备要口令但没配：立刻报错，不把命令当口令喂进去', () {
+    fakeAsync((async) {
+      final written = <String>[];
+      final seq = EnableSequence(
+        write: written.add,
+        promptDetector: PromptDetector(),
+        command: 'en',
+        password: null,
+      );
+
+      ConnectionFailure? result;
+      seq.start().then((f) => result = f);
+      async.elapse(const Duration(milliseconds: 300));
+
+      seq.onOutput('en\r\r\n');
+      seq.onOutput(_passwordPrompt);
+      async.flushMicrotasks();
+
+      expect(result, isNotNull);
+      expect(result!.kind, ConnectionFailureKind.authFailed);
+      expect(result!.message, contains('提权口令'));
+      expect(written, ['en\n'], reason: '没有口令可发，绝不能把别的东西写下去');
+      async.elapse(const Duration(minutes: 1));
+    });
+  });
+
+  test('口令被拒：重来一遍；两次都被拒就报认证失败', () {
+    fakeAsync((async) {
+      final written = <String>[];
+      final seq = EnableSequence(
+        write: written.add,
+        promptDetector: PromptDetector(),
+        command: 'en',
+        password: '错的',
+      );
+
+      ConnectionFailure? result;
+      seq.start().then((f) => result = f);
+      async.elapse(const Duration(milliseconds: 300));
+      expect(written, ['en\n']);
+
+      // 第一次：要口令 → 发 → 又被要（口令错）。
+      seq.onOutput('en\r\r\n$_passwordPrompt');
+      async.flushMicrotasks();
+      expect(written, ['en\n', '错的\n']);
+
+      seq.onOutput(_passwordPrompt);
+      async.flushMicrotasks();
+      expect(written, ['en\n', '错的\n', 'en\n'], reason: '口令被拒要重来一遍');
+
+      // 第二次又被拒 → 两次用完，报错。
+      seq.onOutput('en\r\r\n$_passwordPrompt');
+      async.flushMicrotasks();
+      expect(written, ['en\n', '错的\n', 'en\n', '错的\n']);
+
+      seq.onOutput(_passwordPrompt);
+      async.flushMicrotasks();
+
+      expect(result, isNotNull);
+      expect(result!.kind, ConnectionFailureKind.authFailed);
+      expect(result!.message, contains('提权口令被拒'));
+      async.elapse(const Duration(minutes: 1));
+    });
+  });
+
+  test('设备没反应：重发一次，再没反应就报超时', () {
+    fakeAsync((async) {
+      final written = <String>[];
+      final seq = EnableSequence(
+        write: written.add,
+        promptDetector: PromptDetector(),
+        command: 'en',
+        password: 'pw',
+        attemptTimeout: const Duration(seconds: 6),
+      );
+
+      ConnectionFailure? result;
+      seq.start().then((f) => result = f);
+
+      async.elapse(const Duration(milliseconds: 300));
+      expect(written, ['en\n']);
+
+      // 第一次尝试超时 → 重发。
+      async.elapse(const Duration(seconds: 6));
+      expect(written, ['en\n', 'en\n']);
+
+      // 第二次也超时 → 报错。
+      async.elapse(const Duration(seconds: 6));
+      expect(result, isNotNull);
+      expect(result!.kind, ConnectionFailureKind.timeout);
+      expect(result!.message, contains('提权超时'));
+    });
+  });
+
+  test('口令以 # 结尾也不会被回显骗成成功', () {
+    // 部分设备会回显口令，而口令本身可能以 `#` 或 `>` 结尾 ——
+    // 直接拿最后一行去匹配，`abc#` 那行就变成了"特权提示符"。
+    fakeAsync((async) {
+      final written = <String>[];
+      final seq = EnableSequence(
+        write: written.add,
+        promptDetector: PromptDetector(),
+        command: 'en',
+        password: 'abc#',
+      );
+
+      ConnectionFailure? result;
+      var completed = false;
+      seq.start().then((f) {
+        result = f;
+        completed = true;
+      });
+      async.elapse(const Duration(milliseconds: 300));
+
+      seq.onOutput('en\r\r\n$_passwordPrompt');
+      async.flushMicrotasks();
+      seq.onOutput('abc#\r\r\n'); // 回显，末尾就是 '#'
+      async.flushMicrotasks();
+      expect(completed, isFalse, reason: '口令回显不是特权提示符');
+
+      seq.onOutput('Ruijie#');
+      async.flushMicrotasks();
+      expect(completed, isTrue);
+      expect(result, isNull);
+      async.elapse(const Duration(minutes: 1));
+    });
+  });
+}
