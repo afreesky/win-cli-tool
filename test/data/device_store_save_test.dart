@@ -28,6 +28,7 @@ void main() {
     String id, {
     String? name,
     String? password,
+    String? enablePassword,
     List<String> hops = const [],
     List<Snippet> snippets = const [],
   }) =>
@@ -39,6 +40,7 @@ void main() {
         port: 22,
         username: 'admin',
         password: password,
+        enablePassword: enablePassword,
         jumpHostIds: hops,
         postLoginCommands: const ['enable'],
         snippets: snippets,
@@ -118,6 +120,45 @@ void main() {
     final raw = jsonDecode(await file.readAsString()) as Map<String, Object?>;
     final first = (raw['devices']! as List<Object?>).single! as Map<String, Object?>;
     expect(first.containsKey('password'), isFalse);
+  });
+
+  test('提权口令与登录口令一起往返，且密钥库实现下都不落文件（NFR-S-01）', () async {
+    // ① 明文实现：两个秘密都要能存能读。提权口令走的是与登录口令同一条
+    //    剥/写路径（`credentials.strip` → `credentials.write`），
+    //    任何一头漏了都会在这里断。
+    final plain = profile(
+      'd1',
+      password: 'login-secret',
+      enablePassword: 'enable-secret',
+    );
+    await store().save([plain]);
+
+    final back = (await store().load()).devices.single;
+    expect(back.password, 'login-secret');
+    expect(
+      back.enablePassword,
+      'enable-secret',
+      reason: '存盘→读盘往返不能丢提权口令（save/load 的调用点少传了字段）',
+    );
+
+    final raw = await file.readAsString();
+    expect(raw, contains('login-secret'));
+    expect(
+      raw,
+      contains('enable-secret'),
+      reason: '明文实现下两个都落在文件里 —— 这是 V1 已接受的决策',
+    );
+
+    // ② 密钥库实现：两个都**不许**出现在文件里。这条才是 NFR-S-01 的守卫。
+    final vaultFile = File('${root.path}/vault.json');
+    await DeviceStore(file: vaultFile, credentials: _Vault()).save([plain]);
+    final vaultRaw = await vaultFile.readAsString();
+    expect(vaultRaw, isNot(contains('login-secret')));
+    expect(
+      vaultRaw,
+      isNot(contains('enable-secret')),
+      reason: 'strip 漏剥 enablePassword ⇒ 提权口令明文落进 devices.json',
+    );
   });
 
   test('jumpHosts 原文原样写回（跳板机已放弃，但不得丢用户数据）', () async {
