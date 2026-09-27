@@ -1477,51 +1477,43 @@ git commit -m "feat(conn): 登录后先提权，成功才进已连接并发登�
 
 ```dart
   testWidgets('提权命令与提权口令能存进设备（FR-D-01）', (tester) async {
-    await pumpDialog(tester); // 用本文件现成的打开对话框的辅助
-    await tester.enterText(find.byKey(const ValueKey('device-name')), '汇聚');
-    await tester.enterText(find.byKey(const ValueKey('device-host')), '10.0.0.1');
-    await tester.enterText(
-      find.byKey(const ValueKey('device-username')),
-      'admin',
-    );
-    await tester.enterText(
-      find.byKey(const ValueKey('device-enable-command')),
-      'en',
-    );
-    await tester.enterText(
-      find.byKey(const ValueKey('device-enable-password')),
-      'enable-secret',
-    );
+    await open(tester);
+    await fill(tester, 'device-name', '汇聚');
+    await fill(tester, 'device-host', '10.0.0.1');
+    await fill(tester, 'device-username', 'admin');
+    await fill(tester, 'device-enable-command', 'en');
+    await fill(tester, 'device-enable-password', 'enable-secret');
     await tester.tap(find.text('保存'));
-    await tester.pumpAndSettle();
+    // 保存要落盘（真 I/O），假时钟推不动 —— 用本文件既有的 `settleDisk`，
+    // 别用 `pumpAndSettle`。
+    await settleDisk(tester);
 
-    final saved = container.read(devicesProvider).single;
+    final saved = stored(tester);
     expect(saved.enableCommand, 'en');
     expect(saved.enablePassword, 'enable-secret');
   });
 
   testWidgets('提权命令留空 → null（表示不提权，而不是空串）', (tester) async {
-    await pumpDialog(tester);
-    await tester.enterText(find.byKey(const ValueKey('device-name')), '接入');
-    await tester.enterText(find.byKey(const ValueKey('device-host')), '10.0.0.2');
-    await tester.enterText(
-      find.byKey(const ValueKey('device-username')),
-      'admin',
-    );
-    await tester.enterText(
-      find.byKey(const ValueKey('device-enable-command')),
-      '   ',
-    );
+    await open(tester);
+    await fill(tester, 'device-name', '接入');
+    await fill(tester, 'device-host', '10.0.0.2');
+    await fill(tester, 'device-username', 'admin');
+    await fill(tester, 'device-enable-command', '   ');
     await tester.tap(find.text('保存'));
-    await tester.pumpAndSettle();
+    await settleDisk(tester);
 
     expect(
-      container.read(devicesProvider).single.enableCommand,
+      stored(tester).enableCommand,
       isNull,
       reason: '空串会真的往设备发一个空行；null 才是"不提权"',
     );
   });
 ```
+
+> **这三个辅助的名字是本文件里真实存在的**：`open(tester)`（开对话框）、
+> `fill(tester, key, text)`（填字段）、`stored(tester)`（读回唯一那台设备）、
+> `settleDisk(tester)`（等落盘）。定义都在本文件顶部，别去别处找，也别自己
+> 另起炉灶 —— 本文件**没有** `pumpDialog` / `container` 这种名字。
 
 追加到 `test/ui/device_params_change_test.dart`（该文件测的是"改连接参数就断线"）：
 
@@ -1530,17 +1522,20 @@ git commit -m "feat(conn): 登录后先提权，成功才进已连接并发登�
     // 提权参数不在 `_displayOnlyFields` 里，所以它自动算连接参数。
     // 这条用例把这个"自动"钉住：哪天有人往白名单里加了 enableCommand，
     // 改提权设置就会静默地不断线，而界面上设备行看起来已经改好了。
-    await pumpExistingDevice(tester); // 用本文件现成的辅助
-    await tester.enterText(
-      find.byKey(const ValueKey('device-enable-command')),
-      'en',
-    );
+    await openConnected(tester, device: base());
+    await fill(tester, 'device-enable-command', 'en');
     await tester.tap(find.text('保存'));
-    await tester.pumpAndSettle();
+    // 这条路上有两段真 I/O：`update(draft)` 落盘 + `disconnect()` 收尾
+    // （含 chmod 真进程）。`settleDisk` 不够，要按条件等 SnackBar。
+    await pumpUntilSnackBar(tester);
 
     expect(find.text('连接参数已改变，已断开该设备，请重新连接'), findsOneWidget);
   });
 ```
+
+> **`openConnected(tester, device: base())` 与 `pumpUntilSnackBar(tester)` 是本文件
+> 里真实存在的辅助**（`base()` 造一台 d1 设备，`openConnected` 把它连上再开对话框）。
+> 本文件**没有** `pumpExistingDevice` 这个名字。
 
 - [ ] **Step 2: 跑测试确认它失败**
 
@@ -1637,25 +1632,33 @@ git commit -m "feat(ui): 设备编辑对话框增加提权命令与提权口令"
 
 ```dart
   test('新增设备时提权字段不能丢（add 是逐字段重建的）', () async {
-    final container = await makeContainer(); // 用本文件现成的装配辅助
-    final draft = DeviceProfile(
-      id: 'draft-id',
-      name: '汇聚',
-      protocol: DeviceProtocol.ssh,
-      host: '10.0.0.1',
-      port: 22,
-      username: 'admin',
-      enableCommand: 'en',
-      enablePassword: 'enable-secret',
-    );
+    final container = await boot();
+    final notifier = container.read(devicesProvider.notifier);
 
-    final created = await container.read(devicesProvider.notifier).add(draft);
+    final created = await notifier.add(
+      const DeviceProfile(
+        id: 'draft-id',
+        name: '汇聚',
+        protocol: DeviceProtocol.ssh,
+        host: '10.0.0.1',
+        port: 22,
+        username: 'admin',
+        enableCommand: 'en',
+        enablePassword: 'enable-secret',
+      ),
+    );
 
     expect(created.id, isNot('draft-id'), reason: 'id 由本层生成');
     expect(created.enableCommand, 'en');
     expect(created.enablePassword, 'enable-secret');
   });
 ```
+
+> **`boot()` 是本文件里真实存在的装配辅助**（`File:32`，签名
+> `Future<ProviderContainer> boot({settings, devices, deviceIssues, factory})`，
+> 内部用 `ProviderContainer.test` 并覆盖 `logsDirPath`）。本文件**没有**
+> `makeContainer` 这个名字。`boot()` 已经处理了临时目录（`setUp` 里的 `root`），
+> 落盘是真 I/O，直接 `await` 即可。
 
 - [ ] **Step 2: 跑测试确认它失败**
 
