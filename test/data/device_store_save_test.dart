@@ -190,15 +190,17 @@ void main() {
 
 class _Vault implements CredentialStore {
   @override
-  String? read(Map<String, Object?> record) => '来自密钥库';
+  DeviceSecrets read(Map<String, Object?> record) => const DeviceSecrets();
 
   @override
-  void write(Map<String, Object?> record, String? password) {}
+  void write(Map<String, Object?> record, DeviceSecrets secrets) {}
 
   @override
   Map<String, Object?> strip(Map<String, Object?> record) {
     final copy = Map<String, Object?>.of(record);
-    copy.remove('password');
+    for (final key in PlaintextCredentialStore.keys) {
+      copy.remove(key);
+    }
     return copy;
   }
 }

@@ -155,10 +155,12 @@ class DeviceStore {
         // `.from` 是**立即**拷贝并校验键类型；`.cast` 是惰性视图，
         // 会把错误推迟到后面某次读取，报错位置离原因更远（spec §13.6）。
         final record = Map<String, Object?>.from(entry);
-        final password = credentials.read(record);
+        final secrets = credentials.read(record);
         final profile =
             DeviceProfile.fromJson(credentials.strip(record)).copyWith(
-          password: password,
+          password: secrets.password,
+          // 提权口令同样是凭据，走同一条路（NFR-S-01）。
+          enablePassword: secrets.enablePassword,
         );
         // **把惰性视图收一遍，而且必须在 add 之前。** 模型里 `postLoginCommands`
         // 与 `jumpHostIds` 用的是 `.cast<String>()`（spec §13.6）—— 那是惰性校验
@@ -226,7 +228,13 @@ class DeviceStore {
       // 再让接口决定它落在哪里 —— 明文实现会写回同一个字段，
       // 密钥库实现则什么都不写，于是文件里没有凭据。
       final record = credentials.strip(device.toJson());
-      credentials.write(record, device.password);
+      credentials.write(
+        record,
+        DeviceSecrets(
+          password: device.password,
+          enablePassword: device.enablePassword,
+        ),
+      );
       encoded.add(record);
     }
 

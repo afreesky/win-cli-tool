@@ -284,18 +284,20 @@ class _Vault implements CredentialStore {
   final readIds = <String>[];
 
   @override
-  String? read(Map<String, Object?> record) {
+  DeviceSecrets read(Map<String, Object?> record) {
     readIds.add(record['id']! as String);
-    return '来自密钥库';
+    return const DeviceSecrets(password: '来自密钥库', enablePassword: '密钥库提权口令');
   }
 
   @override
-  void write(Map<String, Object?> record, String? password) {}
+  void write(Map<String, Object?> record, DeviceSecrets secrets) {}
 
   @override
   Map<String, Object?> strip(Map<String, Object?> record) {
     final copy = Map<String, Object?>.of(record);
-    copy.remove('password');
+    for (final key in PlaintextCredentialStore.keys) {
+      copy.remove(key);
+    }
     return copy;
   }
 }
@@ -303,15 +305,17 @@ class _Vault implements CredentialStore {
 /// 什么都查不到的密钥库。
 class _EmptyVault implements CredentialStore {
   @override
-  String? read(Map<String, Object?> record) => null;
+  DeviceSecrets read(Map<String, Object?> record) => const DeviceSecrets();
 
   @override
-  void write(Map<String, Object?> record, String? password) {}
+  void write(Map<String, Object?> record, DeviceSecrets secrets) {}
 
   @override
   Map<String, Object?> strip(Map<String, Object?> record) {
     final copy = Map<String, Object?>.of(record);
-    copy.remove('password');
+    for (final key in PlaintextCredentialStore.keys) {
+      copy.remove(key);
+    }
     return copy;
   }
 }
