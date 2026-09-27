@@ -907,9 +907,19 @@ enum _Phase {
 /// 兜底：到那一刻仍没见过换行，就退回看整个缓冲区。这个口子开得有限 ——
 /// 横幅若被延迟投递，紧接着设备的回应就到了，最后一行会被它顶掉。
 class EnableSequence {
+  /// **具名形参直接写成 `this._write`**（私有具名形参，Dart 3.x 特性）。
+  ///
+  /// 不能写成 `required void Function(String) write` + `: _write = write`：
+  /// 那会触发两条 `info` 级 `prefer_initializing_formals`，而本仓库的验收线是
+  /// `dart analyze` 必须 `No issues found!` —— 连 info 都算不合格。
+  ///
+  /// **调用点的名字不变**：声明是 `this._write`，但调用方仍然写
+  /// `EnableSequence(write: ..., promptDetector: ...)`（下划线被剥掉）。
+  /// 写成 `_write:` 反而会报
+  /// `The named parameter '_write' should use the corresponding public name 'write'`。
   EnableSequence({
-    required void Function(String) write,
-    required PromptDetector promptDetector,
+    required this._write,
+    required this._promptDetector,
     required this.command,
     this.password,
     this.lineEnding = '\n',
@@ -917,8 +927,7 @@ class EnableSequence {
     this.attemptTimeout = const Duration(seconds: 6),
     this.settleDelay = const Duration(milliseconds: 300),
     this.echoGrace = const Duration(seconds: 1),
-  })  : _write = write,
-        _promptDetector = promptDetector;
+  });
 
   final void Function(String) _write;
 
@@ -957,8 +966,13 @@ class EnableSequence {
   ///
   /// 默认提示符正则 `[>#\]]\s*$` 匹配不上它，但用户可以在设备上自定义
   /// `promptRegex` —— 那个正则**可能**匹配。所以每个状态下都**先判它**。
+  /// **别写成 `(?i)password...`。** Dart 的 `RegExp` 是 ECMAScript 引擎，
+  /// **不支持 PCRE / Java / Python 那种内联修饰符**，实测直接抛
+  /// `FormatException: Invalid group`。而且它是 `static final`，延迟初始化 ——
+  /// 异常不在编译期、也不在构造时炸，要等到**第一次匹配**才炸，表现为运行期
+  /// 崩在 `_check()` 里。等价写法是 `caseSensitive: false`。
   static final RegExp passwordPromptPattern =
-      RegExp(r'(?i)password\s*[:：]?\s*$');
+      RegExp(r'password\s*[:：]?\s*$', caseSensitive: false);
 
   _Phase _phase = _Phase.idle;
   String _buffer = '';
@@ -1065,6 +1079,15 @@ class EnableSequence {
   /// 缓冲区末尾（回显之后的那一段）是否为设备提示符。
   ///
   /// 见类文档的"回显闸门"。
+  ///
+  /// **已知缺口（下面那个兜底支）：** 若设备**只回显、且只用 `\r` 断行**
+  /// （缓冲区永远没有 `\n`），兜底支会拿整个缓冲区去匹配。此时若提权口令
+  /// 本身以 `#` / `>` / `]` 结尾，口令回显就会被当成特权提示符 —— 正是
+  /// 测试 6 要防的那种误判，但那条用例走的是上半支（它的 chunk 里有 `\n`），
+  /// 盖不到这里。要触发它得同时满足四条：设备回显口令、只用 `\r` 断行、
+  /// 口令以提示符字符结尾、且回显晚于 [echoGrace]。目标设备（锐捷 S6990）
+  /// 发的是 `\r\r\n`，四条都不沾，所以这一版不修。**真机验收时若遇到
+  /// "提权像是成功了但命令被当口令吃掉"，先查这里。**
   bool _promptSeen() {
     final at = _buffer.indexOf('\n');
     if (at >= 0) {
